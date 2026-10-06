@@ -1,0 +1,29 @@
+.venv/
+formula-worker/.venv/
+.runtime/
+.cache/
+data/
+validation/
+.env
+.env.*
+!.env.example
+__pycache__/
+.pytest_cache/
+backend/tests/.parser-validation/
+*.pyc
+*.tsbuildinfo
+frontend/node_modules/
+model-runtime/node_modules/
+frontend/dist/
+*.log
+
+# Local housekeeping reports; contain local data paths.
+/docs/清理记录.md
+/docs/文件空间明细.csv
+
+# Local editor and operating-system files.
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini

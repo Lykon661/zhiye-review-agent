@@ -1,0 +1,212 @@
+import json
+import queue
+import re
+import shutil
+import subprocess
+from dataclasses import asdict
+from threading import Thread
+from time import monotonic
+
+from .config import ROOT, Settings
+from .model_config import ModelConfig, ModelConfigStore
+
+
+class ModelNotConfigured(ValueError):
+    pass
+
+
+class StructuredOutputError(ValueError):
+    """The provider returned unusable content; never store it as completed evidence."""
+
+
+class ModelImageNotSupported(ValueError):
+    pass
+
+
+class ModelRuntimeError(RuntimeError):
+    def __init__(self, message, status_code=None, timed_out=False):
+        super().__init__(message)
+        self.status_code = status_code
+        self.timed_out = timed_out
+
+
+def model_failure_message(error: Exception) -> str:
+    current, seen = error, set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ModelImageNotSupported):
+            return str(current)
+        status = getattr(current, "status_code", None)
+        if status == 402:
+            return "模型服务余额或额度不足（HTTP 402）。请检查当前 API Key 所属账户，恢复余额或更换可用模型配置后重试。"
+        if status == 401:
+            return "模型服务认证失败（HTTP 401）。请在页面“模型配置”中更换 API Key。"
+        if status == 403:
+            return "模型服务拒绝访问（HTTP 403）。请检查当前 API Key 的模型使用权限。"
+        if status == 404:
+            return "模型或接口不存在（HTTP 404）。请在“模型配置”中检查模型名称、协议和接口根地址。"
+        if status == 429:
+            return "模型服务限流或额度受限（HTTP 429）。请检查服务商额度，稍后重试。"
+        if getattr(current, "timed_out", False) or type(current).__name__ == "APITimeoutError":
+            return "模型请求超时。请稍后重试，或在“模型配置”中增加请求超时。"
+        if isinstance(current, ModelRuntimeError):
+            return str(current)
+        if type(current).__name__ == "APIConnectionError":
+            return "无法连接模型服务。请检查页面中的接口地址和网络后重试。"
+        current = current.__cause__ or current.__context__
+    return "模型调用失败，请检查模型配置或后端日志。"
+
+
+class ModelClient:
+    """Python adapter to pi-ai; each invocation uses one immutable settings snapshot."""
+
+    def __init__(self, settings: Settings, config_store: ModelConfigStore | None = None):
+        self.settings = settings
+        self.config_store = config_store or ModelConfigStore(settings)
+
+    @property
+    def configured(self):
+        return self.config_store.snapshot().configured
+
+    def _events(self, request: dict, timeout: float):
+        node = shutil.which("node")
+        if not node:
+            raise ModelRuntimeError("未找到 Node.js。请安装 Node.js 22.19 或更高版本后重启后端。")
+        events = queue.Queue()
+        process = subprocess.Popen(
+            [node, str(ROOT / "model-runtime" / "bridge.mjs")],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", cwd=ROOT,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+        def read():
+            try:
+                for line in process.stdout:
+                    events.put(line)
+            finally:
+                events.put(None)
+
+        reader = Thread(target=read, daemon=True)
+        reader.start()
+        deadline = monotonic() + timeout + 10  # Include local SDK import overhead.
+        terminal = False
+        try:
+            process.stdin.write(json.dumps(request, ensure_ascii=False))
+            process.stdin.close()
+            while True:
+                try:
+                    line = events.get(timeout=max(0.01, deadline - monotonic()))
+                except queue.Empty as exc:
+                    raise ModelRuntimeError("模型请求超时。", timed_out=True) from exc
+                if line is None:
+                    break
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ModelRuntimeError("模型运行进程返回了无效数据，请检查运行依赖。") from exc
+                if event.get("type") == "error":
+                    if event.get("code") == "image_not_supported":
+                        raise ModelImageNotSupported("当前模型不支持图片输入。请在“模型配置”中选择支持图片的视觉模型；自定义接口需确认模型支持图片并启用该选项。")
+                    message = str(event.get("message", "模型请求失败。"))
+                    key = request.get("config", {}).get("api_key")
+                    if key:
+                        message = message.replace(key, "[密钥已隐藏]")
+                    # Providers sometimes include request bodies or headers in error messages.
+                    status = event.get("status")
+                    if status is None:
+                        match = re.search(r"(?:HTTP\s*|status(?:_code)?[\s:=]+|^)([45]\d\d)\b", message, re.I)
+                        status = int(match.group(1)) if match else None
+                    if "模型运行依赖未安装" in message or "当前页面不支持" in message:
+                        safe_message = message
+                    else:
+                        safe_message = "模型请求失败。请检查模型配置、网络和服务商额度。"
+                    raise ModelRuntimeError(safe_message, status, event.get("timeout", False))
+                terminal = event.get("type") in ("done", "catalog") or terminal
+                yield event
+            if not terminal:
+                raise ModelRuntimeError("模型运行进程提前结束。请确认 Node.js 版本和 model-runtime 依赖已安装。")
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            reader.join(timeout=1)
+            process.stdout.close()
+            if not process.stdin.closed:
+                process.stdin.close()
+
+    def catalog(self):
+        for event in self._events({"action": "catalog"}, 30):
+            if event["type"] == "catalog":
+                return event["providers"]
+        raise ModelRuntimeError("未能读取模型目录。")
+
+    def _request(self, messages, action, json_mode=False, config: ModelConfig | None = None, max_tokens=None):
+        config = config or self.config_store.snapshot()
+        if not config.configured:
+            raise ModelNotConfigured("请点击页面右上角“模型配置”，填写服务商、模型和 API Key 后保存。")
+        request = {"action": action, "config": asdict(config), "messages": messages, "json_mode": json_mode}
+        if max_tokens is not None:
+            request["max_tokens"] = max_tokens
+        return self._events(request, config.timeout_seconds)
+
+    @staticmethod
+    def _text(event):
+        if event.get("stop_reason") == "length":
+            raise StructuredOutputError("模型输出被长度限制截断，未保存。请拆分问题或章节，或在模型配置中增加最大输出 token 数。")
+        if event.get("stop_reason") != "stop":
+            raise StructuredOutputError("模型未正常完成输出，未保存，请稍后重试。")
+        text = event.get("text", "")
+        if not isinstance(text, str) or not text.strip():
+            raise StructuredOutputError("模型返回了空内容，未保存结果。")
+        return text
+
+    def complete(self, messages: list[dict], json_mode: bool = False) -> str:
+        for event in self._request(messages, "complete", json_mode):
+            if event["type"] == "done":
+                return self._text(event)
+        raise StructuredOutputError("模型未返回完整结果。")
+
+    def complete_markdown(self, messages: list[dict]) -> str:
+        return self.complete(messages)
+
+    def stream(self, messages: list[dict]):
+        for event in self._request(messages, "stream"):
+            if event["type"] == "delta":
+                yield event["text"]
+            elif event["type"] == "done":
+                self._text(event)
+
+    def check(self, config: ModelConfig):
+        for event in self._request([{"role": "user", "content": "请只回复 OK。"}], "complete", config=config, max_tokens=256):
+            if event["type"] == "done":
+                # A short probe may consume its budget in reasoning; receiving text still proves transport.
+                if not event.get("text", "").strip():
+                    raise StructuredOutputError("服务已响应但没有返回正文，请调整模型或关闭推理后重试。")
+                return {"message": "模型已连接并返回正文。", "model": config.model}
+        raise StructuredOutputError("模型未返回连接结果。")
+
+def parse_json(text: str) -> dict:
+    text = text.strip()
+    # Reasoning-capable gateways sometimes put a private thought section or
+    # Markdown fence around the JSON despite the requested response format.
+    text = re.sub(r"^<think>.*?</think>\s*", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE)
+    decoder = json.JSONDecoder()
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        # Accept prose around one complete root object, but never skip a
+        # broken root and mistake one of its nested objects for the result.
+        start = text.find("{")
+        if start < 0 or text.startswith("["):
+            raise StructuredOutputError("模型返回的 JSON 无法解析：未返回完整 JSON 对象。")
+        try:
+            value, _ = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError as exc:
+            raise StructuredOutputError(
+                f"模型返回的 JSON 无法解析：内容不完整或格式错误（第 {exc.lineno} 行，第 {exc.colno} 列）。"
+            ) from exc
+    if not isinstance(value, dict):
+        raise StructuredOutputError("模型应返回 JSON 对象。")
+    return value

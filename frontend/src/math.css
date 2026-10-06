@@ -1,0 +1,10 @@
+.markdown-content .math-block { max-width: 100%; overflow-x: auto; overflow-y: hidden; padding: 2px 0; }
+.markdown-content .katex-display { margin: 0.8em 0; }
+.markdown-content .katex { font-size: 1.05em; }
+.markdown-content .math-inline-display { display: inline-block; max-width: 100%; overflow-x: auto; overflow-y: hidden; vertical-align: middle; }
+.markdown-content .math-inline-display .katex-display { margin: 0.25em 0; }
+.markdown-content sup, .markdown-content sub { font-size: 0.75em; line-height: 0; position: relative; vertical-align: baseline; }
+.markdown-content sup { top: -0.5em; }
+.markdown-content sub { bottom: -0.25em; }
+.markdown-content pre { font-size: 15px; line-height: 1.7; }
+.markdown-content pre > code { font-size: 15px; line-height: 1.7; }
