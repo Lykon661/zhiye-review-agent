@@ -5,8 +5,9 @@ import json
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from .models import Course, PracticeTranslation, WrongQuestion, new_id, now
+from .models import Course, PracticeTranslation, WrongQuestion, WrongQuestionReview, new_id, now
 from .math_formatting import plain_math_format
+from .practice_progress import grading
 
 
 class WrongQuestionService:
@@ -107,8 +108,63 @@ class WrongQuestionService:
     def list(self, course_id):
         with self.s.sessions() as db:
             self.require_course(db, course_id)
-            return [self.row(record) for record in db.scalars(select(WrongQuestion).where(
-                WrongQuestion.course_id == course_id).order_by(WrongQuestion.updated_at.desc(), WrongQuestion.id))]
+            records = list(db.scalars(select(WrongQuestion).where(
+                WrongQuestion.course_id == course_id).order_by(WrongQuestion.updated_at.desc(), WrongQuestion.id)))
+            reviews = {}
+            for attempt in db.scalars(select(WrongQuestionReview).join(WrongQuestion).where(
+                    WrongQuestion.course_id == course_id).order_by(WrongQuestionReview.created_at.desc(), WrongQuestionReview.id)):
+                reviews.setdefault(attempt.wrong_question_id, []).append(
+                    {"id": attempt.id, "created_at": attempt.created_at, **attempt.content})
+            return [{**self.row(record), "reviews": reviews.get(record.id, [])} for record in records]
+
+    def review(self, course_id, identity, selected, own_answer):
+        with self.s.lock, self.s.sessions() as db:
+            self.require_course(db, course_id)
+            record = db.get(WrongQuestion, identity)
+            if record is None or record.course_id != course_id:
+                raise HTTPException(404, "错题不存在或已删除")
+            question = record.question
+            choice = question["question_type"] in ("single_choice", "multiple_choice")
+            keys = {option["key"] for option in question.get("options", [])}
+            if choice:
+                if (not selected or len(set(selected)) != len(selected) or not set(selected).issubset(keys)
+                        or question["question_type"] == "single_choice" and len(selected) != 1):
+                    raise HTTPException(422, "请选择有效选项；单选题只能选一项，多选题至少选一项")
+            elif selected or not own_answer.strip():
+                raise HTTPException(422, "请填写本次作答，非选择题不支持自动判分")
+            resolution = dict(record.resolution or {})
+            labels = resolution.get("choices", [])
+            comparable = (choice and resolution.get("origin") in ("uploaded", "embedded", "model")
+                          and resolution.get("resolved") is not False and bool(labels)
+                          and set(labels).issubset(keys)
+                          and (question["question_type"] != "single_choice" or len(labels) == 1))
+            assessment = grading(resolution, selected) if comparable else {
+                "correct": None, "reference_match": None, "grading_basis": None}
+            content = {"selected": selected, "own_answer": own_answer.strip(), **assessment,
+                       "resolved": bool(comparable), "resolution": resolution, "question": dict(question)}
+            attempt = WrongQuestionReview(wrong_question_id=record.id, content=content)
+            db.add(attempt)
+            db.commit()
+            return {"id": attempt.id, "created_at": attempt.created_at, **content}
+
+    def chat_context(self, db, course_id, identity, selected=None, own_answer=None):
+        record = db.get(WrongQuestion, identity)
+        if record is None or record.course_id != course_id:
+            raise HTTPException(404, "错题不存在或不属于当前课程")
+        q = record.question
+        values = record.selected if selected is None else selected
+        if not set(values).issubset({o["key"] for o in q.get("options", [])}):
+            raise HTTPException(422, "错题选项已变化，请重新选择")
+        context = {"wrong_question_id": record.id, "question_id": record.source_question_id,
+                   "document_id": record.source_document_id, "filename": q["filename"], "kind": "exercise",
+                   "number": q.get("number") or "手动录入", "original_number": q.get("number", ""),
+                   "section": q.get("section", ""), "stem": q["stem"], "options": q.get("options", []),
+                   "locator": q.get("locator", {}), "selected": values,
+                   "own_answer": record.own_answer if own_answer is None else own_answer}
+        if record.resolution:
+            context["reference_answer"] = {key: record.resolution[key] for key in
+                                           ("answer", "choices", "origin", "source") if key in record.resolution}
+        return context
 
     def add(self, course_id, stem, own_answer, answer):
         with self.s.lock, self.s.sessions() as db:

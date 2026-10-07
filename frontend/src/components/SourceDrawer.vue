@@ -37,7 +37,7 @@ onUnmounted(() => {
 <template>
   <div class="drawer-overlay" @click.self="emit('close')">
     <aside ref="drawer" class="source-drawer" role="dialog" aria-modal="true" aria-label="资料原文">
-      <div class="section-top"><div><p class="eyebrow">SOURCE / 原始资料</p><h2>原文预览</h2></div><button class="icon-button" aria-label="关闭原文预览" @click="emit('close')">×</button></div>
+      <div class="section-top"><div><h2>原文预览</h2></div><button class="icon-button" aria-label="关闭原文预览" @click="emit('close')">×</button></div>
       <p v-if="loading" class="muted">正在读取原文…</p>
       <div v-else-if="error" class="notice error" role="alert">{{ error }}</div>
       <template v-else-if="source">

@@ -382,11 +382,11 @@ onUnmounted(() => { progress.dispose(); window.removeEventListener('pagehide', s
 
 <template>
   <section class="panel practice-upload">
-    <div class="section-top"><div><p class="eyebrow">PRACTICE / 在线练习</p><h2>用上传题目练一练</h2><p class="muted">选择题按上传答案判题；模型答案仅供参考。其他题型自行作答，按需显示答案。</p></div></div>
+    <div class="section-top"><div><h2>上传练习材料</h2><p class="muted">选择题按上传答案判题；模型答案仅供参考。其他题型自行作答，按需显示答案。</p></div></div>
     <div class="practice-upload-actions">
-      <button class="button primary" :disabled="working || uploadBlocked" @click="pick('exercise')">{{ uploading ? '上传中…' : '↑ 上传题目' }}</button>
+      <button class="button primary" :disabled="working || uploadBlocked" @click="pick('exercise')">{{ uploading ? '上传中…' : '上传题目' }}</button>
       <span class="practice-upload-hint">提示：格式混乱的试卷中，非选择题有可能解析错误。</span>
-      <button class="button subtle" :disabled="working || uploadBlocked" @click="pick('answer')">↑ 上传答案</button>
+      <button class="button subtle" :disabled="working || uploadBlocked" @click="pick('answer')">上传答案</button>
       <label>年份（可选）<input v-model="uploadYear" inputmode="numeric" maxlength="4" placeholder="例如 2024" :disabled="working" /></label>
       <span class="muted">题目和答案在同一文件时，点击“上传题目”，会自动匹配原文答案；分开的文件分别上传，按文件名自动关联。{{ uploadFormatsLabel }}。</span>
       <input ref="input" type="file" :accept="uploadAccept" multiple hidden @change="upload(($event.target as HTMLInputElement).files)" />
@@ -425,7 +425,7 @@ onUnmounted(() => { progress.dispose(); window.removeEventListener('pagehide', s
       <div v-if="answersPreparing" class="practice-answer-preparation" role="status"><span>正在准备上传答案 · {{ Math.round((bank.answer_preparation?.progress || 0) * 100) }}%</span><span>可以先作答，准备完成后提交更快。</span></div>
       <div class="practice-summary"><span>第 {{ index + 1 }} / {{ bank.questions.length }} 题 · {{ saveStatus }}</span><span v-if="answered">按原文答案已判 {{ answered }} 题 · 答对 {{ correct }} 题</span></div>
       <div class="practice-layout">
-        <aside class="practice-navigation" aria-label="题目导航"><button v-for="(item, position) in bank.questions" :key="item.id" :class="['practice-number', { active: index === position, correct: results[item.id]?.correct === true, incorrect: results[item.id]?.correct === false, viewed: visible[item.id] && item.question_type === 'other' }]" :aria-label="`第 ${position + 1} 题`" :aria-current="index === position ? 'step' : undefined" :disabled="questionBusy" @click="move(position)">{{ position + 1 }}</button></aside>
+        <aside class="practice-navigation" aria-label="题目导航"><button v-for="(item, position) in bank.questions" :key="item.id" :class="['practice-number', { active: index === position, correct: results[item.id]?.correct === true, incorrect: results[item.id]?.correct === false, viewed: visible[item.id] && item.question_type === 'other' }]" :aria-label="`第 ${position + 1} 题${results[item.id]?.correct === true ? '，已答对' : results[item.id]?.correct === false ? '，已答错' : visible[item.id] ? '，已查看答案' : '，未判题'}`" :aria-current="index === position ? 'step' : undefined" :disabled="questionBusy" @click="move(position)">{{ position + 1 }}<span v-if="results[item.id]?.correct === true || results[item.id]?.correct === false" class="practice-state" aria-hidden="true">{{ results[item.id]?.correct ? '✓' : '×' }}</span></button></aside>
         <article class="practice-question" :key="current.id">
           <div class="practice-question-meta"><span class="badge neutral">{{ current.question_type === 'single_choice' ? '单选题' : current.question_type === 'multiple_choice' ? '多选题' : '其他题型 · 自行对照' }}</span><span v-if="current.section">{{ current.section }}</span><span v-if="current.number">原题 {{ current.number }}</span><span v-if="current.locator.label">{{ current.locator.label }}</span><button class="text-button danger practice-delete-question" :disabled="modelBusy" @click="confirmDeleteQuestion">{{ deletingQuestion === current.id ? '删除中…' : '删除题目' }}</button></div>
           <div v-if="hasEnglish || current.translation" class="practice-translation-actions">
@@ -474,11 +474,69 @@ onUnmounted(() => { progress.dispose(); window.removeEventListener('pagehide', s
 </template>
 
 <style scoped>
-.practice-upload-hint{font-size:12px;color:#92713d;line-height:1.7}.practice-delete-question{margin-left:auto}
-.practice-answer-pairing{display:grid;gap:10px;margin-top:20px;padding:16px;border:1px solid #e2ead8;border-radius:9px;background:#fafcf7}.practice-answer-pairing>strong{font-size:13px;font-weight:600;color:#708562}.practice-pairing-controls{display:flex;gap:10px;flex-wrap:wrap;align-items:end}.practice-pairing-controls label{display:grid;gap:6px;flex:1;min-width:min(240px,100%);font-size:12px;color:#708562}.practice-pairing-controls select{width:100%;min-width:0;max-width:100%}.practice-answer-pairing p{line-height:1.7;margin:0}.practice-answer-pairing.needs-confirmation{border-color:#d7bf8d;background:#fffaf0}.practice-pairing-notice{font-size:12px;color:#92713d}
-.practice-answer-preparation{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;font-size:11px;color:#829674;background:#f6f9f0;border-radius:8px;padding:12px 15px;margin-top:18px}
-.practice-controls{flex-wrap:wrap}.practice-saved{font-size:11px;margin:-8px 0 18px}
-.practice-translation-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px}.practice-translation-actions>.muted{font-size:11px}.practice-translation{border-left:3px solid #b5cea3;background:#f6f9f0;padding:12px 16px;margin:12px 0}.practice-translation-label{font-size:11px;color:#829674;margin:0 0 8px}.practice-option-content{flex:1;min-width:0}.practice-option-translation{border-top:1px dashed #d9e4ce;margin-top:10px;padding-top:10px;color:#708562}
-.practice-upload-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.practice-upload-actions label{display:flex;align-items:center;gap:8px;font-size:12px}.practice-upload-actions input:not([type=file]){width:100px}.practice-upload-actions>.muted{font-size:11px;flex-basis:100%}.practice-panel>.section-top select{max-width:min(400px,100%)}.practice-summary{display:flex;justify-content:space-between;gap:10px;margin:20px 0;font-size:12px;color:#829674}.practice-layout{display:grid;grid-template-columns:150px minmax(0,1fr);gap:25px}.practice-navigation{display:grid;grid-template-columns:repeat(4,1fr);align-content:start;gap:7px;max-height:540px;overflow:auto;padding:3px}.practice-number{border:1px solid #e2ead8;border-radius:7px;background:#fafcf7;color:#7c926c;min-height:32px;font-size:12px}.practice-number.active{outline:2px solid #789c61;outline-offset:1px}.practice-number.correct{background:#e4f1dd;border-color:#b5cea3}.practice-number.incorrect{background:#f9e7e0;border-color:#dec0b4;color:#a16953}.practice-number.viewed{background:#eef0df}.practice-question{min-width:0}.practice-question-meta{display:flex;flex-wrap:wrap;align-items:center;gap:10px;font-size:11px;color:#97a48c;margin-bottom:18px}.practice-options{border:0;padding:0;display:grid;gap:10px;margin:20px 0}.practice-option{display:flex;align-items:flex-start;gap:12px;border:1px solid #e1e9d7;border-radius:9px;padding:13px 15px;cursor:pointer;background:#fcfdf9}.practice-option.selected{border-color:#89a96f;background:#f0f6e9}.practice-option input{margin-top:6px;accent-color:#6b8e53;width:auto}.practice-option strong{font-size:13px;color:#74915d;padding-top:2px}.practice-option>.markdown-content{flex:1;min-width:0}.practice-draft{display:grid;gap:10px;margin:20px 0}.practice-draft label{font-size:12px;color:#7c926c}.practice-draft textarea{width:100%;resize:vertical;line-height:1.8}.practice-controls{display:flex;align-items:center;gap:15px;margin:22px 0}.practice-answer{padding:20px;border:1px solid #e2ebd9;border-radius:10px;background:#fafcf6}.practice-answer-origin{font-size:11px;color:#8f9e83;margin-bottom:14px;overflow-wrap:anywhere}.practice-paging{display:flex;justify-content:space-between;gap:12px;margin-top:25px}.practice-loading{padding:25px 0}.practice-loading h3{font-size:16px;color:#789268;margin-bottom:8px}.practice-loading .progress-track{margin-top:20px}.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)}
-@media(max-width:850px){.practice-layout{grid-template-columns:1fr}.practice-navigation{grid-template-columns:repeat(auto-fill,minmax(32px,1fr));max-height:140px}.practice-upload-actions>.button{font-size:11px}.practice-question-meta{font-size:10px}.practice-answer{padding:14px}.practice-panel>.section-top select{width:100%}}
+.practice-upload-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.practice-upload-actions label { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.practice-upload-actions input:not([type=file]) { width: 100px; }
+.practice-upload-actions > .muted { flex-basis: 100%; margin-top: 4px; }
+.practice-upload-hint { font-size: 12px; color: var(--warning); line-height: 1.8; }
+.practice-answer-pairing { display: grid; gap: 12px; margin-top: 22px; padding: 18px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-alt); }
+.practice-answer-pairing > strong { font-size: 13px; font-weight: 600; color: var(--ink); }
+.practice-pairing-controls { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
+.practice-pairing-controls label { display: grid; gap: 8px; flex: 1; min-width: min(240px, 100%); font-size: 13px; color: #53617b; }
+.practice-pairing-controls select { width: 100%; min-width: 0; max-width: 100%; }
+.practice-answer-pairing p { line-height: 1.8; margin: 0; }
+.practice-answer-pairing.needs-confirmation { border-color: #e7d4b1; background: var(--warning-soft); }
+.practice-pairing-notice { font-size: 13px; color: var(--warning); }
+.practice-answer-preparation { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; font-size: 12px; color: var(--accent-dark); background: var(--soft); border-radius: 8px; padding: 12px 15px; margin-top: 18px; }
+.practice-summary { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin: 20px 0; padding-bottom: 14px; border-bottom: 1px solid var(--line); font-size: 13px; color: var(--muted); }
+.practice-layout { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 26px; }
+.practice-navigation { display: grid; grid-template-columns: repeat(4, 1fr); align-content: start; gap: 8px; max-height: 540px; overflow: auto; padding: 4px; scrollbar-width: thin; }
+.practice-number { position: relative; border: 1px solid #d4ddeb; border-radius: 6px; background: var(--surface); color: #53617b; min-height: 36px; font-size: 13px; font-variant-numeric: tabular-nums; }
+.practice-number:not(:disabled):hover { border-color: var(--accent); }
+.practice-number.correct { background: var(--success-soft); border-color: #9bceba; color: var(--success); }
+.practice-number.incorrect { background: var(--danger-soft); border-color: #e0aeb5; color: var(--danger); }
+.practice-number.viewed { background: #eef1f8; }
+.practice-number.active { box-shadow: 0 0 0 2px var(--accent); border-color: var(--surface); font-weight: 700; }
+.practice-state { position: absolute; right: 2px; top: -3px; font-size: 9px; font-weight: 700; }
+.practice-question { min-width: 0; padding-top: 6px; }
+.practice-question > .markdown-content { font-size: 16px; line-height: 2; }
+.practice-question-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); margin-bottom: 20px; }
+.practice-delete-question { margin-left: auto; }
+.practice-options { border: 0; padding: 0; display: grid; gap: 12px; margin: 24px 0; min-width: 0; }
+.practice-option { display: flex; align-items: flex-start; gap: 12px; border: 1px solid #d6dfed; border-radius: 9px; padding: 15px 16px; cursor: pointer; background: var(--surface); transition: background-color .15s, border-color .15s; }
+.practice-option:hover { background: var(--surface-alt); border-color: #a7b8d5; }
+.practice-option.selected { border-color: var(--accent); background: #f0f4ff; box-shadow: inset 3px 0 var(--accent); }
+.practice-option:focus-within { outline: 2px solid var(--accent); outline-offset: 3px; }
+.practice-option input { margin: 7px 0 0; accent-color: var(--accent); width: 16px; height: 16px; flex-shrink: 0; }
+.practice-option strong { font-size: 14px; color: var(--accent); padding-top: 2px; font-weight: 650; }
+.practice-option-content { flex: 1; min-width: 0; }
+.practice-option-content .markdown-content { font-size: 15px; }
+.practice-translation-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+.practice-translation { border-left: 3px solid #9ab0e5; background: var(--surface-alt); padding: 14px 18px; margin: 16px 0; }
+.practice-translation-label { font-size: 12px; color: var(--muted); margin: 0 0 9px; }
+.practice-option-translation { border-top: 1px dashed #cdd7ea; margin-top: 12px; padding-top: 12px; color: #53617b; }
+.practice-draft { display: grid; gap: 10px; margin: 24px 0; }
+.practice-draft label { font-size: 13px; color: #53617b; }
+.practice-draft textarea { width: 100%; resize: vertical; line-height: 1.9; }
+.practice-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 24px 0; }
+.practice-saved { font-size: 12px; margin: -8px 0 18px; }
+.practice-answer { padding: 22px; border: 1px solid #d9e2ef; border-radius: 10px; background: var(--surface-alt); }
+.practice-answer-origin { font-size: 12px; color: var(--muted); margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.practice-paging { display: flex; justify-content: space-between; gap: 12px; margin-top: 28px; padding-top: 20px; border-top: 1px solid var(--line); }
+.practice-loading { padding: 25px 0; }
+.practice-loading h3 { font-size: 16px; margin-bottom: 8px; }
+.practice-loading .progress-track { margin-top: 20px; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); }
+@media (max-width: 850px) {
+  .practice-layout { grid-template-columns: 1fr; }
+  .practice-navigation { grid-template-columns: repeat(auto-fill, minmax(36px, 1fr)); max-height: 150px; }
+  .practice-answer { padding: 18px; }
+}
+@media (max-width: 600px) {
+  .practice-answer-pairing { padding: 14px; }
+  .practice-option { padding: 14px 12px; gap: 10px; }
+  .practice-controls { gap: 10px; }
+  .practice-answer { padding: 16px; }
+  .practice-draft textarea { font-size: 16px; }
+}
 </style>

@@ -16,6 +16,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from .agent import ReviewAgentService
+from .chat_answers import ChatAnswerGrounding
 from .config import Settings
 from .file_chapters import chapter_role, document_role
 from .llm import ModelClient, ModelRuntimeError, model_failure_message
@@ -79,11 +80,21 @@ class SessionNameInput(SessionInput):
     title: str = Field(min_length=1, max_length=100)
 
 
+class NoteChatInput(BaseModel):
+    outline_id: str = Field(min_length=1, max_length=100)
+    selected_text: str = Field(min_length=1, max_length=1200)
+    source_text: str = Field(min_length=1, max_length=4500)
+    start_line: int = Field(ge=0)
+    end_line: int = Field(ge=1)
+
+
 class ChatInput(BaseModel):
     message: str = Field(min_length=1, max_length=4000, validation_alias=AliasChoices("message", "question"))
     practice_question_id: str | None = Field(default=None, max_length=100)
+    wrong_question_id: str | None = Field(default=None, max_length=100)
+    note_context: NoteChatInput | None = None
     selected: list[str] = Field(default_factory=list, max_length=100)
-    own_answer: str = Field(default="", max_length=4000)
+    own_answer: str = Field(default="", max_length=20000)
 
     @field_validator("message")
     @classmethod
@@ -145,6 +156,11 @@ class WrongQuestionInput(BaseModel):
         return value
 
 
+class WrongQuestionReviewInput(BaseModel):
+    selected: list[str] = Field(default_factory=list, max_length=26)
+    own_answer: str = Field(default="", max_length=20000)
+
+
 def row(obj):
     return {column.name: getattr(obj, column.name) for column in obj.__table__.columns
             if column.name not in ("path", "snapshot", "chapter_results")}
@@ -169,6 +185,7 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
     services = Services(settings, embedder, llm)
     agent, outline_service = ReviewAgentService(services), OutlineService(services)
     practice = PracticeService(services)
+    agent.answer_grounding = ChatAnswerGrounding(practice)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -438,6 +455,10 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
     def add_wrong_question(course_id: str, payload: WrongQuestionInput):
         return practice.wrong_questions.add(course_id, payload.stem, payload.own_answer, payload.answer)
 
+    @app.post("/courses/{course_id}/wrong-questions/{identity}/reviews", status_code=201)
+    def review_wrong_question(course_id: str, identity: str, payload: WrongQuestionReviewInput):
+        return practice.wrong_questions.review(course_id, identity, payload.selected, payload.own_answer)
+
     @app.delete("/courses/{course_id}/wrong-questions/{identity}", status_code=204)
     def delete_wrong_question(course_id: str, identity: str):
         practice.wrong_questions.remove(course_id, identity)
@@ -664,13 +685,37 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
             require(db, ChatSession, session_id)
             return [{**row(m), "content": re.sub(r"\[S[a-fA-F0-9]{32}\]", "", m.content) if m.role == "assistant" else m.content,
                      "practice_context": next((c["practice_context"] for c in (m.citations or []) if "practice_context" in c), None) if m.role == "user" else None,
+                     "note_context": next((c["note_context"] for c in (m.citations or []) if "note_context" in c), None) if m.role == "user" else None,
                      "citations": []} for m in db.scalars(select(Message).where(Message.session_id == session_id).order_by(Message.created_at))]
 
     @app.post("/sessions/{session_id}/chat")
     def chat(session_id: str, payload: ChatInput):
-        practice_context = None
+        practice_context, note_context = None, None
         with services.lock, services.sessions() as db:
             session = require(db, ChatSession, session_id)
+            if sum(bool(value) for value in (payload.practice_question_id, payload.wrong_question_id, payload.note_context)) > 1:
+                raise HTTPException(422, "一次提问只能携带一道题目或一段笔记")
+            if payload.wrong_question_id:
+                practice_context = practice.wrong_questions.chat_context(
+                    db, session.course_id, payload.wrong_question_id, payload.selected, payload.own_answer)
+            if payload.note_context:
+                target = payload.note_context
+                note = require(db, Outline, target.outline_id)
+                if note.course_id != session.course_id:
+                    raise HTTPException(422, "所选笔记不属于当前课程")
+                lines = note.markdown.splitlines()
+                if not 0 <= target.start_line < target.end_line <= len(lines):
+                    raise HTTPException(422, "所选段落已变化，请重新选择")
+                excerpt = "\n".join(lines[target.start_line:target.end_line])
+                if excerpt != target.source_text:
+                    raise HTTPException(409, "笔记段落已更新，请重新选择需要解释的内容")
+                if not excerpt.strip() or len(excerpt.encode("utf-8")) > 4500:
+                    raise HTTPException(422, "所选段落过长，请缩小选择范围后再解释")
+                heading = next((re.sub(r"^#{1,6}\s+", "", line).strip() for line in reversed(lines[:target.start_line + 1])
+                                if re.match(r"^#{1,6}\s+", line)), "复习笔记")
+                note_context = {"outline_id": note.id, "heading": heading, "text": excerpt,
+                                "selected_text": target.selected_text, "start_line": target.start_line,
+                                "end_line": target.end_line, "stale": note.version != db.get(Course, session.course_id).version}
             if payload.practice_question_id:
                 q = require(db, PracticeQuestion, payload.practice_question_id)
                 doc = require(db, Document, q.document_id)
@@ -682,7 +727,7 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
                 keys = {o["key"] for o in q.options}
                 if any(key not in keys for key in payload.selected):
                     raise HTTPException(422, "当前题目的选项已变化，请刷新题目")
-                practice_context = {"question_id": q.id, "filename": doc.filename, "kind": doc.kind,
+                practice_context = {"question_id": q.id, "document_id": doc.id, "filename": doc.filename, "kind": doc.kind,
                                     "number": str(q.position + 1), "original_number": q.number, "section": q.section,
                                     "stem": q.stem, "options": q.options, "locator": q.locator,
                                     "selected": payload.selected, "own_answer": payload.own_answer}
@@ -701,7 +746,7 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
 
         def generate():
             try:
-                yield from agent.chat(session_id, payload.message, practice_context)
+                yield from agent.chat(session_id, payload.message, practice_context, note_context)
             finally:
                 lock.release()
         return StreamingResponse(generate(), media_type="text/event-stream",

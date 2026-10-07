@@ -1,6 +1,6 @@
 import type { SSEEvent } from './sse'
 import { readSSE } from './sse'
-import type { PracticeChatContext } from './types'
+import type { NoteChatContext, PracticeChatContext } from './types'
 
 export const API_BASE = (import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000').replace(/\/$/, '')
 
@@ -35,11 +35,13 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
   return response.json() as Promise<T>
 }
 
-export async function chatStream(sessionId: string, message: string, signal: AbortSignal, receive: (event: SSEEvent) => void, context?: PracticeChatContext | null): Promise<void> {
+export async function chatStream(sessionId: string, message: string, signal: AbortSignal, receive: (event: SSEEvent) => void, context?: PracticeChatContext | null, noteContext?: NoteChatContext | null): Promise<void> {
   const response = await fetch(`${API_BASE}/sessions/${encodeURIComponent(sessionId)}/chat`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message, practice_question_id: context?.question_id,
-      selected: context?.selected, own_answer: context?.own_answer }), signal,
+    body: JSON.stringify({ message, practice_question_id: context?.wrong_question_id ? undefined : context?.question_id,
+      wrong_question_id: context?.wrong_question_id, selected: context?.selected, own_answer: context?.own_answer,
+      note_context: noteContext ? { outline_id: noteContext.outline_id, selected_text: noteContext.selected_text,
+        source_text: noteContext.source_text, start_line: noteContext.start_line, end_line: noteContext.end_line } : undefined }), signal,
   })
   if (!response.ok) throw new Error(await errorMessage(response))
   if (!response.body) throw new Error('服务未返回可读取的回答流。')

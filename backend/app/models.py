@@ -193,3 +193,13 @@ class WrongQuestion(Base):
     reason: Mapped[str] = mapped_column(String, default="manual")
     created_at: Mapped[str] = mapped_column(String, default=now)
     updated_at: Mapped[str] = mapped_column(String, default=now)
+
+
+class WrongQuestionReview(Base):
+    __tablename__ = "wrong_question_reviews"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=new_id)
+    wrong_question_id: Mapped[str] = mapped_column(
+        ForeignKey("wrong_questions.id", ondelete="CASCADE"), index=True)
+    # Keep each attempt and its assessment independent of the original mistake.
+    content: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[str] = mapped_column(String, default=now)

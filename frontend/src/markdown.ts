@@ -104,9 +104,28 @@ function addMath(md: MarkdownIt) {
   }
 }
 
-export function renderMarkdown(content: string, sources: Source[] = []): string {
+export function renderMarkdown(content: string, sources: Source[] = [], notePositions = false): string {
   const md = new MarkdownIt({ html: false, linkify: false, breaks: true })
   addMath(md)
+  if (notePositions) {
+    md.core.ruler.push('note_positions', state => {
+      for (const token of state.tokens) {
+        if (token.block && token.map && (token.nesting === 1 || ['fence', 'code_block', 'math_block'].includes(token.type))) {
+          token.attrSet('data-note-start', String(token.map[0]))
+          token.attrSet('data-note-end', String(token.map[1]))
+        }
+      }
+    })
+    // Custom renderers need to forward the same source-line information.
+    for (const type of ['fence', 'code_block', 'math_block']) {
+      const renderer = md.renderer.rules[type]
+      if (renderer) md.renderer.rules[type] = (tokens, index, options, env, self) => {
+        const token = tokens[index]
+        const body = renderer(tokens, index, options, env, self)
+        return token.map ? `<div data-note-start="${token.map[0]}" data-note-end="${token.map[1]}">${body}</div>` : body
+      }
+    }
+  }
   const allowed = new Map<string, string>()
   for (const source of sources) {
     allowed.set(`S${source.chunk_id}`, source.chunk_id)

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api, chatStream, downloadOutline } from './api'
-import type { Block, Chapter, ChapterDraft, Course, Document, DocumentKind, Health, Job, Message, Outline, PracticeChatContext, Session, Source } from './types'
+import type { Block, Chapter, ChapterDraft, Course, Document, DocumentKind, Health, Job, Message, NoteChatContext, Outline, PracticeChatContext, Session, Source } from './types'
 import { kindLabels } from './types'
 import ChapterEditor from './components/ChapterEditor.vue'
 import MarkdownContent from './components/MarkdownContent.vue'
@@ -10,6 +10,8 @@ import ManagementDialog from './components/ManagementDialog.vue'
 import ModelSettings from './components/ModelSettings.vue'
 import PracticePanel from './components/PracticePanel.vue'
 import WrongQuestionsPanel from './components/WrongQuestionsPanel.vue'
+import NotesReader from './components/NotesReader.vue'
+import UiIcon from './components/UiIcon.vue'
 import { supportsUpload, uploadAccept, uploadFormatsLabel } from './uploadFormats'
 
 type Section = 'library' | 'outline' | 'practice' | 'wrong'
@@ -33,7 +35,10 @@ const practiceModelBusy = ref(false)
 const wrongBusy = ref(false)
 const wrongRevision = ref(0)
 const practiceContext = ref<PracticeChatContext | null>(null)
-const currentChatContext = computed(() => section.value === 'practice' ? practiceContext.value : null)
+const wrongContext = ref<PracticeChatContext | null>(null)
+const noteContext = ref<NoteChatContext | null>(null)
+const currentChatContext = computed(() => section.value === 'practice' ? practiceContext.value : section.value === 'wrong' ? wrongContext.value : null)
+const currentNoteContext = computed(() => section.value === 'outline' ? noteContext.value : null)
 const currentSession = computed(() => sessions.value.find(item => item.id === sessionId.value))
 watch(section, () => { void scrollChat() })
 type ManagementAction = 'rename-course' | 'delete-course' | 'new-session' | 'rename-session' | 'delete-session' | 'delete-outline'
@@ -95,12 +100,12 @@ const modelConfigured = computed(() => health.value?.llm_configured === true)
 const indexRepairRequired = computed(() => !!courseId.value && (health.value?.index_repair_courses || []).includes(courseId.value))
 const courseSwitchBusy = computed(() => initialLoading.value || courseLoading.value || chatting.value || uploadBusy.value || chapterBusy.value || outlineBusy.value || indexRepairBusy.value || !!documentBusy.value || newSessionBusy.value || creatingCourse.value || managementBusy.value || practiceBusy.value || wrongBusy.value)
 const chapterControlsBusy = computed(() => chapterBusy.value || courseLoading.value || indexRepairBusy.value || uploadBusy.value || processingCount.value > 0 || !!documentBusy.value || outlineBusy.value || !!activeJob.value || chatting.value || managementBusy.value)
-const canChat = computed(() => modelConfigured.value && readyCount.value > 0 && !indexRepairRequired.value && !indexRepairBusy.value && !courseLoading.value && !messagesLoading.value && !managementBusy.value && !chapterBusy.value && !newSessionBusy.value)
+const canChat = computed(() => modelConfigured.value && (readyCount.value > 0 || !!currentChatContext.value || !!currentNoteContext.value) && !indexRepairRequired.value && !indexRepairBusy.value && !courseLoading.value && !messagesLoading.value && !managementBusy.value && !chapterBusy.value && !newSessionBusy.value)
 const sectionMeta: Record<Section, { title: string; intro: string; label: string }> = {
-  library: { title: '每一份资料，都有条理。', intro: '先把课程资料放在一起，再确认你的复习路线。', label: '资料库' },
-  outline: { title: '把课程知识，整理成复习笔记。', intro: '按主题串起概念、原理、公式和方法，用比较表格理清区别。', label: '复习笔记' },
-  practice: { title: '边做题，边巩固所学。', intro: '按上传答案判题，模型答案仅供参考；作答与进度自动保存。', label: '在线练习' },
-  wrong: { title: '再看一遍，直到真正掌握。', intro: '自动收集答错的题目，也能手动加入需要复习的题目。', label: '错题本' },
+  library: { title: '课程资料', intro: '上传课件、笔记和真题，确认章节后开始复习。', label: '资料库' },
+  outline: { title: '复习笔记', intro: '按章节阅读知识重点，选中不理解的段落即可提问。', label: '复习笔记' },
+  practice: { title: '在线练习', intro: '作答与进度自动保存。按上传答案判题，模型答案仅供参考。', label: '在线练习' },
+  wrong: { title: '错题本', intro: '回顾需要巩固的题目，重新作答，或与右侧助手讨论。', label: '错题本' },
 }
 const statusLabels: Record<string, string> = { queued: '等待处理', processing: '解析文字、图片与公式', ready: '可用于复习', failed: '处理失败', running: '正在生成', completed: '已完成', interrupted: '已中断' }
 function date(value: string) { const d = new Date(value); return Number.isNaN(d.getTime()) ? value : d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) }
@@ -203,7 +208,7 @@ async function loadGroups(id = courseId.value) {
   if (courseId.value === id) groups.value = result
 }
 async function loadCourse(id: string) {
-  practiceContext.value = null
+  practiceContext.value = null; wrongContext.value = null; noteContext.value = null
   const generation = ++courseGeneration
   ++sessionGeneration; ++outlineGeneration
   ++sourceGeneration; showDrawer.value = false; question.value = ''; messagesLoading.value = false; outlineLoading.value = false
@@ -227,7 +232,9 @@ async function loadCourse(id: string) {
     if (generation !== courseGeneration) return
     sessionId.value = sessions.value[0]?.id || ''
     if (sessionId.value) await selectSession(sessionId.value)
-    selectedOutlineId.value = outlines.value[0]?.id || ''
+    let lastOutline = ''
+    try { lastOutline = localStorage.getItem(`review-note-outline:${id}`) || '' } catch { /* Optional reading history. */ }
+    selectedOutlineId.value = outlines.value.find(item => item.id === lastOutline)?.id || outlines.value[0]?.id || ''
     if (selectedOutlineId.value) await selectOutline(selectedOutlineId.value)
   } catch (error) { if (generation === courseGeneration) setError(error) }
   finally { if (generation === courseGeneration) courseLoading.value = false }
@@ -418,17 +425,24 @@ async function newSession(title = '新复习对话', id = courseId.value) {
   finally { newSessionBusy.value = false }
 }
 async function scrollChat() { await nextTick(); if (chatBox.value) chatBox.value.scrollTop = chatBox.value.scrollHeight }
+function explainNote(context: NoteChatContext) {
+  if (chatting.value) return
+  noteContext.value = { ...context }
+  question.value = '请解释选中的这段笔记，结合课程资料讲清概念、适用条件和推导过程。'
+  void sendQuestion()
+}
 async function sendQuestion() {
   const text = question.value.trim()
   if (!text || chatting.value || !canChat.value) return
   const context = currentChatContext.value ? JSON.parse(JSON.stringify(currentChatContext.value)) as PracticeChatContext : null
+  const note = currentNoteContext.value ? { ...currentNoteContext.value } : null
   clearFeedback()
   chatting.value = true
   if (!sessionId.value) { await newSession(); if (!sessionId.value) { chatting.value = false; return } }
   const currentSession = sessionId.value
   question.value = ''; chatting.value = true; chatStatus.value = '正在准备检索…'
   const controller = new AbortController(); activeController = controller
-  const user: VisibleMessage = { id: `local-user-${Date.now()}`, role: 'user', content: text, citations: [], created_at: new Date().toISOString(), practice_context: context }
+  const user: VisibleMessage = { id: `local-user-${Date.now()}`, role: 'user', content: text, citations: [], created_at: new Date().toISOString(), practice_context: context, note_context: note }
   const answer = ref<VisibleMessage>({ id: `local-assistant-${Date.now()}`, role: 'assistant', content: '', citations: [], created_at: new Date().toISOString(), pending: true })
   messages.value.push(user, answer.value)
   // Use the reactive array member so streaming updates render immediately.
@@ -446,7 +460,7 @@ async function sendQuestion() {
         visibleAnswer.content = typeof data.content === 'string' ? data.content : visibleAnswer.content
         visibleAnswer.citations = []
       }
-    }, context)
+    }, context, note)
     if (!completed) throw new Error('回答流意外结束，未收到完成确认。')
     sessions.value = await api<Session[]>(`/courses/${courseId.value}/sessions`)
   } catch (error) {
@@ -461,6 +475,7 @@ async function sendQuestion() {
 }
 function keyboard(event: KeyboardEvent) { if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); void sendQuestion() } }
 async function selectOutline(id: string) {
+  noteContext.value = null
   const generation = ++outlineGeneration; selectedOutlineId.value = id; outlineLoading.value = true
   try {
     const result = await api<Outline>(`/outlines/${id}`)
@@ -468,6 +483,7 @@ async function selectOutline(id: string) {
     const resultJob = await api<Job>(`/jobs/${result.job_id}`)
     if (generation !== outlineGeneration) return
     outline.value = result; job.value = resultJob
+    try { localStorage.setItem(`review-note-outline:${courseId.value}`, id) } catch { /* Optional reading history. */ }
   } catch (error) { if (generation === outlineGeneration) setError(error) }
   finally { if (generation === outlineGeneration) outlineLoading.value = false }
 }
@@ -529,10 +545,11 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer); activeController?.a
 
 <template>
   <div class="app-shell">
+    <a class="skip-link" href="#main-content">跳到主要内容</a>
     <aside class="sidebar course-sidebar">
-      <a class="brand" href="#" @click.prevent="section = 'library'"><div class="brand-mark"><span></span><span></span><span></span></div><div><strong>知页</strong><small>期末复习 Agent</small></div></a>
+      <a class="brand" href="#" @click.prevent="section = 'library'"><div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div><div><strong>知页</strong><small>课程复习工作台</small></div></a>
       <div class="workspace-label">你的复习空间</div>
-      <nav class="main-nav" aria-label="主要功能"><button v-for="(item, key) in sectionMeta" :key="key" :class="['nav-item', { active: section === key }]" @click="section = key as Section"><span class="nav-symbol">{{ key === 'library' ? '▤' : key === 'outline' ? '≡' : key === 'practice' ? '✓' : key === 'wrong' ? '☆' : '◌' }}</span><span>{{ item.label }}</span><span v-if="section === key" class="nav-active-dot"></span></button></nav>
+      <nav class="main-nav" aria-label="主要功能"><button v-for="(item, key) in sectionMeta" :key="key" :class="['nav-item', { active: section === key }]" :aria-current="section === key ? 'page' : undefined" @click="section = key as Section"><UiIcon :name="key as Section" /><span>{{ item.label }}</span><span v-if="section === key" class="nav-active-dot" aria-hidden="true"></span></button></nav>
       <div class="sidebar-courses">
         <div class="courses-heading"><strong>全部课程 <span class="count-badge">{{ courses.length }}</span></strong><button class="icon-button small" aria-label="新建课程" title="新建课程" :disabled="courseSwitchBusy" @click="newCourseOpen = !newCourseOpen">＋</button></div>
         <form v-if="newCourseOpen" class="sidebar-course-form" @submit.prevent="createCourse"><input v-model="newCourseName" aria-label="新课程名称" placeholder="输入课程名称" maxlength="100" :disabled="courseSwitchBusy" /><div><button class="button primary small" :disabled="courseSwitchBusy || !newCourseName.trim()">{{ creatingCourse ? '创建中…' : '创建' }}</button><button type="button" class="text-button" :disabled="creatingCourse" @click="newCourseOpen = false">取消</button></div></form>
@@ -542,42 +559,42 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer); activeController?.a
       <div class="sidebar-bottom"><span class="leaf-icon">✳</span><p>让复习有出处，<br />让每一页都连起来。</p><div class="local-badge"><span></span> 本机个人工作台</div></div>
     </aside>
     <div class="workspace managed-workspace">
-      <header class="topbar"><div class="breadcrumb">复习空间 <span>/</span> {{ sectionMeta[section].label }}</div><div class="topbar-actions"><button class="button subtle small" @click="modelSettingsOpen = true">⚙ 模型配置</button><div :class="['health-pill', { offline: !!connectionError }]" :title="connectionError || '后端服务已连接'"><span></span>{{ initialLoading ? '连接中' : connectionError ? '服务未连接' : '服务已连接' }}</div></div></header>
-      <main class="main-content" :class="{ 'with-review-chat': courseId && section !== 'library' }">
-        <div class="page-heading"><div><p class="eyebrow">STUDY / {{ course?.name || '从一门课程开始' }}</p><h1>{{ sectionMeta[section].title }}</h1><p>{{ sectionMeta[section].intro }}</p></div><div class="heading-note"><span>一点一点，</span><strong>把知识串起来。</strong></div></div>
+      <header class="topbar"><div class="breadcrumb"><span class="breadcrumb-course">{{ course?.name || '复习空间' }}</span><span class="breadcrumb-divider">/</span><span>{{ sectionMeta[section].label }}</span></div><div class="topbar-actions"><button class="button subtle small" @click="modelSettingsOpen = true"><UiIcon name="settings" />模型配置</button><div :class="['health-pill', { offline: !!connectionError }]" :title="connectionError || '后端服务已连接'"><span></span>{{ initialLoading ? '连接中' : connectionError ? '服务未连接' : '服务已连接' }}</div></div></header>
+      <main id="main-content" tabindex="-1" class="main-content" :class="{ 'with-review-chat': courseId && section !== 'library' }">
+        <div class="page-heading"><div><p class="course-caption">{{ course?.name || '从一门课程开始' }}</p><h1>{{ sectionMeta[section].title }}</h1><p>{{ sectionMeta[section].intro }}</p></div><div v-if="course" class="heading-note"><span>当前课程</span><strong>{{ readyCount }} 份资料可用于复习</strong></div></div>
         <div v-if="connectionError" class="notice error" role="alert"><strong>无法连接服务</strong><span>{{ connectionError }}</span><button class="text-button" @click="initialise">重新连接</button></div>
-        <div v-else-if="health && !modelConfigured" class="notice warning"><strong>聊天模型尚未配置</strong><span>资料上传与目录整理可以使用。点击“模型配置”，选择服务商并填写模型和 API Key，保存后即可生成回答和复习笔记。</span><button class="text-button" @click="modelSettingsOpen = true">配置模型 →</button></div>
+        <div v-else-if="health && !modelConfigured" class="notice warning"><strong>聊天模型尚未配置</strong><span>资料上传与目录整理可以使用。点击“模型配置”，选择服务商并填写模型和 API Key，保存后即可生成回答和复习笔记。</span><button class="text-button" @click="modelSettingsOpen = true">配置模型</button></div>
         <div v-if="health && !health.embedding_ready && documents.length && !indexRepairRequired" class="notice info"><span>检索模型将在需要时加载。已下载的模型直接从本地读取；尚未下载时需要联网获取模型文件。</span></div>
         <div v-if="indexRepairRequired" class="notice warning"><strong>本地检索索引需要重新建立</strong><span>{{ indexRepairBusy ? '正在用本地向量模型重新处理已保存资料，请等待完成。首次加载模型可能较慢；此操作不会调用聊天模型。' : '资料、章节目录和复习笔记仍保留。点击重新建立索引后再使用问答；复习笔记仍可正常生成。' }}</span><button class="button subtle small" :disabled="indexRepairBusy || chapterBusy || !!activeJob || chatting" @click="repairIndex">{{ indexRepairBusy ? '正在重新建立…' : '重新建立索引' }}</button></div>
         <div v-if="actionError" class="notice error feedback" role="alert"><span>{{ actionError }}</span><button class="icon-button small" aria-label="关闭错误提示" @click="actionError = ''">×</button></div>
         <div v-if="success" class="notice success feedback" role="status"><span>{{ success }}</span><button class="icon-button small" aria-label="关闭成功提示" @click="success = ''">×</button></div>
         <div v-if="initialLoading || courseLoading" class="loading-bar">正在加载复习空间…</div>
-        <section v-if="!courseId && !initialLoading" class="panel welcome-panel"><div class="welcome-art"><span>知识</span><span>笔记</span><span>问题</span><i></i></div><p class="eyebrow">START HERE</p><h2>先为一门课程建个空间</h2><p>上传课件、笔记和往年真题，整理成一份按主题组织的复习笔记。</p><form @submit.prevent="createCourse"><input v-model="newCourseName" aria-label="新课程名称" placeholder="输入课程名称" maxlength="100" /><button class="button primary" :disabled="creatingCourse || !newCourseName.trim()">创建复习空间 →</button></form></section>
+        <section v-if="!courseId && !initialLoading" class="panel welcome-panel"><div class="welcome-art" aria-hidden="true"><span>资料</span><span>笔记</span><span>练习</span></div><h2>从第一门课程开始</h2><p>把课件、笔记和真题放在一起，随时阅读、练习和提问。</p><form @submit.prevent="createCourse"><input v-model="newCourseName" aria-label="新课程名称" placeholder="例如：数据结构" maxlength="100" /><button class="button primary" :disabled="creatingCourse || !newCourseName.trim()">{{ creatingCourse ? '创建中…' : '创建课程' }}</button></form></section>
 
         <template v-if="courseId && section === 'library'">
           <div class="stats-row"><div class="stat-card"><span>课程资料</span><strong>{{ documents.length }}<small>份</small></strong><p>{{ processingCount ? `${processingCount} 份正在处理` : '按类型组织课程内容' }}</p></div><div class="stat-card"><span>可用于复习</span><strong>{{ readyCount }}<small>份</small></strong><p>解析完成并已建立索引</p></div><div class="stat-card"><span>已提取原文</span><strong>{{ unitCount }}<small>处</small></strong><p>页、幻灯片或文档内容位置</p></div><div class="stat-card accent"><span>章节路线</span><strong>{{ knowledgeChapters.length }}<small>章</small></strong><p>{{ confirmed ? '目录已确认，准备好生成复习笔记' : '下一步：确认章节目录' }}</p></div></div>
-          <section class="panel"><div class="section-top"><div><p class="eyebrow">01 / 课程资料</p><h2>给复习准备好材料</h2><p class="muted">自动提取文档正文、图片文字和公式，无法识别的内容会跳过。</p></div><span class="badge neutral">支持批量上传</span></div>
+          <section class="panel"><div class="section-top"><div><h2>上传与管理资料</h2><p class="muted">自动提取正文、图片文字和公式，保留原文位置。</p></div><span class="badge neutral">支持批量上传</span></div>
             <div class="upload-options"><label>资料类型<select v-model="uploadKind" :disabled="uploadBusy"><option v-for="(label, key) in kindLabels" :key="key" :value="key">{{ label }}</option></select></label><label v-if="uploadKind === 'exam' || uploadKind === 'exercise' || uploadKind === 'answer'">年份 <span class="muted">（可选）</span><input v-model="uploadYear" type="text" inputmode="numeric" maxlength="4" placeholder="例如 2024" :disabled="uploadBusy" /></label><p>同批文件使用相同类型；不同类型请分批上传。</p></div>
-            <div :class="['upload-area', { dragging: dragOver, busy: uploadBusy }]" @dragover.prevent="dragOver = true" @dragleave.prevent="dragOver = false" @drop.prevent="drop"><div class="upload-icon">↑</div><h3>{{ uploadBusy ? '正在接收资料…' : '把资料拖到这里' }}</h3><p>{{ uploadLabel || (indexRepairRequired ? '请先重新建立索引，再加入新资料' : '保留原文位置，让每次回答都有据可查') }}</p><button class="button primary" :disabled="uploadBusy || indexRepairRequired || indexRepairBusy" @click="fileInput?.click()">{{ uploadBusy ? '上传中…' : '选择文件' }}</button><input ref="fileInput" type="file" multiple :accept="uploadAccept" hidden @change="upload(($event.target as HTMLInputElement).files || [])" /><small>{{ uploadFormatsLabel }}</small></div>
+            <div :class="['upload-area', { dragging: dragOver, busy: uploadBusy }]" @dragover.prevent="dragOver = true" @dragleave.prevent="dragOver = false" @drop.prevent="drop"><div class="upload-icon"><UiIcon name="upload" /></div><div class="upload-description"><h3>{{ uploadBusy ? '正在接收资料…' : '拖入课程资料' }}</h3><p>{{ uploadLabel || (indexRepairRequired ? '请先重新建立索引，再加入新资料' : '可以一次选择多个文件') }}</p><small>{{ uploadFormatsLabel }}</small></div><button class="button primary" :disabled="uploadBusy || indexRepairRequired || indexRepairBusy" @click="fileInput?.click()">{{ uploadBusy ? '上传中…' : '选择文件' }}</button><input ref="fileInput" type="file" multiple :accept="uploadAccept" hidden @change="upload(($event.target as HTMLInputElement).files || [])" /></div>
             <div class="list-heading"><strong>全部资料 <span class="count-badge">{{ documents.length }}</span></strong><div class="inline-actions"><button v-if="readyCount && !indexRepairRequired" class="text-button" :disabled="indexRepairBusy || chapterBusy || !!activeJob || chatting" @click="repairIndex">{{ indexRepairBusy ? '正在修复…' : '修复索引' }}</button><button class="text-button" @click="refreshDocuments().catch(setError)">刷新状态 ↻</button></div></div>
             <div v-if="!documents.length" class="empty-state compact"><p>还没有课程资料</p><span>建议先上传少量资料，检查解析内容后再逐批加入。</span></div>
             <div v-for="document in documents" :key="document.id" class="document-row"><div :class="['file-type', document.filename.split('.').pop()?.toLowerCase()]">{{ document.filename.split('.').pop()?.toUpperCase() }}</div><div class="document-info"><h3>{{ document.filename }}</h3><div class="document-meta"><span>{{ kindLabels[document.kind] }}</span><span v-if="document.year">{{ document.year }} 年</span><span v-if="document.units_total">{{ document.units_with_text }} / {{ document.units_total }} 处有内容</span></div><p v-if="document.error" class="document-error">{{ document.error }}</p></div><span :class="['badge', document.status]">{{ statusLabels[document.status] || document.status }}</span><div class="document-actions"><button class="text-button" :disabled="['queued', 'processing'].includes(document.status)" @click="preview(document)">原文预览</button><button v-if="document.status === 'ready'" class="text-button" :disabled="!!documentBusy || uploadBusy || indexRepairRequired || indexRepairBusy || !!activeJob || processingCount > 0" @click="reparseDocument(document.id)">重新解析（OCR）</button><button v-if="document.status === 'failed'" class="text-button" :disabled="!!documentBusy || indexRepairRequired || indexRepairBusy || !!activeJob" @click="retryDocument(document.id)">重试</button><button class="text-button danger" :disabled="documentBusy === document.id || uploadBusy || ['queued', 'processing'].includes(document.status)" @click="deleteDocument(document)">删除</button></div></div>
           </section>
           <ChapterEditor :key="courseId" :chapters="chapters" :groups="groups" :busy="chapterControlsBusy" @save="saveChapters" @edit="editChapters" @delete="deleteChapter" @draft="draftChapters" />
-          <div v-if="confirmed" class="next-step"><span>复习路线已经准备好了。</span><button class="text-button" @click="section = 'outline'">去生成复习笔记 →</button></div>
+          <div v-if="confirmed" class="next-step"><span>复习路线已经准备好了。</span><button class="text-button" @click="section = 'outline'">生成复习笔记</button></div>
         </template>
 
         <div v-if="courseId" v-show="section !== 'library'" class="study-workspace">
           <div class="study-content">
         <template v-if="section === 'outline'">
-          <section class="outline-intro panel"><div class="outline-illustration"><span>01</span><span>02</span><span>03</span></div><div><p class="eyebrow">YOUR REVIEW NOTES</p><h2>一门课，一份连贯的复习笔记</h2><p>围绕核心主题整理概念、原理、公式和算法，用表格比较容易混淆的内容。</p><div class="outline-checks"><span :class="{ checked: readyCount > 0 }">{{ readyCount > 0 ? '✓' : '○' }} {{ readyCount }} 份可用资料</span><span :class="{ checked: confirmed }">{{ confirmed ? '✓' : '○' }} {{ confirmed ? '章节已确认' : '章节待确认' }}</span></div></div><button class="button primary" :disabled="!confirmed || !readyCount || !modelConfigured || indexRepairBusy || outlineBusy || !!activeJob || !!processingCount" @click="createOutline">{{ activeJob ? '正在生成…' : outlineBusy ? '创建任务…' : '生成复习笔记 →' }}</button></section>
-          <div v-if="!confirmed" class="notice info"><span>生成前，请先在资料库确认章节目录与资料归属。</span><button class="text-button" @click="section = 'library'">去确认目录 →</button></div>
+          <section class="outline-intro panel"><div class="outline-illustration" aria-hidden="true"><UiIcon name="outline" /></div><div><h2>按课程资料生成笔记</h2><p>整理概念、公式和方法，用表格比较容易混淆的知识。</p><div class="outline-checks"><span :class="{ checked: readyCount > 0 }">{{ readyCount > 0 ? '✓' : '○' }} {{ readyCount }} 份可用资料</span><span :class="{ checked: confirmed }">{{ confirmed ? '✓' : '○' }} {{ confirmed ? '章节已确认' : '章节待确认' }}</span></div></div><button class="button primary" :disabled="!confirmed || !readyCount || !modelConfigured || indexRepairBusy || outlineBusy || !!activeJob || !!processingCount" @click="createOutline">{{ activeJob ? '正在生成…' : outlineBusy ? '创建任务…' : '生成复习笔记' }}</button></section>
+          <div v-if="!confirmed" class="notice info"><span>生成前，请先在资料库确认章节目录与资料归属。</span><button class="text-button" @click="section = 'library'">确认章节目录</button></div>
           <div v-if="processingCount" class="notice info">还有 {{ processingCount }} 份资料正在处理，请待入库完成后再生成复习笔记。</div>
           <section v-if="displayedJob" class="panel job-panel"><div class="section-top"><div><h3>{{ statusLabels[displayedJob.status] || displayedJob.status }}</h3><p class="muted">{{ displayedJob.stage || '准备整理课程资料' }}</p></div><strong>{{ Math.round(displayedJob.progress || 0) }}%</strong></div><div class="progress-track"><span :style="{ width: `${Math.min(100, Math.max(0, displayedJob.progress || 0))}%` }"></span></div><p v-if="displayedJob.error" class="document-error">{{ displayedJob.error }}</p><button v-if="['failed', 'interrupted'].includes(displayedJob.status)" class="button subtle" :disabled="outlineBusy || !!activeJob || !modelConfigured || indexRepairRequired || indexRepairBusy" @click="retryOutline">重试未完成章节</button></section>
-          <section class="panel outline-content-panel"><div class="section-top"><div><p class="eyebrow">MARKDOWN / 复习笔记</p><h2>你的复习笔记</h2></div><div class="inline-actions"><select v-if="outlines.length" :value="selectedOutlineId" aria-label="选择历史笔记" :disabled="outlineBusy || outlineLoading || managementBusy" @change="selectOutline(($event.target as HTMLSelectElement).value)"><option v-for="item in outlines" :key="item.id" :value="item.id">{{ date(item.created_at) }} · {{ statusLabels[item.status] || item.status }}{{ item.stale ? ' · 已过期' : '' }}</option></select><button v-if="outline?.stale" class="button subtle danger" :disabled="outlineLoading || outlineBusy || !!activeJob || managementBusy" @click="deleteOldOutline">删除过期笔记</button><button class="button subtle" :disabled="!outline?.markdown" @click="exportOutline">↓ 下载 .md</button></div></div>
+          <section class="panel outline-content-panel"><div class="section-top"><div><h2>阅读笔记</h2></div><div class="inline-actions"><select v-if="outlines.length" :value="selectedOutlineId" aria-label="选择历史笔记" :disabled="outlineBusy || outlineLoading || managementBusy" @change="selectOutline(($event.target as HTMLSelectElement).value)"><option v-for="item in outlines" :key="item.id" :value="item.id">{{ date(item.created_at) }} · {{ statusLabels[item.status] || item.status }}{{ item.stale ? ' · 已过期' : '' }}</option></select><button v-if="outline?.stale" class="button subtle danger" :disabled="outlineLoading || outlineBusy || !!activeJob || managementBusy" @click="deleteOldOutline">删除过期笔记</button><button class="button subtle" :disabled="!outline?.markdown" @click="exportOutline">下载笔记 .md</button></div></div>
             <div v-if="outline?.stale" class="notice warning"><strong>这份笔记已过期</strong><span>资料或章节已经变化。可重新生成，也可点击“删除过期笔记”清除当前选中的旧版本。</span></div>
             <div v-if="outline?.status === 'completed' && outline.current_style && outline.style !== outline.current_style" class="notice info">这是之前生成的笔记。点击上方生成按钮，可重新整理；英文资料中的关键名词会同时保留英文。</div>
-            <p v-if="outlineLoading" class="loading-bar">正在读取复习笔记…</p><MarkdownContent v-else-if="outline?.markdown" :content="outline.markdown" /><div v-else class="empty-state outline-empty"><div class="empty-symbol">≡</div><h3>{{ activeJob ? '正在把资料整理成复习笔记' : '复习笔记从这里开始' }}</h3><p>{{ activeJob ? '正在筛选重点、合并主题，章节完成后会保存。' : '上传资料、确认目录，再按主题生成复习笔记。' }}</p><div class="outline-tags"><span>概念与原理</span><span>公式与条件</span><span>算法步骤</span><span>比较表格</span></div></div>
+            <p v-if="outlineLoading" class="loading-bar">正在读取复习笔记…</p><NotesReader v-else-if="outline?.markdown" :key="outline.id" :course-id="courseId" :outline-id="outline.id" :content="outline.markdown" :discussion-busy="chatting || messagesLoading || courseLoading || managementBusy" @explain="explainNote" /><div v-else class="empty-state outline-empty"><div class="empty-symbol"><UiIcon name="outline" /></div><h3>{{ activeJob ? '正在把资料整理成复习笔记' : '复习笔记从这里开始' }}</h3><p>{{ activeJob ? '正在筛选重点、合并主题，章节完成后会保存。' : '上传资料、确认目录，再按主题生成复习笔记。' }}</p><div class="outline-tags"><span>概念与原理</span><span>公式与条件</span><span>算法步骤</span><span>比较表格</span></div></div>
           </section>
         </template>
 
@@ -585,7 +602,7 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer); activeController?.a
           <PracticePanel v-if="section === 'practice'" :course-id="courseId" :documents="documents" :model-configured="modelConfigured" :wrong-revision="wrongRevision" :deletion-busy="!!documentBusy || uploadBusy || indexRepairBusy || managementBusy || chapterBusy" :deleting-document-id="documentBusy" :upload-blocked="indexRepairRequired || indexRepairBusy" @delete-document="deleteDocument" @refresh="refreshDocuments().catch(setError)" @busy="practiceBusy = $event" @model-busy="practiceModelBusy = $event" @wrong-change="wrongRevision++" @context-change="practiceContext = $event" />
         </KeepAlive>
 
-        <WrongQuestionsPanel v-if="courseId && section === 'wrong'" :key="courseId" :course-id="courseId" :revision="wrongRevision" @busy="wrongBusy = $event" @change="wrongRevision++" />
+        <WrongQuestionsPanel v-if="courseId && section === 'wrong'" :key="courseId" :course-id="courseId" :revision="wrongRevision" :discussion-busy="chatting || messagesLoading || courseLoading || managementBusy" :active-question-id="wrongContext?.wrong_question_id || ''" @busy="wrongBusy = $event" @change="wrongRevision++" @context-change="wrongContext = $event" />
 
           </div>
           <aside class="review-chat panel review-chat-floating" aria-label="复习对话">
@@ -593,13 +610,15 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer); activeController?.a
               <header class="chat-top"><div><span class="chat-avatar">知</span><strong>复习对话</strong></div><button class="text-button" :disabled="chatting || newSessionBusy || courseLoading || managementBusy" @click="nameNewSession">＋ 新会话</button></header>
               <div class="chat-session-bar"><select :value="sessionId" aria-label="选择复习会话" :disabled="chatting || newSessionBusy || messagesLoading || managementBusy" @change="selectSession(($event.target as HTMLSelectElement).value)"><option v-if="!sessionId" value="">开始新的复习对话</option><option v-for="item in sessions" :key="item.id" :value="item.id">{{ item.title }}</option></select><button v-if="currentSession" class="text-button" :disabled="chatting || newSessionBusy || managementBusy" @click="renameSession(currentSession)">改名</button><button v-if="currentSession" class="text-button danger" :disabled="chatting || newSessionBusy || managementBusy" @click="deleteSession(currentSession)">删除</button></div>
               <div v-if="currentChatContext" class="chat-question-context" role="status"><strong>正在讨论第 {{ currentChatContext.number }} 题</strong><span :title="currentChatContext.filename">{{ currentChatContext.filename }}</span></div>
-              <div ref="chatBox" class="message-list" aria-live="polite"><p v-if="messagesLoading" class="muted">正在读取历史会话…</p><div v-else-if="!messages.length" class="chat-welcome"><div class="chat-welcome-mark">✳</div><p class="eyebrow">LET'S CONNECT THE DOTS</p><h2>{{ currentChatContext ? '这道题，哪里还没弄懂？' : '有疑问，随时问。' }}</h2><p>{{ currentChatContext ? '已自动带上当前题目和你的作答，可以直接提问或追问。' : '边看笔记、边做题，随时解释概念和梳理思路。' }}</p></div>
-                <article v-for="message in messages" :key="message.id" :class="['message', message.role]"><div class="message-avatar">{{ message.role === 'user' ? '我' : '知' }}</div><div class="message-body"><div class="message-label">{{ message.role === 'user' ? '你' : '复习助手' }}<span v-if="message.pending" class="streaming-label">正在整理…</span><span v-if="message.incomplete" class="incomplete-label">未完成 · 仅本地保留</span></div><div v-if="message.role === 'user'" class="user-text"><small v-if="message.practice_context" class="message-question-label">第 {{ message.practice_context.number }} 题 · {{ message.practice_context.filename }}</small>{{ message.content }}</div><MarkdownContent v-else-if="message.content" :content="message.content" hide-citations /><div v-else-if="message.pending" class="thinking"><span></span><span></span><span></span><small>{{ chatStatus }}</small></div><p v-else-if="message.incomplete" class="muted">本次没有收到完整回答，可以重新提问。</p></div></article>
+              <div v-if="currentNoteContext" class="chat-question-context" role="status"><strong>正在解释 · {{ currentNoteContext.heading }}</strong><span :title="currentNoteContext.selected_text">{{ currentNoteContext.selected_text }}</span><button type="button" class="text-button" :disabled="chatting" @click="noteContext = null">取消段落上下文</button></div>
+              <button v-if="section === 'wrong' && currentChatContext" type="button" class="text-button chat-clear-context" :disabled="chatting" @click="wrongContext = null">取消题目上下文</button>
+              <div ref="chatBox" class="message-list" aria-live="polite"><p v-if="messagesLoading" class="muted">正在读取历史会话…</p><div v-else-if="!messages.length" class="chat-welcome"><div class="chat-welcome-mark"><UiIcon name="chat" /></div><h2>{{ currentChatContext ? '这道题，哪里还没弄懂？' : currentNoteContext ? '一起读懂这段笔记' : '在这里理清思路' }}</h2><p>{{ currentChatContext ? '已带上当前题目和你的作答，直接提问即可。' : currentNoteContext ? '已带上选中的笔记段落，可以继续追问概念、公式或例子。' : '可以提问课程概念、比较解题方法，也可以继续追问。回答会结合当前课程资料。' }}</p></div>
+                <article v-for="message in messages" :key="message.id" :class="['message', message.role]"><div class="message-avatar">{{ message.role === 'user' ? '我' : '知' }}</div><div class="message-body"><div class="message-label">{{ message.role === 'user' ? '你' : '复习助手' }}<span v-if="message.pending" class="streaming-label">正在整理…</span><span v-if="message.incomplete" class="incomplete-label">未完成 · 仅本地保留</span></div><div v-if="message.role === 'user'" class="user-text"><small v-if="message.practice_context" class="message-question-label">第 {{ message.practice_context.number }} 题 · {{ message.practice_context.filename }}</small><small v-if="message.note_context" class="message-question-label">笔记 · {{ message.note_context.heading }} · {{ message.note_context.selected_text.slice(0, 90) }}</small>{{ message.content }}</div><MarkdownContent v-else-if="message.content" :content="message.content" hide-citations /><div v-else-if="message.pending" class="thinking"><span></span><span></span><span></span><small>{{ chatStatus }}</small></div><p v-else-if="message.incomplete" class="muted">本次没有收到完整回答，可以重新提问。</p></div></article>
               </div>
-              <form class="chat-composer" @submit.prevent="sendQuestion"><div v-if="chatting" class="chat-status"><span class="pulse-dot"></span>{{ chatStatus || '正在生成回答…' }}<button type="button" class="text-button" @click="activeController?.abort()">停止生成</button></div><div v-if="indexRepairRequired" class="composer-notice">课程检索索引需要修复，请点击上方“重新建立索引”。</div><div v-else-if="!modelConfigured" class="composer-notice">配置聊天模型后，即可使用复习问答。</div><div v-else-if="!readyCount" class="composer-notice">先上传并处理至少一份资料，再开始提问。</div><div class="composer-input"><textarea v-model="question" rows="2" :disabled="!canChat || chatting" :placeholder="currentChatContext ? '直接问这道题，也可以结合你的作答追问…' : '围绕课程资料提问，或继续追问…'" aria-label="复习问题" @keydown="keyboard"></textarea><button class="send-button" aria-label="发送问题" :disabled="!question.trim() || !canChat || chatting">↑</button></div><div class="composer-footer"><span>Enter 发送 · Shift + Enter 换行</span><span>基于当前课程资料回答</span></div></form>
+              <form class="chat-composer" @submit.prevent="sendQuestion"><div v-if="chatting" class="chat-status"><span class="pulse-dot"></span>{{ chatStatus || '正在生成回答…' }}<button type="button" class="text-button" @click="activeController?.abort()">停止生成</button></div><div v-if="indexRepairRequired" class="composer-notice">课程检索索引需要修复，请点击上方“重新建立索引”。</div><div v-else-if="!modelConfigured" class="composer-notice">配置聊天模型后，即可使用复习问答。</div><div v-else-if="!readyCount && !currentChatContext && !currentNoteContext" class="composer-notice">先上传并处理至少一份资料，再开始提问。</div><div class="composer-input"><textarea v-model="question" rows="2" :disabled="!canChat || chatting" :placeholder="currentChatContext ? '直接问这道题，也可以结合你的作答追问…' : currentNoteContext ? '围绕选中的笔记段落继续追问…' : '围绕课程资料提问，或继续追问…'" aria-label="复习问题" @keydown="keyboard"></textarea><button class="send-button" aria-label="发送问题" :disabled="!question.trim() || !canChat || chatting">↑</button></div><div class="composer-footer"><span>Enter 发送 · Shift + Enter 换行</span><span>基于当前课程资料回答</span></div></form>
             </div></aside>
         </div>
-        <footer class="page-footer"><span>知页 · 把资料连成知识</span><span>PDF / PPTX / DOCX → 章节 → 复习笔记 → 复习</span></footer>
+        <footer class="page-footer"><span>知页 · 课程复习工作台</span><span>资料与学习记录保存在本机</span></footer>
       </main>
     </div>
     <SourceDrawer v-if="showDrawer" :source="source" :loading="sourceLoading" :error="sourceError" @close="showDrawer = false; ++sourceGeneration" />

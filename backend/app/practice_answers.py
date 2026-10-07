@@ -394,6 +394,28 @@ class UploadedAnswerPreparation:
                 raise HTTPException(409, "尚未确认这份试卷的答案文件。请在上传区的“试卷答案关联”中选择对应答案并保存；没有对应答案时可选择“不使用上传答案”。")
             return True, result
 
+    def chat_matches(self, document_id):
+        """Reuse source-validated matches without starting model work in chat."""
+        try:
+            context = self.context(document_id)
+        except HTTPException:
+            return []
+        if context["waiting"] or context["needs_pairing"]:
+            return []
+        matcher = LocalAnswerMatcher(context)
+        matches = []
+        for question in context["questions"]:
+            try:
+                found, resolution = self.entry(document_id, context["signature"], self.key(question))
+            except (HTTPException, StructuredOutputError):
+                continue
+            if not found:
+                resolution = self.combine(question, matcher.local_matches(question))
+            if (resolution and not resolution.get("error") and not resolution.get("needs_pairing")
+                    and resolution.get("origin") in ("uploaded", "embedded")):
+                matches.append((question, resolution))
+        return matches
+
     def lookup(self, question, document):
         with self.s.lock:
             context = self.context(document.id)

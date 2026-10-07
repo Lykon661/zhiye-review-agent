@@ -178,7 +178,7 @@ onUnmounted(() => {
 
 <template>
   <section class="panel chapter-panel">
-    <div class="section-top"><div><p class="eyebrow">02 / 章节目录</p><h2>整理你的章节路线</h2><p class="muted">拖动左侧手柄上下排序，松手后自动保存；可重命名、合并或删除章节。提纲、试卷、练习题和答案保留在资料库。</p></div><button class="button subtle" :disabled="busy || !!dragged || !groups.length" @click="draft">{{ chapters.length || hasExcludedChapters ? '按文件重新整理' : '按文件建立目录' }}</button></div>
+    <div class="section-top"><div><h2>章节目录</h2><p class="muted">拖动左侧手柄上下排序，松手后自动保存；可重命名、合并或删除章节。提纲、试卷、练习题和答案保留在资料库。</p></div><button class="button subtle" :disabled="busy || !!dragged || !groups.length" @click="draft">{{ chapters.length || hasExcludedChapters ? '按文件重新整理' : '按文件建立目录' }}</button></div>
     <div v-if="!knowledgeChapters.length" class="empty-state compact"><div class="empty-symbol">≡</div><p>暂无知识章节</p><span>{{ hasExcludedChapters ? '原资料仍保留，点击“按文件重新整理”可恢复已删除的章节。' : '上传知识课件或笔记后会自动建立章节目录。' }}</span></div>
     <div v-else class="chapter-table-wrap">
       <table class="chapter-table">
@@ -211,7 +211,28 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.file-chapter-title{overflow-wrap:anywhere;font-size:12px;color:#75896a;padding-top:16px;padding-bottom:16px;min-width:180px}.chapter-footer>.muted{font-size:11px;line-height:1.8;max-width:65%}.chapter-table th:last-child{width:190px;min-width:190px}.chapter-table .chapter-block-count{white-space:nowrap}.chapter-table .badge{white-space:nowrap}.chapter-row-actions{display:flex;align-items:center;gap:14px;white-space:nowrap}.chapter-row-actions .text-button{font-size:11px}.chapter-edit-form{display:grid;gap:14px;background:#f7faf2;border:1px solid #e2ebd7;border-radius:10px;padding:18px;margin-top:16px}.chapter-edit-form h3{font-size:13px;color:#6e875b;overflow-wrap:anywhere}.chapter-edit-form label{display:grid;gap:8px;font-size:11px;color:#829674}.chapter-edit-form input,.chapter-edit-form select{width:100%;min-width:0}.chapter-edit-form .muted{font-size:11px;line-height:1.8}.chapter-edit-actions{display:flex;justify-content:flex-end;gap:10px}
-@media(max-width:600px){.chapter-footer>.muted{max-width:100%}.file-chapter-title{font-size:11px}.chapter-edit-form{padding:14px}.chapter-row-actions{gap:10px}}
-.chapter-table .chapter-drag-cell{width:50px;min-width:50px;text-align:center;padding-left:5px;padding-right:5px}.chapter-drag-handle{display:inline-flex;align-items:center;justify-content:center;width:32px;height:36px;border:1px solid transparent;border-radius:7px;background:transparent;color:#8da575;font-size:24px;line-height:1;cursor:grab;touch-action:none;user-select:none}.chapter-drag-handle:not(:disabled):hover{background:#eef4e6;border-color:#dbe7ce}.chapter-drag-handle:not(:disabled):active{cursor:grabbing}.chapter-drag-handle:focus-visible{outline:2px solid #789c61;outline-offset:2px}.chapter-drag-handle:disabled{cursor:default;opacity:.35}.chapter-dragging>td{background:#edf4e5;box-shadow:inset 0 2px #bfd0aa,inset 0 -2px #bfd0aa}.chapter-dragging .file-chapter-title{color:#50753c}.chapter-drag-preview{position:fixed;z-index:80;pointer-events:none;max-width:260px;padding:12px 17px;border:1px solid #bdd0a7;border-radius:9px;background:#f7faf2;color:#55773f;box-shadow:0 8px 24px #30472526;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.file-chapter-title { overflow-wrap: anywhere; font-size: 14px; color: var(--ink); padding-top: 18px; padding-bottom: 18px; min-width: 180px; }
+.chapter-footer > .muted { font-size: 12px; line-height: 1.85; max-width: 60%; }
+.chapter-table th:last-child { width: 195px; min-width: 195px; }
+.chapter-table .chapter-block-count, .chapter-table .badge { white-space: nowrap; }
+.chapter-row-actions { display: flex; align-items: center; gap: 14px; white-space: nowrap; }
+.chapter-row-actions .text-button { font-size: 12px; }
+.chapter-edit-form { display: grid; gap: 16px; background: var(--surface-alt); border: 1px solid var(--line); border-radius: 10px; padding: 20px; margin-top: 18px; }
+.chapter-edit-form h3 { font-size: 14px; color: var(--ink); overflow-wrap: anywhere; }
+.chapter-edit-form label { display: grid; gap: 8px; font-size: 13px; color: #53617b; }
+.chapter-edit-form input, .chapter-edit-form select { width: 100%; min-width: 0; }
+.chapter-edit-actions { display: flex; justify-content: flex-end; gap: 10px; }
+.chapter-table .chapter-drag-cell { width: 48px; min-width: 48px; text-align: center; padding-left: 5px; padding-right: 5px; }
+.chapter-drag-handle { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 36px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: #8291ae; font-size: 24px; line-height: 1; cursor: grab; touch-action: none; user-select: none; }
+.chapter-drag-handle:not(:disabled):hover { background: var(--soft); border-color: #cdd9f8; color: var(--accent); }
+.chapter-drag-handle:not(:disabled):active { cursor: grabbing; }
+.chapter-drag-handle:disabled { cursor: default; opacity: .35; }
+.chapter-dragging > td { background: var(--soft); box-shadow: inset 0 2px #a9bcef, inset 0 -2px #a9bcef; }
+.chapter-dragging .file-chapter-title { color: var(--accent-dark); }
+.chapter-drag-preview { position: fixed; z-index: 80; pointer-events: none; max-width: 260px; padding: 12px 17px; border: 1px solid #b7c8f4; border-radius: 8px; background: var(--surface); color: var(--accent-dark); box-shadow: 0 8px 28px #1d2d4d26; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 600px) {
+  .chapter-footer > .muted { max-width: 100%; }
+  .chapter-edit-form { padding: 16px; }
+  .chapter-row-actions { gap: 12px; }
+}
 </style>

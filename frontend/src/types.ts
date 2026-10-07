@@ -23,7 +23,7 @@ export interface Chapter { id: string; title: string; position: number; confirme
 export interface ChapterDraft { id: string | null; title: string; position: number; block_ids: string[] }
 export interface Session { id: string; title: string; created_at: string }
 export interface Source { chunk_id: string; text: string; filename: string; kind: DocumentKind; year: number | null; chapter_id: string | null; locator: Locator; source_id?: string }
-export interface Message { id: string; role: string; content: string; citations: Source[]; created_at: string; practice_context?: PracticeChatContext | null }
+export interface Message { id: string; role: string; content: string; citations: Source[]; created_at: string; practice_context?: PracticeChatContext | null; note_context?: NoteChatContext | null }
 export interface Outline { id: string; markdown?: string; status: string; stale: boolean; style?: string; current_style?: string; coverage?: Record<string, unknown>; job_id: string; created_at: string }
 export interface Job { id: string; status: 'queued' | 'running' | 'completed' | 'failed' | 'interrupted'; progress: number; stage: string; error?: string | null; outline_id: string }
 export const kindLabels: Record<DocumentKind, string> = { lecture: '课件', note: '笔记', exam: '往年真题', exercise: '练习题', answer: '答案' }
@@ -58,9 +58,22 @@ export interface PracticeAnswer {
 }
 
 export interface PracticeChatContext {
-  question_id: string; filename: string; number: string; stem: string
+  question_id: string | null; wrong_question_id?: string; filename: string; number: string; stem: string
   original_number?: string
   options: { key: string; text: string }[]; selected: string[]; own_answer: string
+}
+
+export interface NoteChatContext {
+  outline_id: string; heading: string; selected_text: string; start_line: number; end_line: number
+  text?: string; stale?: boolean
+  source_text?: string
+}
+
+export interface WrongQuestionReview {
+  id: string; selected: string[]; own_answer: string; created_at: string
+  correct: boolean | null; reference_match: boolean | null; resolved: boolean
+  grading_basis: 'uploaded' | 'embedded' | 'model' | null
+  resolution: WrongQuestion['resolution']
 }
 
 export interface WrongQuestion {
@@ -68,4 +81,5 @@ export interface WrongQuestion {
   question: Omit<PracticeQuestion, 'id' | 'wrong_question_id'> & { filename: string; year: number | null }
   resolution: { answer?: string; choices?: string[]; origin?: 'uploaded' | 'embedded' | 'model' | 'manual'; source?: string }
   selected: string[]; own_answer: string; reason: 'manual' | 'incorrect' | 'reference'; created_at: string; updated_at: string
+  reviews?: WrongQuestionReview[]
 }

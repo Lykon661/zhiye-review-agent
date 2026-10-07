@@ -1,101 +1,86 @@
-.sidebar.course-sidebar {
-  width: 250px;
-  overflow-y: auto;
-  padding: 28px 18px 20px;
-}
+.sidebar.course-sidebar { width: 250px; overflow-y: auto; padding: 28px 16px 20px; }
 .workspace.managed-workspace { margin-left: 250px; }
-.course-sidebar .brand { margin-bottom: 28px; }
-.sidebar-courses { margin-top: 26px; min-height: 150px; flex: 1; display: flex; flex-direction: column; }
-.courses-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; font-size: 12px; }
-.course-list { overflow-y: auto; min-height: 100px; max-height: 44vh; padding: 3px; }
-.course-list-row { border: 1px solid transparent; border-radius: 10px; margin-bottom: 8px; padding: 3px 9px 6px; }
-.course-list-row.active { background: #fff; border-color: #d8e5d5; }
-.course-select { display: block; width: 100%; padding: 8px 0 3px; background: none; border: 0; text-align: left; color: inherit; overflow-wrap: anywhere; font-size: 13px; }
-.course-list-row.active .course-select { color: var(--green); font-weight: 600; }
+.course-sidebar .brand { margin-bottom: 32px; }
+.sidebar-courses { margin-top: 30px; min-height: 150px; flex: 1; display: flex; flex-direction: column; }
+.courses-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 12px; padding-inline: 8px; font-size: 12px; color: #53617b; }
+.courses-heading strong { font-weight: 600; }
+.course-list { overflow-y: auto; min-height: 100px; padding: 4px; scrollbar-width: thin; flex: 1; }
+.course-list-row { border: 1px solid transparent; border-radius: 8px; margin-bottom: 7px; padding: 5px 11px 6px; }
+.course-list-row.active { background: var(--surface); border-color: #cdd8f2; }
+.course-list-row:not(.active):hover { background: #e6ecf8; }
+.course-select { display: block; width: 100%; padding: 7px 0 4px; background: none; border: 0; text-align: left; color: #43516b; overflow-wrap: anywhere; font-size: 13px; border-radius: 3px; line-height: 1.65; }
+.course-list-row.active .course-select { color: var(--accent-dark); font-weight: 650; }
 .course-row-actions, .session-row-actions { display: flex; gap: 14px; }
-.course-row-actions .text-button { font-size: 10px; padding: 3px 0; }
+.course-row-actions .text-button { font-size: 11px; padding: 4px 0; }
 .course-list-empty { padding: 12px 4px; }
-.sidebar-course-form { margin-bottom: 12px; padding: 0 3px; }
-.sidebar-course-form input { width: 100%; min-width: 0; font-size: 12px; }
+.sidebar-course-form { margin-bottom: 12px; padding: 0 4px; }
+.sidebar-course-form input { width: 100%; min-width: 0; font-size: 13px; }
 .sidebar-course-form > div { display: flex; gap: 12px; margin-top: 8px; }
-.course-sidebar .sidebar-course { margin-top: 18px; padding: 12px 8px; }
-.course-sidebar .sidebar-bottom { margin-top: 16px; padding-top: 12px; }
+.course-sidebar .sidebar-course { margin-top: 20px; padding: 14px 12px; }
+.course-sidebar .sidebar-bottom { margin-top: 10px; }
 .course-sidebar .sidebar-bottom > p, .course-sidebar .sidebar-bottom > .leaf-icon { display: none; }
-.session-panel { overflow-y: auto; max-height: 760px; }
-.session-list-row { border: 1px solid var(--line); border-radius: 9px; background: #fff; flex-shrink: 0; }
-.session-list-row.active { border-color: #adccb9; background: var(--soft); }
-.session-list-row .session-item { border: 0; border-radius: 8px 8px 0 0; background: none; width: 100%; }
-.session-list-row .session-item strong { white-space: normal; overflow-wrap: anywhere; line-height: 1.6; }
-.session-row-actions { padding: 0 11px 6px; }
-.session-row-actions .text-button { font-size: 10px; padding: 3px 0; }
-.button.subtle.danger { color: #a24b42; border-color: #e8c9c1; }
-.management-overlay { position: fixed; inset: 0; z-index: 100; background: #20352f66; display: flex; align-items: center; justify-content: center; padding: 20px; }
-.management-dialog { width: min(460px, 100%); padding: 28px; border-radius: 16px; background: #fff; box-shadow: 0 12px 50px #20352f33; max-height: 90vh; overflow-y: auto; }
-.management-dialog h2 { font-size: 19px; overflow-wrap: anywhere; }
-.management-dialog > p { margin-top: 12px; line-height: 1.9; }
-.management-name { display: flex; flex-direction: column; gap: 7px; margin-top: 20px; font-size: 12px; }
-.management-dialog-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 24px; }
-.button.management-delete { background: #a24b42; color: white; }
-.button.management-delete:not(:disabled):hover { background: #873b34; }
-.topbar-actions { display: flex; align-items: center; gap: 12px; }
-.model-settings { width: min(620px, 100%); }
+.button.subtle.danger { color: var(--danger); border-color: #e6bfc5; }
+.button.subtle.danger:not(:disabled):hover { background: var(--danger-soft); border-color: #d59ba4; }
+.management-overlay { position: fixed; inset: 0; z-index: 100; background: #1d2d4d66; display: flex; align-items: center; justify-content: center; padding: 24px; }
+.management-dialog { width: min(460px, 100%); padding: 30px; border: 1px solid var(--line); border-radius: 16px; background: var(--surface); box-shadow: 0 18px 60px #1d2d4d26; max-height: calc(100dvh - 48px); overflow-y: auto; overscroll-behavior: contain; }
+.management-dialog h2 { font-size: 21px; overflow-wrap: anywhere; }
+.management-dialog > p { margin-top: 12px; line-height: 1.85; }
+.management-name { display: flex; flex-direction: column; gap: 8px; margin-top: 22px; font-size: 13px; }
+.management-dialog-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 10px; margin-top: 26px; padding-top: 20px; border-top: 1px solid var(--line); }
+.button.management-delete { background: var(--danger); color: #fff; }
+.button.management-delete:not(:disabled):hover { background: #903640; }
+.topbar-actions { display: flex; align-items: center; gap: 18px; margin-left: auto; }
+.model-settings { width: min(650px, 100%); }
 .model-settings .section-top { align-items: flex-start; }
 .model-settings .section-top p { margin-top: 6px; }
-.model-current { background: #f1f6f2; border-radius: 9px; padding: 10px 12px; overflow-wrap: anywhere; font-size: 12px; }
-.model-help { font-size: 11px; }
-.model-fields { border: 0; padding: 0; margin: 18px 0 0; display: grid; gap: 14px; min-width: 0; }
-.model-fields label { display: flex; flex-direction: column; gap: 7px; font-size: 12px; min-width: 0; }
+.model-current { background: var(--soft); border-radius: 8px; border-left: 3px solid var(--accent); padding: 12px 14px; overflow-wrap: anywhere; font-size: 13px; color: var(--accent-dark); }
+.model-help { font-size: 12px; }
+.model-fields { border: 0; padding: 0; margin: 22px 0 0; display: grid; gap: 18px; min-width: 0; }
+.model-fields label { display: flex; flex-direction: column; gap: 8px; font-size: 13px; min-width: 0; }
 .model-fields input, .model-fields select { width: 100%; min-width: 0; }
-.model-fields small { color: var(--muted); font-size: 10px; line-height: 1.7; }
-.model-key-input { display: flex; align-items: center; gap: 10px; }
+.model-fields small { color: var(--muted); font-size: 12px; line-height: 1.8; }
+.model-key-input { display: flex; align-items: center; gap: 12px; }
 .model-key-input input { flex: 1; }
 .model-key-input button { flex-shrink: 0; }
-.model-fields .model-checkbox { flex-direction: row; align-items: center; gap: 8px; }
-.model-fields .model-checkbox input { width: 15px; height: 15px; flex: 0 0 15px; }
-.model-advanced { padding: 12px; border: 1px solid var(--line); border-radius: 9px; }
-.model-advanced summary { cursor: pointer; font-size: 12px; }
-.model-number-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 14px 0; }
-.model-feedback { color: #39755a; font-size: 12px; }
-@media (max-width: 600px) {
-  .topbar-actions { gap: 7px; }
-  .topbar-actions .health-pill { font-size: 10px; padding: 5px 7px; }
-  .model-number-grid { grid-template-columns: 1fr; }
-}
+.model-fields .model-checkbox { flex-direction: row; align-items: center; gap: 10px; }
+.model-fields .model-checkbox input { width: 16px; height: 16px; flex: 0 0 16px; }
+.model-advanced { padding: 16px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-alt); }
+.model-advanced summary { cursor: pointer; font-size: 13px; color: #43516b; }
+.model-number-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 18px 0; }
+.model-feedback { color: var(--success); font-size: 13px; }
 @media (max-width: 1150px) {
-  .sidebar.course-sidebar { width: 220px; }
+  .sidebar.course-sidebar { width: 220px; padding-inline: 12px; }
   .workspace.managed-workspace { margin-left: 220px; }
 }
 @media (max-width: 850px) {
-  .sidebar.course-sidebar { width: 190px; padding: 22px 12px; }
+  .sidebar.course-sidebar { width: 190px; padding: 24px 10px; }
   .workspace.managed-workspace { margin-left: 190px; }
-  .course-sidebar .brand > div:last-child, .course-sidebar > .workspace-label, .course-sidebar .nav-item > span:not(.nav-active-dot), .course-sidebar .sidebar-course { display: block; }
-  .course-sidebar .brand { gap: 8px; }
-  .course-sidebar .brand strong { font-size: 21px; }
-  .course-sidebar .brand small { font-size: 8px; letter-spacing: 0; }
-  .course-sidebar .main-nav { align-items: stretch; }
-  .course-sidebar .nav-item { justify-content: flex-start; gap: 9px; width: 100%; padding: 10px; }
-  .course-sidebar .nav-item > .nav-symbol { display: inline-flex; }
-  .course-sidebar .nav-item > .nav-active-dot { display: none; }
-  .session-panel { width: 165px; }
-  .chat-layout { flex-direction: column; }
-  .chat-layout .session-panel { width: 100%; max-height: 230px; border-right: 0; border-bottom: 1px solid var(--line); }
-  .chat-layout .chat-main { min-width: 0; }
+  .course-sidebar .brand { gap: 10px; padding-inline: 6px; }
+  .course-sidebar .brand strong { font-size: 23px; }
+  .course-sidebar .brand small { font-size: 10px; }
+  .course-sidebar .nav-item { gap: 10px; padding: 10px 12px; }
+  .course-sidebar .nav-active-dot { display: none; }
   .outline-content-panel .inline-actions { flex-wrap: wrap; }
+  .topbar-actions { gap: 12px; }
 }
 @media (max-width: 600px) {
   .app-shell { display: block; }
-  .sidebar.course-sidebar { position: static; width: 100%; height: auto; flex-direction: column; padding: 16px; border-right: 0; border-bottom: 1px solid var(--line); }
-  .workspace.managed-workspace { margin-left: 0; padding-bottom: 0; }
-  .course-sidebar .brand { display: flex; margin-bottom: 16px; }
+  .sidebar.course-sidebar { position: static; width: 100%; flex-direction: column; padding: 20px 16px 16px; border-right: 0; border-bottom: 1px solid var(--line); }
+  .workspace.managed-workspace { margin-left: 0; }
+  .course-sidebar .brand { margin-bottom: 20px; }
   .course-sidebar > .workspace-label, .course-sidebar .sidebar-course, .course-sidebar .sidebar-bottom { display: none; }
-  .course-sidebar .main-nav { flex-direction: row; width: 100%; gap: 6px; }
-  .course-sidebar .nav-item { width: auto; flex: 1; justify-content: center; font-size: 11px; padding: 8px 3px; }
-  .sidebar-courses { margin-top: 16px; min-height: 0; }
-  .course-list { max-height: 190px; min-height: 0; }
-  .course-list-row { margin-bottom: 6px; }
-  .course-select { font-size: 12px; }
-  .chat-layout .session-panel { flex-direction: column; overflow-x: hidden; gap: 8px; }
-  .chat-layout .session-heading { display: flex; }
-  .session-list-row .session-item { width: 100%; }
-  .management-dialog { padding: 22px; }
+  .course-sidebar .main-nav { flex-direction: row; width: 100%; gap: 5px; }
+  .course-sidebar .nav-item { flex: 1; min-width: 0; flex-direction: column; justify-content: center; gap: 6px; font-size: 12px; padding: 10px 3px; }
+  .course-sidebar .nav-item.active:before { top: auto; bottom: 0; left: 25%; width: 50%; height: 3px; border-radius: 2px 2px 0 0; }
+  .sidebar-courses { margin-top: 20px; min-height: 0; }
+  .courses-heading { padding-inline: 2px; margin-bottom: 8px; }
+  .course-list { display: flex; gap: 8px; max-height: none; min-height: 0; overflow-x: auto; padding: 4px 2px; scroll-snap-type: x proximity; }
+  .course-list-row { flex: 0 0 170px; margin-bottom: 0; scroll-snap-align: start; padding: 6px 10px; }
+  .course-select { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .course-row-actions .text-button { min-height: 32px; }
+  .topbar-actions { gap: 14px; }
+  .management-overlay { padding: 16px; }
+  .management-dialog { padding: 24px 20px; max-height: calc(100dvh - 32px); }
+  .management-dialog-actions { gap: 8px; }
+  .model-number-grid { grid-template-columns: 1fr; }
 }
