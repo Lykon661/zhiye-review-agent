@@ -53,6 +53,10 @@ class UploadedAnswerPreparation:
         return self.pairing_sources(db, doc)[0]
 
     def pairing_sources(self, db, doc):
+        if doc.kind == "generated":
+            return ({"mode": "none", "answer_document_id": None, "needs_confirmation": False,
+                     "missing": False, "embedded": False, "matched_document_id": None,
+                     "matched_filename": None}, [], [], {})
         marker = db.get(AppMeta, "practice_answer_pair:" + doc.id)
         saved = json.loads(marker.value) if marker else {"mode": "auto", "answer_document_id": None}
         mode, identity = saved["mode"], saved.get("answer_document_id")
@@ -87,6 +91,8 @@ class UploadedAnswerPreparation:
     def save_pairing(self, document_id, mode, answer_document_id):
         with self.s.lock, self.s.sessions() as db:
             doc = self.p._document(db, document_id)
+            if doc.kind == "generated":
+                raise HTTPException(422, "AI 练习使用生题时保存的模型参考答案，无需关联上传答案")
             if mode == "manual":
                 answer = db.get(Document, answer_document_id) if answer_document_id else None
                 if (answer is None or answer.id == doc.id or answer.course_id != doc.course_id

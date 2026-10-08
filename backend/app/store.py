@@ -12,6 +12,7 @@ from .db import create_database
 from .file_chapters import document_role, file_order, file_title
 from .llm import ModelClient
 from .model_config import ModelConfigStore
+from .memory import MemoryService
 from .models import AppMeta, Block, Chapter, ChatSession, Chunk, Course, Document, Job, Message, Outline, PracticeAnswerIndex, PracticeSet, WrongQuestion, new_id
 from .parsing import parse_document
 from .practice_progress import answer_policy_current
@@ -41,6 +42,7 @@ class Services:
         self.practice_locks = {}
         self.answer_preparation_locks = {}
         self.explanation_locks = {}
+        self.memory = MemoryService(self)
         with self.sessions() as db:
             model = db.get(AppMeta, "embedding_model")
             if model and model.value != settings.embedding_model and db.scalar(select(Chunk.id).limit(1)):
@@ -69,11 +71,10 @@ class Services:
     def recover(self):
         migrated = []
         with self.lock, self.sessions() as db:
-            # Keep old snapshots, but distinguish model-reference differences
-            # from errors established by an uploaded answer.
-            for wrong in db.scalars(select(WrongQuestion).where(WrongQuestion.reason == "incorrect")):
-                if wrong.resolution.get("origin") == "model":
-                    wrong.reason = "reference"
+            # Both uploaded and model answer mismatches are errors; the
+            # resolution retains the grading provenance independently.
+            for wrong in db.scalars(select(WrongQuestion).where(WrongQuestion.reason == "reference")):
+                wrong.reason = "incorrect"
             for wrong in db.scalars(select(WrongQuestion)):
                 if wrong.resolution and not answer_policy_current(wrong.resolution):
                     wrong.resolution = {}
@@ -82,7 +83,9 @@ class Services:
             for index in db.scalars(select(PracticeAnswerIndex).where(PracticeAnswerIndex.status == "processing")):
                 index.status, index.error = "failed", "答案准备被重启中断，可在提交答案时重试。"
             for bank in db.scalars(select(PracticeSet).where(PracticeSet.status.in_(["queued", "processing"]))):
-                bank.status, bank.error = "failed", "后端重启中断了题目整理，请点击重试。"
+                doc = db.get(Document, bank.document_id)
+                bank.status, bank.error = "failed", ("后端重启中断了 AI 生题，请在在线练习中重试生题。"
+                                                     if doc and doc.kind == "generated" else "后端重启中断了题目整理，请点击重试。")
             for doc in db.scalars(select(Document).where(Document.status.in_(["queued", "processing"]))):
                 doc.status = "failed"
                 doc.error = "后端重启中断了处理，可点击重试。"
@@ -151,7 +154,8 @@ class Services:
                 db.execute(delete(AppMeta).where(AppMeta.key == "index_repair:" + course_id))
                 db.execute(delete(AppMeta).where(AppMeta.key == "file_chapter_policy:" + course_id))
                 db.execute(delete(AppMeta).where(AppMeta.key == "chapter_excluded:" + course_id))
-                db.execute(delete(AppMeta).where(AppMeta.key.in_(["practice_answer_pair:" + doc.id for doc in documents])))
+                db.execute(delete(AppMeta).where(AppMeta.key.in_(
+                    [prefix + doc.id for doc in documents for prefix in ("practice_answer_pair:", "practice_title:")])))
                 db.delete(course)
                 db.commit()
             except Exception as exc:
@@ -193,7 +197,7 @@ class Services:
         if reset:
             self.set_excluded_chapter_documents(db, course_id, set())
         excluded = set() if reset else self.excluded_chapter_documents(db, course_id)
-        documents = sorted((doc for doc in db.scalars(select(Document).where(Document.course_id == course_id, Document.status == "ready"))
+        documents = sorted((doc for doc in db.scalars(select(Document).where(Document.course_id == course_id, Document.status == "ready", Document.kind != "generated"))
                             if doc.id not in excluded),
                            key=lambda doc: (file_order(doc.filename), doc.created_at, doc.id))
         chapters = db.scalars(select(Chapter).where(Chapter.course_id == course_id).order_by(Chapter.position)).all()
@@ -438,12 +442,21 @@ class Services:
                 raise ValueError("正在整理题目或回答练习，请完成后再删除资料")
             if self.answer_preparation_locks.get(doc.id) and self.answer_preparation_locks[doc.id].locked():
                 raise ValueError("正在准备这份练习的答案，请完成后再删除资料")
+            if doc.kind == "generated":
+                file_path = self.upload_dir / (doc.id + ".json")
+                db.execute(delete(AppMeta).where(AppMeta.key == "practice_title:" + doc.id))
+                db.delete(doc)
+                db.commit()
+                if file_path.resolve().parent == self.upload_dir.resolve():
+                    file_path.unlink(missing_ok=True)
+                return True
             self.retrieval.delete_document(doc.id)
             db.execute(delete(Chunk).where(Chunk.document_id == doc.id))
             db.execute(delete(Block).where(Block.document_id == doc.id))
             course_id, file_path = doc.course_id, Path(doc.path)
             self.set_excluded_chapter_documents(db, course_id, self.excluded_chapter_documents(db, course_id) - {doc.id})
-            db.execute(delete(AppMeta).where(AppMeta.key == "practice_answer_pair:" + doc.id))
+            db.execute(delete(AppMeta).where(AppMeta.key.in_([
+                "practice_answer_pair:" + doc.id, "practice_title:" + doc.id])))
             db.delete(doc)
             db.flush()
             self.draft_chapters(db, course_id)

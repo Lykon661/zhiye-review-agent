@@ -96,7 +96,7 @@ class WrongQuestionService:
         if incorrect:
             record.reason, record.selected = "incorrect", selected or []
         elif reference_mismatch:
-            record.reason, record.selected = "reference", selected or []
+            record.reason, record.selected = "incorrect", selected or []
         elif selected is not None and record.reason not in ("incorrect", "reference"):
             record.selected = selected
         if own_answer is not None:
@@ -142,9 +142,14 @@ class WrongQuestionService:
                 "correct": None, "reference_match": None, "grading_basis": None}
             content = {"selected": selected, "own_answer": own_answer.strip(), **assessment,
                        "resolved": bool(comparable), "resolution": resolution, "question": dict(question)}
-            attempt = WrongQuestionReview(wrong_question_id=record.id, content=content)
+            attempt = WrongQuestionReview(id=new_id(), wrong_question_id=record.id, content=content)
             db.add(attempt)
+            self.s.memory.record_attempt(
+                db, course_id, {**question, "id": record.source_question_id},
+                {**assessment, "selected": selected, "own_answer": own_answer.strip()}, source_key="review:" + attempt.id,
+                document_id=record.source_document_id, wrong_id=record.id, kind="review")
             db.commit()
+            self.s.memory.wake.set()
             return {"id": attempt.id, "created_at": attempt.created_at, **content}
 
     def chat_context(self, db, course_id, identity, selected=None, own_answer=None):
@@ -169,7 +174,7 @@ class WrongQuestionService:
     def add(self, course_id, stem, own_answer, answer):
         with self.s.lock, self.s.sessions() as db:
             self.require_course(db, course_id)
-            record = WrongQuestion(course_id=course_id, signature="manual:" + new_id(),
+            record = WrongQuestion(id=new_id(), course_id=course_id, signature="manual:" + new_id(),
                                    question={"number": "", "section": "", "question_type": "other",
                                              "stem": stem, "options": [], "locator": {},
                                              "filename": "手动录入", "year": None, "translation": None},
@@ -177,7 +182,12 @@ class WrongQuestionService:
                                    resolution={"answer": answer, "choices": [], "origin": "manual",
                                                "source": "手动填写", "sources": []} if answer else {})
             db.add(record)
+            db.flush()
+            self.s.memory.record_attempt(
+                db, course_id, record.question, {"own_answer": own_answer},
+                source_key="manual_wrong:" + record.id, wrong_id=record.id, kind="manual")
             db.commit()
+            self.s.memory.wake.set()
             return self.row(record)
 
     def remove(self, course_id, identity):

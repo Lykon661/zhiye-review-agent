@@ -11,7 +11,7 @@ from sqlalchemy import delete, select
 
 from .llm import ModelNotConfigured, StructuredOutputError, model_failure_message, parse_json
 from .math_formatting import preserve_option_scripts
-from .models import Block, Course, Document, PracticeProgress, PracticeQuestion, PracticeSet, PracticeTranslation, WrongQuestion, new_id, now
+from .models import AppMeta, Block, Course, Document, LearningEvent, PracticeProgress, PracticeQuestion, PracticeSet, PracticeTranslation, WrongQuestion, new_id, now
 from .retrieval import source_locator
 from .wrong_questions import WrongQuestionService
 from .practice_answers import UploadedAnswerPreparation
@@ -19,6 +19,7 @@ from .practice_sources import DIAGRAM, question_groups, original_other_question
 from .question_images import IMAGE_URL, preserve_question_images
 from .model_images import IMAGE_INPUT_POLICY, attach_question_images, image_resolution_current
 from .practice_progress import ANSWER_POLICY, PracticeProgressService, answer_policy_current, grading
+from .practice_generation import PracticeGenerationService
 
 logger = logging.getLogger(__name__)
 CHOICE_TYPES = {"single_choice", "multiple_choice"}
@@ -48,12 +49,40 @@ class PracticeService:
         self.wrong_questions = WrongQuestionService(services)
         self.uploaded_answers = UploadedAnswerPreparation(self)
         self.progress = PracticeProgressService(self)
+        self.generated = PracticeGenerationService(self)
+
+    def rename(self, document_id, name):
+        with self.s.lock, self.s.sessions() as db:
+            doc = db.get(Document, document_id)
+            if doc is None:
+                raise HTTPException(404, "练习已删除，请刷新练习列表")
+            if doc.kind not in ("exam", "exercise", "generated"):
+                raise HTTPException(422, "只支持修改试卷或 AI 练习的名称")
+            bank = db.get(PracticeSet, document_id)
+            if doc.status in ("queued", "processing") or bank and bank.status in ("queued", "processing"):
+                raise HTTPException(409, "练习仍在处理中，请完成后再改名")
+            if any(lock and lock.locked() for lock in (
+                    self.s.practice_locks.get(doc.id), self.s.answer_preparation_locks.get(doc.id))):
+                raise HTTPException(409, "正在处理这份练习，请完成后再改名")
+            question_ids = db.scalars(select(PracticeQuestion.id).where(PracticeQuestion.document_id == doc.id))
+            if any(self.explanation_locks.get(identity) and self.explanation_locks[identity].locked() for identity in question_ids):
+                raise HTTPException(409, "正在生成练习解析，请完成后再改名")
+            # A display name must not change file-based answer pairing, answer
+            # fingerprints, source citations, or the user's progress signature.
+            key = "practice_title:" + doc.id
+            marker = db.get(AppMeta, key)
+            if marker is None:
+                db.add(AppMeta(key=key, value=name))
+            else:
+                marker.value = name
+            db.commit()
+            return {"id": doc.id, "practice_title": name}
 
     def _document(self, db, identity):
         doc = db.get(Document, identity)
         if doc is None:
             raise HTTPException(404, "题目资料已删除")
-        if doc.kind not in ("exam", "exercise"):
+        if doc.kind not in ("exam", "exercise", "generated"):
             raise HTTPException(422, "请选择上传类型为练习题或往年真题的资料")
         if doc.status != "ready":
             raise HTTPException(409, "请等待题目资料解析完成后再练习")
@@ -194,6 +223,7 @@ class PracticeService:
                 WrongQuestion.signature.in_(list(wrong_signatures.values()))))} if wrong_signatures else {}
             # Answer data never enters the question-list API.
             return {"status": bank.status, "progress": bank.progress, "error": bank.error, "answer_pairing": answer_pairing,
+                    "generated": doc.kind == "generated",
                     "questions": [{"id": q.id, "number": q.number, "section": q.section,
                                    "question_type": q.question_type, "stem": q.stem,
                                    "options": q.options, "locator": q.locator,
@@ -247,10 +277,17 @@ class PracticeService:
             version = db.get(Course, doc.course_id).version
             record = self.wrong_questions.save_practice(
                 db, q, doc, own_answer=own_answer, selected=selected,
-                resolution=q.resolution if q.resolution_version == version and image_resolution_current(q, q.resolution)
+                resolution=q.resolution if (doc.kind == "generated" or q.resolution_version == version) and image_resolution_current(q, q.resolution)
                 and answer_policy_current(q.resolution) else None,
                 translation_signature=self._translation_signature(q))
+            if db.scalar(select(LearningEvent.id).where(LearningEvent.source_key == "manual_wrong:" + record.id)) is None:
+                self.s.memory.record_attempt(
+                    db, doc.course_id, {"id": q.id, "stem": q.stem, "section": q.section,
+                                        "number": q.number, "filename": doc.filename},
+                    {"own_answer": own_answer}, source_key="manual_wrong:" + record.id,
+                    document_id=doc.id, wrong_id=record.id, kind="manual")
             db.commit()
+            self.s.memory.wake.set()
             return {"id": record.id}
 
     def translate(self, question_id):
@@ -321,6 +358,9 @@ section仅用于理解题目背景，无需输出。选项的key必须原样保�
             document_lock.release()
 
     def prepare(self, document_id, tasks):
+        with self.s.sessions() as db:
+            if self._document(db, document_id).kind == "generated":
+                return self.generated.retry(document_id, tasks)
         with self.s.lock, self.s.sessions() as db:
             self._document(db, document_id)
             blocks = self._blocks(db, document_id)
@@ -586,6 +626,10 @@ answer_choices仅在明确上传答案可映射到选项时填写，否则空数
                 "answer_policy": ANSWER_POLICY}
 
     def _resolve(self, q, doc, quick=False):
+        if doc.kind == "generated":
+            if q.resolution.get("generated") and answer_policy_current(q.resolution):
+                return q.resolution
+            raise HTTPException(409, "AI 题目的参考答案已失效，请重新生题")
         uploaded = self.uploaded_answers.lookup(q, doc)
         if uploaded:
             return {**uploaded, "answer_policy": ANSWER_POLICY}
@@ -645,7 +689,7 @@ answer_choices仅在明确上传答案可映射到选项时填写，否则空数
         try:
             cached = q.resolution
             usable = (bool(cached) and not answer_context["needs_pairing"]
-                      and q.resolution_version == version and cached.get("resolved") is not False
+                      and (doc.kind == "generated" or q.resolution_version == version) and cached.get("resolved") is not False
                       and image_resolution_current(q, cached))
             if usable:
                 usable = answer_policy_current(cached)
@@ -671,6 +715,7 @@ answer_choices仅在明确上传答案可映射到选项时填写，否则空数
                     create=correct is False or reference_mismatch,
                     translation_signature=self._translation_signature(current))
                 db.commit()
+                self.s.memory.wake.set()
             return {**result, **assessment, "selected": selected,
                     "wrong_question_id": saved_wrong.id if saved_wrong else None}
         except HTTPException:
@@ -696,7 +741,7 @@ answer_choices仅在明确上传答案可映射到选项时填写，否则空数
             if bank is None or bank.status != "ready" or bank.signature != self._signature(self._blocks(db, doc.id)):
                 raise HTTPException(409, "题目资料已更新，请重新整理题目")
             version = db.get(Course, doc.course_id).version
-            if not q.resolution or q.resolution_version != version or not image_resolution_current(q, q.resolution):
+            if not q.resolution or (doc.kind != "generated" and q.resolution_version != version) or not image_resolution_current(q, q.resolution):
                 raise HTTPException(409, "请先重新提交答案，再获取解析")
             result = dict(q.resolution)
             if not result.get("explanation_pending"):

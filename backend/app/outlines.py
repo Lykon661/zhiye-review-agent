@@ -186,7 +186,7 @@ class OutlineService:
 
     def snapshot(self, db, course_id):
         course = db.get(Course, course_id)
-        docs = db.scalars(select(Document).where(Document.course_id == course_id).order_by(Document.created_at)).all()
+        docs = db.scalars(select(Document).where(Document.course_id == course_id, Document.kind != "generated").order_by(Document.created_at)).all()
         chapters = db.scalars(select(Chapter).where(Chapter.course_id == course_id).order_by(Chapter.position)).all()
         excluded = self.services.excluded_chapter_documents(db, course_id)
         documents, blocks = [], []

@@ -124,6 +124,37 @@ class PracticeSubmission(BaseModel):
     selected: list[str] = Field(min_length=1, max_length=26)
 
 
+class PracticeNameInput(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+
+    @field_validator("name")
+    @classmethod
+    def nonblank(cls, value):
+        value = value.strip()
+        if not value:
+            raise ValueError("练习名称不能为空")
+        if any(ord(char) < 32 for char in value):
+            raise ValueError("练习名称不能包含换行或控制字符")
+        return value
+
+
+class PracticeGenerationInput(BaseModel):
+    mode: Literal["topics", "weakness"] = "topics"
+    chapter_ids: list[str] = Field(default_factory=list, max_length=6)
+    topic: str = Field(default="", max_length=400)
+    weak_topic_ids: list[str] = Field(default_factory=list, max_length=10)
+    count: int = Field(default=5, ge=1, le=10)
+    question_type: Literal["mixed", "single_choice", "multiple_choice", "other"] = "mixed"
+    difficulty: Literal["basic", "medium", "advanced"] = "medium"
+
+    @field_validator("chapter_ids", "weak_topic_ids")
+    @classmethod
+    def unique_ids(cls, value):
+        if any(not identity or len(identity) > 100 for identity in value) or len(set(value)) != len(value):
+            raise ValueError("请选择有效且不重复的章节或薄弱点")
+        return value
+
+
 class PracticeAnswerPairingInput(BaseModel):
     mode: Literal["auto", "manual", "none"] = "auto"
     answer_document_id: str | None = Field(default=None, max_length=100)
@@ -161,6 +192,34 @@ class WrongQuestionReviewInput(BaseModel):
     own_answer: str = Field(default="", max_length=20000)
 
 
+class MemoryPreferenceInput(BaseModel):
+    content: str = Field(min_length=1, max_length=400)
+    scope: Literal["global", "course"] = "global"
+
+    @field_validator("content")
+    @classmethod
+    def nonblank(cls, value):
+        if not value.strip():
+            raise ValueError("记忆内容不能为空")
+        return value.strip()
+
+
+class LearningMemoryInput(BaseModel):
+    topic: str = Field(min_length=1, max_length=80)
+
+    @field_validator("topic")
+    @classmethod
+    def nonblank(cls, value):
+        if not value.strip():
+            raise ValueError("知识点名称不能为空")
+        return value.strip()
+
+
+class SessionMemoryInput(BaseModel):
+    summary: str = Field(max_length=1800)
+    revision: int = Field(ge=0)
+
+
 def row(obj):
     return {column.name: getattr(obj, column.name) for column in obj.__table__.columns
             if column.name not in ("path", "snapshot", "chapter_results")}
@@ -190,7 +249,9 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
     @asynccontextmanager
     async def lifespan(app):
         services.recover()
+        services.memory.start()
         yield
+        services.memory.close()
         try:
             services.visual.close()
         finally:
@@ -297,13 +358,32 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
             raise HTTPException(503, str(exc))
         return Response(status_code=204)
 
+    def practice_document_rows(db, documents):
+        documents = list(documents)
+        keys = ["practice_title:" + doc.id for doc in documents]
+        names = {marker.key.removeprefix("practice_title:"): marker.value
+                 for marker in db.scalars(select(AppMeta).where(AppMeta.key.in_(keys)))} if keys else {}
+        return [{**row(doc), "practice_title": names.get(doc.id)} for doc in documents]
+
     @app.get("/courses/{course_id}/documents")
     def documents(course_id: str):
         with services.sessions() as db:
             require(db, Course, course_id)
             excluded = services.excluded_chapter_documents(db, course_id)
-            return [{**row(d), "chapter_excluded": d.id in excluded}
-                    for d in db.scalars(select(Document).where(Document.course_id == course_id).order_by(Document.created_at))]
+            return [{**doc, "chapter_excluded": doc["id"] in excluded}
+                    for doc in practice_document_rows(db, db.scalars(select(Document).where(
+                        Document.course_id == course_id, Document.kind != "generated").order_by(Document.created_at)))]
+
+    @app.get("/courses/{course_id}/practice/generated")
+    def generated_practice_sets(course_id: str):
+        with services.sessions() as db:
+            require(db, Course, course_id)
+            return practice_document_rows(db, db.scalars(select(Document).where(
+                Document.course_id == course_id, Document.kind == "generated").order_by(Document.created_at.desc())))
+
+    @app.post("/courses/{course_id}/practice/generate", status_code=202)
+    def generate_practice(course_id: str, payload: PracticeGenerationInput, tasks: BackgroundTasks):
+        return practice.generated.start(course_id, payload.model_dump(), tasks)
 
     def queue_document(db, doc):
         """Reserve a document before reparsing or changing its upload metadata."""
@@ -384,6 +464,8 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
     def retry_document(document_id: str, tasks: BackgroundTasks):
         with services.lock, services.sessions() as db:
             doc = require(db, Document, document_id)
+            if doc.kind == "generated":
+                raise HTTPException(422, "请在在线练习中重试 AI 生题")
             queue_document(db, doc)
             db.commit()
             result = row(doc)
@@ -402,13 +484,17 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
     @app.get("/documents/{document_id}/practice")
     def practice_state(document_id: str, tasks: BackgroundTasks):
         result = practice.state(document_id)
-        if result["status"] == "ready":
+        if result["status"] == "ready" and not result.get("generated"):
             result["answer_preparation"] = practice.uploaded_answers.schedule(document_id, tasks)
         return result
 
     @app.post("/documents/{document_id}/practice", status_code=202)
     def prepare_practice(document_id: str, tasks: BackgroundTasks):
         return practice.prepare(document_id, tasks)
+
+    @app.patch("/documents/{document_id}/practice/name")
+    def rename_practice(document_id: str, payload: PracticeNameInput):
+        return practice.rename(document_id, payload.name)
 
     @app.put("/documents/{document_id}/practice/answer-pairing")
     def save_answer_pairing(document_id: str, payload: PracticeAnswerPairingInput):
@@ -640,6 +726,38 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
                 raise HTTPException(404, "引用资料不存在、已删除或未完成入库")
             return result
 
+    @app.get("/courses/{course_id}/memory")
+    def get_memory(course_id: str, session_id: str | None = None):
+        return services.memory.public(course_id, session_id)
+
+    @app.post("/courses/{course_id}/memory/preferences", status_code=201)
+    def add_memory_preference(course_id: str, payload: MemoryPreferenceInput):
+        return services.memory.save_preference(course_id, payload.content, payload.scope)
+
+    @app.patch("/courses/{course_id}/memory/preferences/{identity}")
+    def edit_memory_preference(course_id: str, identity: str, payload: MemoryPreferenceInput):
+        return services.memory.save_preference(course_id, payload.content, payload.scope, identity)
+
+    @app.delete("/courses/{course_id}/memory/preferences/{identity}", status_code=204)
+    def delete_memory_preference(course_id: str, identity: str):
+        services.memory.delete_preference(course_id, identity)
+        return Response(status_code=204)
+
+    @app.patch("/courses/{course_id}/memory/learning/{identity}")
+    def edit_learning_memory(course_id: str, identity: str, payload: LearningMemoryInput):
+        services.memory.edit_topic(course_id, identity, payload.topic)
+        return {"topic": payload.topic}
+
+    @app.delete("/courses/{course_id}/memory/learning/{identity}", status_code=204)
+    def delete_learning_memory(course_id: str, identity: str):
+        services.memory.edit_topic(course_id, identity)
+        return Response(status_code=204)
+
+    @app.put("/courses/{course_id}/memory/sessions/{session_id}")
+    def edit_session_memory(course_id: str, session_id: str, payload: SessionMemoryInput):
+        services.memory.edit_summary(course_id, session_id, payload.summary.strip(), payload.revision)
+        return services.memory.public(course_id, session_id)["session"]
+
     @app.get("/courses/{course_id}/sessions")
     def sessions(course_id: str):
         with services.sessions() as db:
@@ -732,7 +850,7 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
                                     "stem": q.stem, "options": q.options, "locator": q.locator,
                                     "selected": payload.selected, "own_answer": payload.own_answer}
                 course = db.get(Course, doc.course_id)
-                if (q.resolution_version == course.version and image_resolution_current(q, q.resolution)
+                if ((doc.kind == "generated" or q.resolution_version == course.version) and image_resolution_current(q, q.resolution)
                         and answer_policy_current(q.resolution)):
                     practice_context["reference_answer"] = {key: q.resolution[key] for key in
                                                             ("answer", "choices", "origin", "source") if key in q.resolution}

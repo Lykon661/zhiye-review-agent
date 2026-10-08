@@ -203,3 +203,43 @@ class WrongQuestionReview(Base):
     # Keep each attempt and its assessment independent of the original mistake.
     content: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[str] = mapped_column(String, default=now)
+
+
+class SessionMemory(Base):
+    __tablename__ = "session_memories"
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"), primary_key=True)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    topic: Mapped[str] = mapped_column(String, default="")
+    summary_cursor: Mapped[dict] = mapped_column(JSON, default=dict)
+    preference_cursor: Mapped[dict] = mapped_column(JSON, default=dict)
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+    pending: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    updated_at: Mapped[str] = mapped_column(String, default=now)
+
+
+class MemoryPreference(Base):
+    __tablename__ = "memory_preferences"
+    __table_args__ = (UniqueConstraint("scope", "key"),)
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=new_id)
+    course_id: Mapped[str | None] = mapped_column(ForeignKey("courses.id", ondelete="CASCADE"), nullable=True, index=True)
+    scope: Mapped[str] = mapped_column(String, default="global")
+    key: Mapped[str] = mapped_column(String)
+    content: Mapped[str] = mapped_column(Text)
+    source_message_id: Mapped[str | None] = mapped_column(ForeignKey("messages.id", ondelete="CASCADE"), nullable=True)
+    source_quote: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[str] = mapped_column(String, default=now)
+
+
+class LearningEvent(Base):
+    __tablename__ = "learning_events"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=new_id)
+    source_key: Mapped[str] = mapped_column(String, unique=True)
+    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id", ondelete="CASCADE"), index=True)
+    source_document_id: Mapped[str | None] = mapped_column(ForeignKey("documents.id", ondelete="SET NULL"), nullable=True)
+    source_wrong_id: Mapped[str | None] = mapped_column(ForeignKey("wrong_questions.id", ondelete="CASCADE"), nullable=True)
+    source_message_id: Mapped[str | None] = mapped_column(ForeignKey("messages.id", ondelete="CASCADE"), nullable=True)
+    topic: Mapped[str] = mapped_column(String)
+    content: Mapped[dict] = mapped_column(JSON)
+    topic_pending: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    forgotten: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[str] = mapped_column(String, default=now)

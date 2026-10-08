@@ -22,8 +22,8 @@ const reviewResult = ref<WrongQuestionReview | null>(null)
 const reviewSaving = ref(false)
 const discussedId = ref('')
 const busy = computed(() => loading.value || saving.value || reviewSaving.value || !!deleting.value)
-const automaticCount = computed(() => questions.value.filter(q => q.reason === 'incorrect').length)
-const referenceCount = computed(() => questions.value.filter(q => q.reason === 'reference').length)
+const automaticCount = computed(() => questions.value.filter(q => q.reason === 'incorrect' && q.resolution.origin !== 'model').length)
+const referenceCount = computed(() => questions.value.filter(q => q.reason === 'reference' || (q.reason === 'incorrect' && q.resolution.origin === 'model')).length)
 let generation = 0
 let disposed = false
 let controller = new AbortController()
@@ -95,8 +95,9 @@ function startReview(item: WrongQuestion) {
   updateDiscussion()
 }
 function reviewLabel(value: WrongQuestionReview) {
-  if (value.correct !== null) return value.correct ? '按原文答案：本次答对' : '按原文答案：本次答错'
-  if (value.reference_match !== null) return value.reference_match ? '与模型答案一致（仅供参考）' : '与模型答案不一致（仅供参考）'
+  const matches = value.correct ?? value.reference_match
+  const origin = value.grading_basis === 'model' || value.resolution.origin === 'model' ? '按模型参考答案' : '按原文答案'
+  if (matches !== null) return origin + (matches ? '：本次答对' : '：本次答错')
   return value.resolution.answer ? '作答已保存，请自行对照参考答案' : '作答已保存，暂无可用于判题的答案'
 }
 function displayResolution(item: WrongQuestion) {
@@ -156,10 +157,10 @@ onUnmounted(() => { disposed = true; controller.abort(); emit('busy', false); em
     <p v-if="loading" class="loading-bar" role="status">正在读取错题…</p>
     <div v-else-if="!questions.length && !error" class="empty-state compact"><div class="empty-symbol">☆</div><h3>还没有收录错题</h3><p>在线练习答错后会自动收录，也可以点击题目旁的“加入错题本”或在这里添加。</p></div>
     <template v-else-if="questions.length">
-      <div class="wrong-summary"><span>共 {{ questions.length }} 道 · 按原文答案自动收录 {{ automaticCount }} 道 · 与模型答案不一致 {{ referenceCount }} 道 · 手动加入 {{ questions.length - automaticCount - referenceCount }} 道</span><span>按最近收录排序</span></div>
+      <div class="wrong-summary"><span>共 {{ questions.length }} 道 · 按原文答案自动收录 {{ automaticCount }} 道 · 按模型参考答案答错 {{ referenceCount }} 道 · 手动加入 {{ questions.length - automaticCount - referenceCount }} 道</span><span>按最近收录排序</span></div>
       <div class="wrong-list">
         <article v-for="(item, index) in questions" :key="item.id" class="wrong-card">
-          <div class="wrong-card-top"><div class="wrong-meta"><strong>#{{ index + 1 }}</strong><span class="badge neutral">{{ item.reason === 'incorrect' ? '按原文答案自动收录' : item.reason === 'reference' ? '与模型答案不一致' : '手动加入' }}</span><span>{{ item.question.question_type === 'single_choice' ? '单选题' : item.question.question_type === 'multiple_choice' ? '多选题' : '其他题型' }}</span><span>{{ date(item.created_at) }}</span></div><button class="text-button danger" :disabled="busy" :aria-label="`删除第 ${index + 1} 道错题`" @click="remove(item)">{{ deleting === item.id ? '删除中…' : '删除错题' }}</button></div>
+          <div class="wrong-card-top"><div class="wrong-meta"><strong>#{{ index + 1 }}</strong><span class="badge neutral">{{ (item.reason === 'reference' || (item.reason === 'incorrect' && item.resolution.origin === 'model')) ? '按模型参考答案答错' : item.reason === 'incorrect' ? '按原文答案答错' : '手动加入' }}</span><span>{{ item.question.question_type === 'single_choice' ? '单选题' : item.question.question_type === 'multiple_choice' ? '多选题' : '其他题型' }}</span><span>{{ date(item.created_at) }}</span></div><button class="text-button danger" :disabled="busy" :aria-label="`删除第 ${index + 1} 道错题`" @click="remove(item)">{{ deleting === item.id ? '删除中…' : '删除错题' }}</button></div>
           <p class="wrong-source">{{ item.question.filename }}<span v-if="item.question.section"> · {{ item.question.section }}</span><span v-if="item.question.number"> · 原题 {{ item.question.number }}</span><span v-if="item.question.locator.label"> · {{ item.question.locator.label }}</span></p>
           <MarkdownContent :content="item.question.stem" />
           <fieldset v-if="reviewId === item.id && item.question.options.length" class="wrong-options wrong-review-options"><legend>本次作答</legend><label v-for="option in item.question.options" :key="option.key" :class="['wrong-option', { chosen: reviewSelected.includes(option.key) }]"><input v-if="item.question.question_type === 'multiple_choice'" v-model="reviewSelected" type="checkbox" :value="option.key" :disabled="reviewSaving" /><input v-else type="radio" :name="`review-${item.id}`" :value="option.key" :checked="reviewSelected.includes(option.key)" :disabled="reviewSaving" @change="reviewSelected = [option.key]" /><strong>{{ option.key }}</strong><MarkdownContent :content="option.text" /></label></fieldset>

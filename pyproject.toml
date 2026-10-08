@@ -9,7 +9,7 @@ dependencies = [
   "hello-agents==0.2.9", "chromadb>=1,<2",
   "tokenizers>=0.21,<1", "huggingface-hub>=0.30,<2", "numpy>=2,<3",
   "pypdf>=5,<7", "python-pptx>=1,<2", "python-docx>=1.2,<2",
-  "rapidocr==3.9.2", "pypdfium2>=4.30,<6",
+  "rapidocr==3.9.2", "opencv-python-headless==4.11.0.86", "pypdfium2>=4.30,<6",
   "pillow>=10,<13", "onnxruntime>=1.20,<2",
   "httpx>=0.27,<1",
 ]
@@ -19,6 +19,9 @@ dev = ["pytest>=8,<10", "reportlab>=4,<5"]
 
 [tool.uv]
 package = false
+required-version = ">=0.11.7"
+# OCR imports cv2; headless provides it without desktop window support.
+exclude-dependencies = ["opencv-python"]
 
 [tool.pytest.ini_options]
 pythonpath = ["backend"]

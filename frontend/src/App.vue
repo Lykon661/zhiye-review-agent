@@ -2,12 +2,13 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api, chatStream, downloadOutline } from './api'
 import type { Block, Chapter, ChapterDraft, Course, Document, DocumentKind, Health, Job, Message, NoteChatContext, Outline, PracticeChatContext, Session, Source } from './types'
-import { kindLabels } from './types'
+import { kindLabels, uploadKindLabels } from './types'
 import ChapterEditor from './components/ChapterEditor.vue'
 import MarkdownContent from './components/MarkdownContent.vue'
 import SourceDrawer from './components/SourceDrawer.vue'
 import ManagementDialog from './components/ManagementDialog.vue'
 import ModelSettings from './components/ModelSettings.vue'
+import MemorySettings from './components/MemorySettings.vue'
 import PracticePanel from './components/PracticePanel.vue'
 import WrongQuestionsPanel from './components/WrongQuestionsPanel.vue'
 import NotesReader from './components/NotesReader.vue'
@@ -30,6 +31,8 @@ const newCourseOpen = ref(false)
 const newCourseName = ref('')
 const creatingCourse = ref(false)
 const modelSettingsOpen = ref(false)
+const memoryOpen = ref(false)
+const memoryBusy = ref(false)
 const practiceBusy = ref(false)
 const practiceModelBusy = ref(false)
 const wrongBusy = ref(false)
@@ -98,13 +101,13 @@ const activeJob = computed(() => !!(runningJob.value && ['queued', 'running'].in
 const displayedJob = computed(() => activeJob.value ? runningJob.value : job.value)
 const modelConfigured = computed(() => health.value?.llm_configured === true)
 const indexRepairRequired = computed(() => !!courseId.value && (health.value?.index_repair_courses || []).includes(courseId.value))
-const courseSwitchBusy = computed(() => initialLoading.value || courseLoading.value || chatting.value || uploadBusy.value || chapterBusy.value || outlineBusy.value || indexRepairBusy.value || !!documentBusy.value || newSessionBusy.value || creatingCourse.value || managementBusy.value || practiceBusy.value || wrongBusy.value)
+const courseSwitchBusy = computed(() => memoryBusy.value || initialLoading.value || courseLoading.value || chatting.value || uploadBusy.value || chapterBusy.value || outlineBusy.value || indexRepairBusy.value || !!documentBusy.value || newSessionBusy.value || creatingCourse.value || managementBusy.value || practiceBusy.value || wrongBusy.value)
 const chapterControlsBusy = computed(() => chapterBusy.value || courseLoading.value || indexRepairBusy.value || uploadBusy.value || processingCount.value > 0 || !!documentBusy.value || outlineBusy.value || !!activeJob.value || chatting.value || managementBusy.value)
-const canChat = computed(() => modelConfigured.value && (readyCount.value > 0 || !!currentChatContext.value || !!currentNoteContext.value) && !indexRepairRequired.value && !indexRepairBusy.value && !courseLoading.value && !messagesLoading.value && !managementBusy.value && !chapterBusy.value && !newSessionBusy.value)
+const canChat = computed(() => !memoryBusy.value && modelConfigured.value && (readyCount.value > 0 || !!currentChatContext.value || !!currentNoteContext.value) && !indexRepairRequired.value && !indexRepairBusy.value && !courseLoading.value && !messagesLoading.value && !managementBusy.value && !chapterBusy.value && !newSessionBusy.value)
 const sectionMeta: Record<Section, { title: string; intro: string; label: string }> = {
   library: { title: '课程资料', intro: '上传课件、笔记和真题，确认章节后开始复习。', label: '资料库' },
   outline: { title: '复习笔记', intro: '按章节阅读知识重点，选中不理解的段落即可提问。', label: '复习笔记' },
-  practice: { title: '在线练习', intro: '作答与进度自动保存。按上传答案判题，模型答案仅供参考。', label: '在线练习' },
+  practice: { title: '在线练习', intro: '作答与进度自动保存。按原文或模型参考答案判题，答错自动收录。', label: '在线练习' },
   wrong: { title: '错题本', intro: '回顾需要巩固的题目，重新作答，或与右侧助手讨论。', label: '错题本' },
 }
 const statusLabels: Record<string, string> = { queued: '等待处理', processing: '解析文字、图片与公式', ready: '可用于复习', failed: '处理失败', running: '正在生成', completed: '已完成', interrupted: '已中断' }
@@ -284,15 +287,19 @@ async function upload(files: FileList | File[]) {
   try { await refreshDocuments() } catch (error) { setError(error) }
 }
 function drop(event: DragEvent) { dragOver.value = false; if (event.dataTransfer?.files) void upload(event.dataTransfer.files) }
+function practiceDocumentRenamed(document: Document) {
+  documents.value = documents.value.map(item => item.id === document.id ? { ...item, practice_title: document.practice_title } : item)
+}
 async function deleteDocument(document: Document) {
   if (documentBusy.value || uploadBusy.value || practiceBusy.value || indexRepairBusy.value || managementBusy.value || chapterBusy.value || ['queued', 'processing'].includes(document.status)) return
+  const isGenerated = document.kind === 'generated'
   const isPaper = document.kind === 'exam' || document.kind === 'exercise'
-  const description = isPaper
+  const description = isGenerated ? '会删除这组 AI 题目及作答进度，无法恢复。已收录的错题会保留。' : isPaper
     ? '会删除这份试卷文件、练习题目和检索内容，无法恢复。已收录的错题会保留，旧笔记将标记为过期。'
     : '对应的检索内容也会删除，旧笔记将标记为过期。'
-  if (!window.confirm(`删除“${document.filename}”？${description}`)) return
+  if (!window.confirm(`删除“${document.practice_title || document.filename}”？${description}`)) return
   clearFeedback(); documentBusy.value = document.id
-  try { await api(`/documents/${document.id}`, { method: 'DELETE' }); await refreshDocuments(); success.value = isPaper ? '试卷已删除。' : '资料已删除。' }
+  try { await api(`/documents/${document.id}`, { method: 'DELETE' }); await refreshDocuments(); success.value = isGenerated ? 'AI 练习已删除。' : isPaper ? '试卷已删除。' : '资料已删除。' }
   catch (error) { setError(error) }
   finally { documentBusy.value = null }
 }
@@ -559,7 +566,7 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer); activeController?.a
       <div class="sidebar-bottom"><span class="leaf-icon">✳</span><p>让复习有出处，<br />让每一页都连起来。</p><div class="local-badge"><span></span> 本机个人工作台</div></div>
     </aside>
     <div class="workspace managed-workspace">
-      <header class="topbar"><div class="breadcrumb"><span class="breadcrumb-course">{{ course?.name || '复习空间' }}</span><span class="breadcrumb-divider">/</span><span>{{ sectionMeta[section].label }}</span></div><div class="topbar-actions"><button class="button subtle small" @click="modelSettingsOpen = true"><UiIcon name="settings" />模型配置</button><div :class="['health-pill', { offline: !!connectionError }]" :title="connectionError || '后端服务已连接'"><span></span>{{ initialLoading ? '连接中' : connectionError ? '服务未连接' : '服务已连接' }}</div></div></header>
+      <header class="topbar"><div class="breadcrumb"><span class="breadcrumb-course">{{ course?.name || '复习空间' }}</span><span class="breadcrumb-divider">/</span><span>{{ sectionMeta[section].label }}</span></div><div class="topbar-actions"><button v-if="courseId" class="button subtle small" @click="memoryOpen = true">记忆</button><button class="button subtle small" @click="modelSettingsOpen = true"><UiIcon name="settings" />模型配置</button><div :class="['health-pill', { offline: !!connectionError }]" :title="connectionError || '后端服务已连接'"><span></span>{{ initialLoading ? '连接中' : connectionError ? '服务未连接' : '服务已连接' }}</div></div></header>
       <main id="main-content" tabindex="-1" class="main-content" :class="{ 'with-review-chat': courseId && section !== 'library' }">
         <div class="page-heading"><div><p class="course-caption">{{ course?.name || '从一门课程开始' }}</p><h1>{{ sectionMeta[section].title }}</h1><p>{{ sectionMeta[section].intro }}</p></div><div v-if="course" class="heading-note"><span>当前课程</span><strong>{{ readyCount }} 份资料可用于复习</strong></div></div>
         <div v-if="connectionError" class="notice error" role="alert"><strong>无法连接服务</strong><span>{{ connectionError }}</span><button class="text-button" @click="initialise">重新连接</button></div>
@@ -574,7 +581,7 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer); activeController?.a
         <template v-if="courseId && section === 'library'">
           <div class="stats-row"><div class="stat-card"><span>课程资料</span><strong>{{ documents.length }}<small>份</small></strong><p>{{ processingCount ? `${processingCount} 份正在处理` : '按类型组织课程内容' }}</p></div><div class="stat-card"><span>可用于复习</span><strong>{{ readyCount }}<small>份</small></strong><p>解析完成并已建立索引</p></div><div class="stat-card"><span>已提取原文</span><strong>{{ unitCount }}<small>处</small></strong><p>页、幻灯片或文档内容位置</p></div><div class="stat-card accent"><span>章节路线</span><strong>{{ knowledgeChapters.length }}<small>章</small></strong><p>{{ confirmed ? '目录已确认，准备好生成复习笔记' : '下一步：确认章节目录' }}</p></div></div>
           <section class="panel"><div class="section-top"><div><h2>上传与管理资料</h2><p class="muted">自动提取正文、图片文字和公式，保留原文位置。</p></div><span class="badge neutral">支持批量上传</span></div>
-            <div class="upload-options"><label>资料类型<select v-model="uploadKind" :disabled="uploadBusy"><option v-for="(label, key) in kindLabels" :key="key" :value="key">{{ label }}</option></select></label><label v-if="uploadKind === 'exam' || uploadKind === 'exercise' || uploadKind === 'answer'">年份 <span class="muted">（可选）</span><input v-model="uploadYear" type="text" inputmode="numeric" maxlength="4" placeholder="例如 2024" :disabled="uploadBusy" /></label><p>同批文件使用相同类型；不同类型请分批上传。</p></div>
+            <div class="upload-options"><label>资料类型<select v-model="uploadKind" :disabled="uploadBusy"><option v-for="(label, key) in uploadKindLabels" :key="key" :value="key">{{ label }}</option></select></label><label v-if="uploadKind === 'exam' || uploadKind === 'exercise' || uploadKind === 'answer'">年份 <span class="muted">（可选）</span><input v-model="uploadYear" type="text" inputmode="numeric" maxlength="4" placeholder="例如 2024" :disabled="uploadBusy" /></label><p>同批文件使用相同类型；不同类型请分批上传。</p></div>
             <div :class="['upload-area', { dragging: dragOver, busy: uploadBusy }]" @dragover.prevent="dragOver = true" @dragleave.prevent="dragOver = false" @drop.prevent="drop"><div class="upload-icon"><UiIcon name="upload" /></div><div class="upload-description"><h3>{{ uploadBusy ? '正在接收资料…' : '拖入课程资料' }}</h3><p>{{ uploadLabel || (indexRepairRequired ? '请先重新建立索引，再加入新资料' : '可以一次选择多个文件') }}</p><small>{{ uploadFormatsLabel }}</small></div><button class="button primary" :disabled="uploadBusy || indexRepairRequired || indexRepairBusy" @click="fileInput?.click()">{{ uploadBusy ? '上传中…' : '选择文件' }}</button><input ref="fileInput" type="file" multiple :accept="uploadAccept" hidden @change="upload(($event.target as HTMLInputElement).files || [])" /></div>
             <div class="list-heading"><strong>全部资料 <span class="count-badge">{{ documents.length }}</span></strong><div class="inline-actions"><button v-if="readyCount && !indexRepairRequired" class="text-button" :disabled="indexRepairBusy || chapterBusy || !!activeJob || chatting" @click="repairIndex">{{ indexRepairBusy ? '正在修复…' : '修复索引' }}</button><button class="text-button" @click="refreshDocuments().catch(setError)">刷新状态 ↻</button></div></div>
             <div v-if="!documents.length" class="empty-state compact"><p>还没有课程资料</p><span>建议先上传少量资料，检查解析内容后再逐批加入。</span></div>
@@ -599,7 +606,7 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer); activeController?.a
         </template>
 
         <KeepAlive v-if="courseId" :key="courseId">
-          <PracticePanel v-if="section === 'practice'" :course-id="courseId" :documents="documents" :model-configured="modelConfigured" :wrong-revision="wrongRevision" :deletion-busy="!!documentBusy || uploadBusy || indexRepairBusy || managementBusy || chapterBusy" :deleting-document-id="documentBusy" :upload-blocked="indexRepairRequired || indexRepairBusy" @delete-document="deleteDocument" @refresh="refreshDocuments().catch(setError)" @busy="practiceBusy = $event" @model-busy="practiceModelBusy = $event" @wrong-change="wrongRevision++" @context-change="practiceContext = $event" />
+          <PracticePanel v-if="section === 'practice'" :course-id="courseId" :documents="documents" :chapters="knowledgeChapters" :model-configured="modelConfigured" :wrong-revision="wrongRevision" :deletion-busy="!!documentBusy || uploadBusy || indexRepairBusy || managementBusy || chapterBusy" :deleting-document-id="documentBusy" :upload-blocked="indexRepairRequired || indexRepairBusy" @delete-document="deleteDocument" @rename-document="practiceDocumentRenamed" @refresh="refreshDocuments().catch(setError)" @busy="practiceBusy = $event" @model-busy="practiceModelBusy = $event" @wrong-change="wrongRevision++" @context-change="practiceContext = $event" />
         </KeepAlive>
 
         <WrongQuestionsPanel v-if="courseId && section === 'wrong'" :key="courseId" :course-id="courseId" :revision="wrongRevision" :discussion-busy="chatting || messagesLoading || courseLoading || managementBusy" :active-question-id="wrongContext?.wrong_question_id || ''" @busy="wrongBusy = $event" @change="wrongRevision++" @context-change="wrongContext = $event" />
@@ -622,6 +629,7 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer); activeController?.a
       </main>
     </div>
     <SourceDrawer v-if="showDrawer" :source="source" :loading="sourceLoading" :error="sourceError" @close="showDrawer = false; ++sourceGeneration" />
+    <MemorySettings v-if="memoryOpen && courseId" :course-id="courseId" :course-name="course?.name || '当前课程'" :session-id="sessionId" :active="chatting" @close="memoryOpen = false" @busy="memoryBusy = $event" />
     <ModelSettings v-if="modelSettingsOpen" :active="chatting || !!activeJob || practiceModelBusy" @close="modelSettingsOpen = false" @saved="refreshHealth" />
     <ManagementDialog v-if="management" :key="`${management.action}:${management.id}`" :title="management.title" :description="management.description" :initial-name="management.initialName" :confirm-text="management.confirmText" :danger="management.danger" :busy="managementBusy" :error="managementError" @close="management = null" @submit="submitManagement" />
   </div>

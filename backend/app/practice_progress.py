@@ -19,7 +19,7 @@ def grading(result, selected):
     comparable = result.get("resolved") is not False and bool(result.get("choices"))
     matches = set(selected) == set(result.get("choices", [])) if selected is not None and comparable else None
     uploaded = result.get("origin") in ("uploaded", "embedded")
-    return {"correct": matches if uploaded else None,
+    return {"correct": matches,
             "reference_match": matches if not uploaded else None,
             "grading_basis": result.get("origin") if uploaded else "model"}
 
@@ -57,8 +57,9 @@ class PracticeProgressService:
             results = {}
             for q in questions:
                 attempt = saved.attempts.get(q.id)
-                if (not attempt or attempt.get("version") != version or not q.resolution
-                        or q.resolution_version != version
+                if (not attempt or not q.resolution
+                        or (doc.kind != "generated" and (attempt.get("version") != version or q.resolution_version != version))
+                        or attempt.get("version") != q.resolution_version
                         or attempt.get("resolution_signature") != self.p._signature(q.resolution)):
                     continue
                 if not answer_policy_current(q.resolution):
@@ -111,3 +112,8 @@ class PracticeProgressService:
         saved.attempts = {**saved.attempts, q.id: {"selected": selected, "version": version,
                           "resolution_signature": self.p._signature(result)}}
         saved.updated_at = now()
+        if selected is not None:
+            self.s.memory.record_attempt(
+                db, doc.course_id, {"id": q.id, "stem": q.stem, "section": q.section,
+                                    "number": q.number, "filename": doc.filename},
+                {**grading(result, selected), "selected": selected}, document_id=doc.id)

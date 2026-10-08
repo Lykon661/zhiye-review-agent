@@ -1,19 +1,26 @@
 <script setup lang="ts">
 import { computed, onActivated, onDeactivated, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api } from '../api'
-import type { Document, PracticeAnswer, PracticeAnswerPairing, PracticeChatContext, PracticeQuestion, PracticeState, PracticeTranslation } from '../types'
+import type { Chapter, Document, PracticeAnswer, PracticeAnswerPairing, PracticeChatContext, PracticeQuestion, PracticeState, PracticeTranslation } from '../types'
 import MarkdownContent from './MarkdownContent.vue'
 import ManagementDialog from './ManagementDialog.vue'
+import PracticeGenerator from './PracticeGenerator.vue'
 import { supportsUpload, uploadAccept, uploadFormatsLabel } from '../uploadFormats'
 import { usePracticeProgress } from '../usePracticeProgress'
 import { normalizePracticeAnswer } from '../practiceAnswers'
 
-const props = defineProps<{ courseId: string; documents: Document[]; modelConfigured: boolean; wrongRevision: number; deletionBusy: boolean; deletingDocumentId: string | null; uploadBlocked: boolean }>()
-const emit = defineEmits<{ refresh: []; busy: [value: boolean]; modelBusy: [value: boolean]; wrongChange: []; deleteDocument: [document: Document]; contextChange: [value: PracticeChatContext | null] }>()
+const props = defineProps<{ courseId: string; documents: Document[]; chapters: Chapter[]; modelConfigured: boolean; wrongRevision: number; deletionBusy: boolean; deletingDocumentId: string | null; uploadBlocked: boolean }>()
+const emit = defineEmits<{ refresh: []; busy: [value: boolean]; modelBusy: [value: boolean]; wrongChange: []; deleteDocument: [document: Document]; renameDocument: [document: Document]; contextChange: [value: PracticeChatContext | null] }>()
 const documentId = ref('')
 const bank = ref<PracticeState | null>(null)
 const loading = ref(false)
 const uploading = ref(false)
+const generationBusy = ref(false)
+const generatedFiles = ref<Document[]>([])
+const generatedLoaded = ref(false)
+const generatedListError = ref('')
+let generatedListSerial = 0
+const generatedListController = new AbortController()
 const pairingBusy = ref(false)
 const pairingSelection = ref('auto')
 const busyQuestion = ref('')
@@ -22,6 +29,9 @@ const markingQuestion = ref('')
 const deletingQuestion = ref('')
 const deleteTarget = ref<PracticeQuestion | null>(null)
 const deleteError = ref('')
+const renameTarget = ref<Document | null>(null)
+const renameError = ref('')
+const renaming = ref(false)
 const translationVisible = ref<Record<string, boolean>>({})
 const error = ref('')
 const uploadYear = ref('')
@@ -42,13 +52,15 @@ watch([index, selections, drafts], () => {
   if (!restoringProgress) progress.changed({ current_question_id: bank.value?.questions[index.value]?.id || null,
     selections: selections.value, drafts: drafts.value })
 }, { deep: true, flush: 'sync' })
-const files = computed(() => props.documents.filter(doc => doc.kind === 'exam' || doc.kind === 'exercise'))
+const files = computed(() => [...generatedFiles.value, ...props.documents.filter(doc => doc.kind === 'exam' || doc.kind === 'exercise')])
 const answerFiles = computed(() => props.documents.filter(doc => doc.id !== documentId.value
   && ['answer', 'exam', 'exercise'].includes(doc.kind)).sort((a, b) => Number(b.kind === 'answer') - Number(a.kind === 'answer')))
 const savedPairingSelection = computed(() => bank.value?.answer_pairing?.mode === 'manual'
   ? bank.value.answer_pairing.answer_document_id || '' : bank.value?.answer_pairing?.mode || 'auto')
 const pairingDirty = computed(() => pairingSelection.value !== savedPairingSelection.value)
 const currentFile = computed(() => files.value.find(doc => doc.id === documentId.value))
+function practiceName(document: Document) { return document.practice_title || document.filename }
+const isGenerated = computed(() => currentFile.value?.kind === 'generated')
 const current = computed(() => bank.value?.questions[index.value])
 const chatContext = computed<PracticeChatContext | null>(() => {
   const q = current.value
@@ -72,7 +84,7 @@ const currentResult = computed(() => current.value ? results.value[current.value
 const answered = computed(() => bank.value?.questions.filter(q => results.value[q.id]?.correct !== null && results.value[q.id]?.correct !== undefined).length || 0)
 const correct = computed(() => bank.value?.questions.filter(q => results.value[q.id]?.correct === true).length || 0)
 const answersPreparing = computed(() => bank.value?.answer_preparation?.status === 'processing')
-const working = computed(() => props.deletionBusy || uploading.value || pairingBusy.value || questionBusy.value || loading.value || answersPreparing.value || ['queued', 'processing'].includes(bank.value?.status || ''))
+const working = computed(() => props.deletionBusy || !!renameTarget.value || renaming.value || generationBusy.value || uploading.value || pairingBusy.value || questionBusy.value || loading.value || answersPreparing.value || ['queued', 'processing'].includes(bank.value?.status || ''))
 const modelBusy = computed(() => working.value || Object.values(explanationBusy.value).some(Boolean))
 let generation = 0
 let timer: ReturnType<typeof setTimeout> | undefined
@@ -86,20 +98,21 @@ watch(working, value => {
   if (!value && wrongSyncPending) void syncWrongQuestions()
 }, { immediate: true })
 watch(modelBusy, value => emit('modelBusy', value), { immediate: true })
-watch(() => props.documents.map(doc => `${doc.id}:${doc.status}`).join('|'), () => {
+watch([() => files.value.map(doc => `${doc.id}:${doc.status}`).join('|'), generatedLoaded], () => {
+  if (!generatedLoaded.value) return
   if (!files.value.some(doc => doc.id === documentId.value)) {
     let remembered = ''
     try { remembered = localStorage.getItem(`review-practice-document:${props.courseId}`) || '' } catch { /* optional preference */ }
     documentId.value = files.value.find(doc => doc.id === remembered)?.id || files.value.find(doc => doc.status === 'ready')?.id || files.value[0]?.id || ''
   }
   else if (currentFile.value?.status === 'ready' && !loading.value && !questionBusy.value && !['queued', 'processing'].includes(bank.value?.status || '')) void load()
-  results.value = {}; visible.value = {}
 }, { immediate: true })
 watch(documentId, () => {
   deleteTarget.value = null; deleteError.value = ''
+  renameTarget.value = null; renameError.value = ''
   progress.reset()
   pairingSelection.value = 'auto'
-  try { localStorage.setItem(`review-practice-document:${props.courseId}`, documentId.value) } catch { /* optional preference */ }
+  try { if (documentId.value) localStorage.setItem(`review-practice-document:${props.courseId}`, documentId.value) } catch { /* optional preference */ }
   bank.value = null; index.value = 0; error.value = ''
   selections.value = {}; drafts.value = {}; results.value = {}; visible.value = {}
   translationVisible.value = {}
@@ -110,6 +123,33 @@ watch(() => props.wrongRevision, () => {
   wrongSyncPending = true
   void syncWrongQuestions()
 })
+watch(() => props.courseId, () => {
+  generatedLoaded.value = false; generatedFiles.value = []; documentId.value = ''
+  void loadGeneratedSets()
+}, { immediate: true })
+watch(() => props.deletingDocumentId, (value, previous) => {
+  if (previous && !value) void loadGeneratedSets()
+})
+async function loadGeneratedSets() {
+  const course = props.courseId, serial = ++generatedListSerial
+  generatedListError.value = ''
+  try {
+    const value = await api<Document[]>(`/courses/${course}/practice/generated`, { signal: generatedListController.signal })
+    if (!disposed && serial === generatedListSerial && course === props.courseId) generatedFiles.value = value
+  } catch (reason) {
+    if (!disposed && serial === generatedListSerial && course === props.courseId) generatedListError.value = message(reason)
+  } finally { if (!disposed && serial === generatedListSerial && course === props.courseId) generatedLoaded.value = true }
+}
+function useGeneratedSet(document: Document) {
+  ++generatedListSerial
+  generatedFiles.value = [document, ...generatedFiles.value.filter(item => item.id !== document.id)]
+  generatedLoaded.value = true; generatedListError.value = ''
+  documentId.value = document.id
+}
+async function refreshPractice() {
+  await loadGeneratedSets()
+  if (!disposed) await load()
+}
 async function syncWrongQuestions() {
   if (!documentId.value || bank.value?.status !== 'ready' || working.value) return
   const token = generation
@@ -313,6 +353,32 @@ async function toggleTranslation() {
   finally { if (active(token)) translatingQuestion.value = '' }
 }
 function pick(kind: 'exercise' | 'answer') { if (!props.uploadBlocked) { uploadKind.value = kind; input.value?.click() } }
+function openRenamePractice() {
+  const file = currentFile.value
+  if (!file || modelBusy.value || ['queued', 'processing'].includes(file.status)) return
+  renameError.value = ''; renameTarget.value = { ...file }
+}
+async function renamePractice(name: string) {
+  const file = renameTarget.value
+  if (!file || renaming.value) return
+  name = name.trim()
+  if (!name) { renameError.value = '练习名称不能为空'; return }
+  if (name === practiceName(file)) { renameTarget.value = null; return }
+  const token = generation
+  renaming.value = true; renameError.value = ''
+  try {
+    const value = await api<{ id: string; practice_title: string }>(`/documents/${file.id}/practice/name`, {
+      method: 'PATCH', body: JSON.stringify({ name }), signal: generatedListController.signal,
+    })
+    if (!active(token)) return
+    const updated = { ...file, practice_title: value.practice_title }
+    ++generatedListSerial
+    generatedFiles.value = generatedFiles.value.map(item => item.id === file.id ? { ...item, practice_title: value.practice_title } : item)
+    emit('renameDocument', updated)
+    renameTarget.value = null
+  } catch (reason) { if (active(token)) renameError.value = message(reason) }
+  finally { renaming.value = false }
+}
 function deleteCurrentFile() {
   const file = currentFile.value
   if (!file || working.value || ['queued', 'processing'].includes(file.status)) return
@@ -377,10 +443,11 @@ async function upload(list: FileList | null) {
 const saveBeforeLeave = () => progress.flush(true)
 onMounted(() => window.addEventListener('pagehide', saveBeforeLeave))
 onDeactivated(() => progress.flush())
-onUnmounted(() => { progress.dispose(); window.removeEventListener('pagehide', saveBeforeLeave); disposed = true; cancel(); emit('busy', false); emit('modelBusy', false) })
+onUnmounted(() => { progress.dispose(); window.removeEventListener('pagehide', saveBeforeLeave); disposed = true; generatedListController.abort(); cancel(); emit('busy', false); emit('modelBusy', false) })
 </script>
 
 <template>
+  <PracticeGenerator :course-id="courseId" :chapters="chapters" :model-configured="modelConfigured" :working="modelBusy" :wrong-revision="wrongRevision" @generated="useGeneratedSet" @busy="generationBusy = $event" />
   <section class="panel practice-upload">
     <div class="section-top"><div><h2>上传练习材料</h2><p class="muted">选择题按上传答案判题；模型答案仅供参考。其他题型自行作答，按需显示答案。</p></div></div>
     <div class="practice-upload-actions">
@@ -391,10 +458,9 @@ onUnmounted(() => { progress.dispose(); window.removeEventListener('pagehide', s
       <span class="muted">题目和答案在同一文件时，点击“上传题目”，会自动匹配原文答案；分开的文件分别上传，按文件名自动关联。{{ uploadFormatsLabel }}。</span>
       <input ref="input" type="file" :accept="uploadAccept" multiple hidden @change="upload(($event.target as HTMLInputElement).files)" />
     </div>
-    <div v-if="files.length" class="practice-answer-pairing" :class="{ 'needs-confirmation': bank?.answer_pairing?.needs_confirmation }">
+    <div v-if="currentFile && !isGenerated" class="practice-answer-pairing" :class="{ 'needs-confirmation': bank?.answer_pairing?.needs_confirmation }">
       <strong>试卷答案关联</strong>
       <div class="practice-pairing-controls">
-        <label>题目文件<select v-model="documentId" aria-label="选择题目文件" :disabled="working"><option v-for="file in files" :key="file.id" :value="file.id">{{ file.filename }}{{ file.status !== 'ready' ? ' · 正在解析或待重试' : '' }}</option></select></label>
         <label>对应答案<select id="practice-answer-file" v-model="pairingSelection" :disabled="modelBusy || currentFile?.status !== 'ready'" aria-label="选择这份试卷对应的答案文件">
           <option value="auto">自动匹配</option>
           <option value="none">不使用上传答案</option>
@@ -413,21 +479,24 @@ onUnmounted(() => { progress.dispose(); window.removeEventListener('pagehide', s
     </div>
   </section>
   <section class="panel practice-panel">
-    <div class="section-top"><div><h2>我的练习</h2><p class="muted">{{ currentFile ? `正在练习：${currentFile.filename}` : '上传的练习题和往年真题都可以在这里作答。' }}</p></div><div v-if="files.length" class="inline-actions"><button class="text-button" :disabled="working" @click="load">刷新题目 ↻</button><button class="text-button danger" :disabled="working || !currentFile || ['queued', 'processing'].includes(currentFile.status)" :aria-label="currentFile ? `删除试卷 ${currentFile.filename}` : '删除试卷'" @click="deleteCurrentFile">{{ deletingDocumentId === documentId ? '删除中…' : '删除试卷' }}</button></div></div>
+    <div class="section-top"><div><h2>我的练习</h2><p class="muted">{{ currentFile ? `正在练习：${practiceName(currentFile)}` : 'AI 生成、上传的练习题和往年真题都可以在这里作答。' }}</p></div><div v-if="files.length" class="inline-actions"><button class="text-button" :disabled="modelBusy || !currentFile || ['queued', 'processing'].includes(currentFile.status)" @click="openRenamePractice">改名</button><button class="text-button" :disabled="questionBusy || generationBusy || deletionBusy || !!renameTarget" @click="refreshPractice">刷新题目 ↻</button><button class="text-button danger" :disabled="working || !currentFile || ['queued', 'processing'].includes(currentFile.status)" :aria-label="currentFile ? `删除练习 ${practiceName(currentFile)}` : '删除练习'" @click="deleteCurrentFile">{{ deletingDocumentId === documentId ? '删除中…' : isGenerated ? '删除 AI 练习' : '删除试卷' }}</button></div></div>
+    <label v-if="files.length" class="practice-set-selector">选择练习<select v-model="documentId" aria-label="选择练习" :disabled="working"><option v-for="file in files" :key="file.id" :value="file.id">{{ practiceName(file) }}{{ file.kind === 'generated' ? ` · ${new Date(file.created_at).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}` : file.status !== 'ready' ? ' · 正在解析或待重试' : '' }}</option></select></label>
+    <div v-if="generatedListError" class="notice error" role="alert"><span>读取 AI 练习失败：{{ generatedListError }}</span><button class="text-button" @click="loadGeneratedSets">重试</button></div>
     <div v-if="error" class="notice error" role="alert"><span>{{ error }}</span><button v-if="bank?.status === 'queued' || bank?.status === 'processing'" class="text-button" @click="load">重新连接</button></div>
-    <div v-if="!files.length" class="empty-state compact"><h3>还没有上传题目</h3><p>点击“上传题目”加入练习；已有真题会自动出现在这里。</p></div>
+    <div v-if="!generatedLoaded" class="empty-state compact" role="status"><p>正在读取练习列表…</p></div>
+    <div v-else-if="!files.length" class="empty-state compact"><h3>还没有练习题</h3><p>使用上方“AI 生题”生成练习，或点击“上传题目”加入试卷。</p></div>
     <div v-else-if="currentFile?.status !== 'ready'" class="empty-state compact"><h3>{{ currentFile?.status === 'failed' ? '题目资料解析失败' : '正在解析题目资料…' }}</h3><p>{{ currentFile?.error || '解析完成后会自动整理成在线练习。可在资料库查看处理状态或重试。' }}</p></div>
-    <div v-else-if="loading || bank?.status === 'queued' || bank?.status === 'processing'" class="practice-loading" role="status"><h3>正在整理上传题目…</h3><p class="muted">提取题干与选项，保留原题内容。</p><div class="progress-track"><span :style="{ width: `${Math.round((bank?.progress || 0) * 100)}%` }"></span></div></div>
+    <div v-else-if="loading || bank?.status === 'queued' || bank?.status === 'processing'" class="practice-loading" role="status"><h3>{{ isGenerated ? '正在生成 AI 练习…' : '正在整理上传题目…' }}</h3><p class="muted">{{ isGenerated ? '正在生成题目与参考解析，完成后即可作答。' : '提取题干与选项，保留原题内容。' }}</p><div class="progress-track"><span :style="{ width: `${Math.round((bank?.progress || 0) * 100)}%` }"></span></div></div>
     <div v-else-if="bank?.status === 'new'" class="empty-state compact"><p>{{ modelConfigured ? '题目尚未整理' : '请先配置模型，用于整理题目及生成参考答案。' }}</p><button class="button primary" :disabled="!modelConfigured" @click="prepare">整理题目</button></div>
-    <div v-else-if="bank?.status === 'failed'" class="empty-state compact"><h3>题目整理未完成</h3><p>{{ bank.error }}</p><button class="button primary" :disabled="!modelConfigured" @click="prepare">重新整理</button></div>
-    <div v-else-if="bank?.status === 'ready' && !bank.questions.length" class="empty-state compact"><h3>当前试卷没有练习题</h3><p>题目可能未识别或已删除。可在资料库查看原文，或上传新的题目文件。</p></div>
+    <div v-else-if="bank?.status === 'failed'" class="empty-state compact"><h3>{{ isGenerated ? 'AI 生题未完成' : '题目整理未完成' }}</h3><p>{{ bank.error }}</p><button class="button primary" :disabled="!modelConfigured" @click="prepare">{{ isGenerated ? '重试生题' : '重新整理' }}</button></div>
+    <div v-else-if="bank?.status === 'ready' && !bank.questions.length" class="empty-state compact"><h3>当前练习没有题目</h3><p>{{ isGenerated ? '题目已全部删除，可在上方重新生成一组练习。' : '题目可能未识别或已删除。可在资料库查看原文，或上传新的题目文件。' }}</p></div>
     <template v-else-if="current && bank?.status === 'ready'">
       <div v-if="answersPreparing" class="practice-answer-preparation" role="status"><span>正在准备上传答案 · {{ Math.round((bank.answer_preparation?.progress || 0) * 100) }}%</span><span>可以先作答，准备完成后提交更快。</span></div>
-      <div class="practice-summary"><span>第 {{ index + 1 }} / {{ bank.questions.length }} 题 · {{ saveStatus }}</span><span v-if="answered">按原文答案已判 {{ answered }} 题 · 答对 {{ correct }} 题</span></div>
+      <div class="practice-summary"><span>第 {{ index + 1 }} / {{ bank.questions.length }} 题 · {{ saveStatus }}</span><span v-if="answered">已判 {{ answered }} 题 · 答对 {{ correct }} 题</span></div>
       <div class="practice-layout">
         <aside class="practice-navigation" aria-label="题目导航"><button v-for="(item, position) in bank.questions" :key="item.id" :class="['practice-number', { active: index === position, correct: results[item.id]?.correct === true, incorrect: results[item.id]?.correct === false, viewed: visible[item.id] && item.question_type === 'other' }]" :aria-label="`第 ${position + 1} 题${results[item.id]?.correct === true ? '，已答对' : results[item.id]?.correct === false ? '，已答错' : visible[item.id] ? '，已查看答案' : '，未判题'}`" :aria-current="index === position ? 'step' : undefined" :disabled="questionBusy" @click="move(position)">{{ position + 1 }}<span v-if="results[item.id]?.correct === true || results[item.id]?.correct === false" class="practice-state" aria-hidden="true">{{ results[item.id]?.correct ? '✓' : '×' }}</span></button></aside>
         <article class="practice-question" :key="current.id">
-          <div class="practice-question-meta"><span class="badge neutral">{{ current.question_type === 'single_choice' ? '单选题' : current.question_type === 'multiple_choice' ? '多选题' : '其他题型 · 自行对照' }}</span><span v-if="current.section">{{ current.section }}</span><span v-if="current.number">原题 {{ current.number }}</span><span v-if="current.locator.label">{{ current.locator.label }}</span><button class="text-button danger practice-delete-question" :disabled="modelBusy" @click="confirmDeleteQuestion">{{ deletingQuestion === current.id ? '删除中…' : '删除题目' }}</button></div>
+          <div class="practice-question-meta"><span class="badge neutral">{{ current.question_type === 'single_choice' ? '单选题' : current.question_type === 'multiple_choice' ? '多选题' : '其他题型 · 自行对照' }}</span><span v-if="current.section">{{ current.section }}</span><span v-if="current.number && !isGenerated">原题 {{ current.number }}</span><span v-if="current.locator.label">{{ current.locator.label }}</span><button class="text-button danger practice-delete-question" :disabled="modelBusy" @click="confirmDeleteQuestion">{{ deletingQuestion === current.id ? '删除中…' : '删除题目' }}</button></div>
           <div v-if="hasEnglish || current.translation" class="practice-translation-actions">
             <button class="button subtle" :disabled="questionBusy || (!current.translation && !modelConfigured)" :aria-expanded="!!translationVisible[current.id]" @click="toggleTranslation">
               {{ translatingQuestion === current.id ? '正在翻译…' : translationVisible[current.id] ? '隐藏中文翻译' : current.translation ? '显示中文翻译' : '翻译题目和选项' }}
@@ -449,10 +518,10 @@ onUnmounted(() => { progress.dispose(); window.removeEventListener('pagehide', s
           </fieldset>
           <div v-else class="practice-draft"><label :for="`draft-${current.id}`">你的作答（可选）</label><textarea :id="`draft-${current.id}`" v-model="drafts[current.id]" :disabled="!!deletingQuestion" rows="6" placeholder="在这里记录思路或答案，也可以在纸上作答。此题不自动判分。"></textarea></div>
           <div class="practice-controls"><button v-if="isChoice" class="button primary" :disabled="questionBusy || !selections[current.id]?.length" @click="resolve(true)">{{ busyQuestion ? '正在判题…' : '提交答案' }}</button><button v-else class="button primary" :disabled="questionBusy" @click="resolve(false)">{{ busyQuestion ? '正在获取答案…' : visible[current.id] ? '隐藏答案' : '显示答案' }}</button><button v-if="isChoice && currentResult" class="text-button" :disabled="questionBusy" @click="toggleAnswer(current.id)">{{ visible[current.id] ? '隐藏解析' : '显示解析' }}</button><button class="button subtle" :disabled="questionBusy" :aria-pressed="!!current.wrong_question_id" @click="toggleWrong">{{ markingQuestion ? '正在保存…' : current.wrong_question_id ? '移出错题本' : '＋ 加入错题本' }}</button></div>
-          <p v-if="current.wrong_question_id" class="muted practice-saved" role="status">{{ currentResult?.reference_match === false ? '与模型答案不一致，已自动收录到错题本' : currentResult?.correct === false ? '本次答错已自动收录到错题本' : '已收录到错题本' }} · 可在左侧“错题本”查看和删除。</p>
+          <p v-if="current.wrong_question_id" class="muted practice-saved" role="status">{{ currentResult?.correct === false ? '本次答错已自动收录到错题本' : '已收录到错题本' }} · 可在左侧“错题本”查看和删除。</p>
           <div v-if="currentResult" aria-live="polite">
             <div v-if="currentResult.origin !== 'model' && currentResult.correct !== null" :class="['notice', currentResult.correct ? 'success' : 'error']"><strong>{{ currentResult.correct ? '回答正确' : '回答错误' }}</strong><span>{{ currentResult.origin === 'embedded' ? '按原题自带答案判题' : '按上传答案判题' }} · 你的答案：{{ currentResult.selected?.join('、') }}　原文答案：{{ currentResult.choices.join('、') }}</span></div>
-            <div v-else-if="currentResult.origin === 'model' && currentResult.reference_match !== null" class="notice info"><strong>{{ currentResult.reference_match ? '与模型答案一致' : '与模型答案不一致' }}</strong><span>你的答案：{{ currentResult.selected?.join('、') }}　模型参考选项：{{ currentResult.choices.join('、') }}。不计入判分；不一致时自动收录到错题本。</span></div>
+            <div v-else-if="currentResult.origin === 'model' && currentResult.correct !== null" :class="['notice', currentResult.correct ? 'success' : 'error']"><strong>{{ currentResult.correct ? '回答正确' : '回答错误' }}</strong><span>按模型参考答案判题 · 你的答案：{{ currentResult.selected?.join('、') }}　模型参考选项：{{ currentResult.choices.join('、') }}。答错时自动收录到错题本。</span></div>
             <div v-else-if="currentResult.resolved === false" class="notice info"><strong>暂无法判题</strong><span>尚未得到明确的参考选项，作答已保留，不计分、不自动收录错题；可以稍后重新提交。</span></div>
             <div v-if="visible[current.id]" class="practice-answer">
               <p class="practice-answer-origin">{{ currentResult.origin === 'uploaded' ? '上传答案' : currentResult.origin === 'embedded' ? '原题自带答案' : '模型参考答案' }} · {{ currentResult.source }}</p>
@@ -470,10 +539,13 @@ onUnmounted(() => { progress.dispose(); window.removeEventListener('pagehide', s
       </div>
     </template>
   </section>
+  <ManagementDialog v-if="renameTarget" title="修改练习名称" description="修改这份练习在列表中的名称，题目与作答进度会保留。" :initial-name="practiceName(renameTarget)" confirm-text="保存名称" :busy="renaming" :error="renameError" @close="renameTarget = null" @submit="renamePractice" />
   <ManagementDialog v-if="deleteTarget" title="删除题目" :description="`确定删除${deleteTarget.number ? `原题 ${deleteTarget.number}` : '这道题目'}吗？删除后无法撤销，其他题目的作答和进度会保留。原试卷文件和已收录的错题仍会保留。`" confirm-text="删除题目" danger :busy="!!deletingQuestion" :error="deleteError" @close="deleteTarget = null" @submit="deleteQuestion" />
 </template>
 
 <style scoped>
+.practice-set-selector { display: grid; gap: 9px; font-size: 13px; color: var(--muted); margin: 18px 0; }
+.practice-set-selector select { width: 100%; min-width: 0; }
 .practice-upload-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .practice-upload-actions label { display: flex; align-items: center; gap: 8px; font-size: 13px; }
 .practice-upload-actions input:not([type=file]) { width: 100px; }
