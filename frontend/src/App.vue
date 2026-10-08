@@ -455,16 +455,27 @@ async function sendQuestion() {
   // Use the reactive array member so streaming updates render immediately.
   const visibleAnswer = messages.value[messages.value.length - 1]
   let completed = false
+  let streamedContent = ''
+  let streamTimer: ReturnType<typeof setTimeout> | undefined
+  function publishStream() {
+    if (streamTimer !== undefined) clearTimeout(streamTimer)
+    streamTimer = undefined
+    visibleAnswer.content = streamedContent
+  }
   try {
     await chatStream(currentSession, text, controller.signal, event => {
       let data: Record<string, unknown>
       try { data = JSON.parse(event.data) } catch { throw new Error('回答流包含无法解析的数据。请重试。') }
       if (event.event === 'status') chatStatus.value = String(data.message || '正在整理答案…')
-      if (event.event === 'delta') { visibleAnswer.content += String(data.text || ''); void scrollChat() }
+      if (event.event === 'delta') {
+        streamedContent += String(data.text || '')
+        if (streamTimer === undefined) streamTimer = setTimeout(() => { publishStream(); void scrollChat() }, 80)
+      }
       if (event.event === 'error') throw new Error(String(data.message || '回答生成失败。'))
       if (event.event === 'done') {
         completed = true; visibleAnswer.id = String(data.message_id || visibleAnswer.id)
-        visibleAnswer.content = typeof data.content === 'string' ? data.content : visibleAnswer.content
+        streamedContent = typeof data.content === 'string' ? data.content : streamedContent
+        publishStream()
         visibleAnswer.citations = []
       }
     }, context, note)
@@ -475,6 +486,7 @@ async function sendQuestion() {
     if ((error as Error).name === 'AbortError') chatStatus.value = '已停止生成'
     else { setError(error); chatStatus.value = '生成失败'; await refreshHealth() }
   } finally {
+    publishStream()
     visibleAnswer.pending = false; chatting.value = false; activeController = null
     if (completed) chatStatus.value = ''
     await scrollChat()

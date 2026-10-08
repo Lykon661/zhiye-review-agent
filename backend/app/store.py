@@ -308,7 +308,8 @@ class Services:
                 )
                 document_count, expected = 0, 0
                 with self.sessions() as db:
-                    documents = db.scalars(select(Document).where(Document.status == "ready")).all()
+                    documents = db.scalars(select(Document).where(
+                        Document.status == "ready", Document.kind != "generated")).all()
                     for document in documents:
                         blocks = db.scalars(select(Block).where(Block.document_id == document.id).order_by(Block.order)).all()
                         chunks = db.scalars(select(Chunk).where(Chunk.document_id == document.id)).all()
@@ -342,7 +343,8 @@ class Services:
                     logger.warning("Failed to close the retired index client", exc_info=True)
                 return {"documents": document_count, "chunks": expected}
             except Exception as exc:
-                self.retrieval.mark_unavailable()
+                # A failed replacement does not damage the live index. Existing
+                # repair flags stay in place until a replacement is published.
                 logger.exception("Vector index rebuild failed; old index and SQLite records retained")
                 if isinstance(exc, ValueError):
                     raise

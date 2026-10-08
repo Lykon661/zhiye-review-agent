@@ -23,6 +23,7 @@ class VisualResult:
     formulas: list[dict] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     skipped: bool = False
+    retryable: bool = False
 
 
 class FormulaRecognitionRejected(ValueError):
@@ -181,9 +182,14 @@ class VisualRecognizer:
                         if math_context and 1.5 < image.width / image.height < 15 and image.height <= 600:
                             try:
                                 result.formulas.append({"latex": self._formula(image), "bbox": [0, 0, image.width, image.height]})
+                            except FormulaRecognitionRejected as exc:
+                                result.warnings.append(str(exc))
                             except ValueError as exc:
                                 result.warnings.append(str(exc))
-                    if not result.warnings:
+                                result.retryable = True
+                    # Filtering noisy text or rejecting a crop is a completed
+                    # recognition result. Only execution/model failures retry.
+                    if not result.retryable:
                         try:
                             self.cache_dir.mkdir(parents=True, exist_ok=True)
                             cache_file.write_text(json.dumps(result.__dict__, ensure_ascii=False), encoding="utf-8")
@@ -193,16 +199,17 @@ class VisualRecognizer:
                 # Retain recognized source positions and scores in SQLite, omit duplicate text.
                 return VisualResult(
                     lines=[line for line in result.lines if not original or normalized(line["text"]) not in original],
-                    formulas=result.formulas, warnings=result.warnings,
+                    formulas=result.formulas, warnings=result.warnings, retryable=result.retryable,
                 )
             except Exception:
                 logger.exception("Image decoding/OCR failed")
-                return VisualResult(warnings=["图片读取或 OCR 失败，未纳入该图片内容；请查看后端日志。"])
+                return VisualResult(warnings=["图片读取或 OCR 失败，未纳入该图片内容；请查看后端日志。"], retryable=True)
 
     def _recognize(self, image, image_bytes):
         result = VisualResult()
         if self.ocr_error:
             result.warnings.append(self.ocr_error)
+            result.retryable = True
             return result
         try:
             if self.ocr is None:
@@ -213,6 +220,7 @@ class VisualRecognizer:
             self.ocr_error = "文字 OCR 模型加载或识别失败，请检查模型下载和后端日志后重新解析。"
             logger.exception("RapidOCR failed")
             result.warnings.append(self.ocr_error)
+            result.retryable = True
             return result
         if output.txts is None or output.boxes is None or output.scores is None:
             return result
@@ -259,5 +267,6 @@ class VisualRecognizer:
                 continue
             except ValueError as exc:
                 result.warnings.append(str(exc))
+                result.retryable = True
                 break
         return result

@@ -70,12 +70,12 @@ class UploadedAnswerPreparation:
         possible = [a for a in answers if (doc.year is None or a.year is None or a.year == doc.year)
                     and (a.kind == "answer" or ANSWER_FILENAME.search(a.filename))]
         matches = [a for a in possible if paired({"doc": doc}, a)]
-        uncertain = mode == "auto" and not embedded and (
+        uncertain = mode == "auto" and (
             len(matches) > 1 or not matches and bool(possible)
             or len(matches) == 1 and matches[0].status == "failed")
         if mode == "manual":
             selected = [chosen] if chosen else []
-        elif mode == "auto" and not embedded and len(matches) == 1:
+        elif mode == "auto" and len(matches) == 1:
             selected = matches
         else:
             selected = []
@@ -151,7 +151,7 @@ class UploadedAnswerPreparation:
             only_pair = len(ready) == 1 and paired(pairing_context, ready[0])
             # Knowledge uploads and chapter edits do not invalidate uploaded-answer
             # matches. Source changes, paper identity and matching context do.
-            signature_inputs = {"style": "uploaded_answers_v7_inline_choice", "paper": [doc.id, doc.filename, doc.year, bank.signature],
+            signature_inputs = {"style": "uploaded_answers_v8_combined_sources", "paper": [doc.id, doc.filename, doc.year, bank.signature],
                 "sources": [[a.id, a.filename, a.year, blocks] for a, blocks in candidates], "pairing": pairing,
                 "only_pair": only_pair}
             signature = self.signature_for_questions(signature_inputs, questions)

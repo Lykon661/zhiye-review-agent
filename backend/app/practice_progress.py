@@ -7,10 +7,13 @@ from sqlalchemy import select
 from .models import Course, PracticeProgress, PracticeQuestion, PracticeSet, now
 from .model_images import image_resolution_current
 
-ANSWER_POLICY = "source_and_choices_v7_inline_choice"
+ANSWER_POLICY = "source_and_choices_v8_combined_sources"
 
 
 def answer_policy_current(resolution):
+    # Generated exercises have no uploaded-answer association to upgrade.
+    if resolution and resolution.get("generated") and resolution.get("answer_policy") == "source_and_choices_v7_inline_choice":
+        return True
     return bool(resolution) and (resolution.get("origin") not in ("uploaded", "embedded", "model")
                                  or resolution.get("answer_policy") == ANSWER_POLICY)
 

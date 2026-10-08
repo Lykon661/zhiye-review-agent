@@ -1,5 +1,7 @@
 """Keep explicitly numbered question bodies intact across paragraphs and pages."""
 import re
+import unicodedata
+from collections import Counter, defaultdict
 from .question_images import IMAGE_URL
 
 PRIMARY = re.compile(r"^\s*(\d{1,3})[.．、](?!\d)\s*\S")
@@ -11,6 +13,44 @@ ANSWER = re.compile(r"(?:^|\n)\s*(?:参考答案|答案|解析|解答|答|解|an
 PROMPT = re.compile(r"[?？]|\b(?:scores?|points?)\b|[（(]\s*\d+\s*分|(?:计算|证明|简述|求出|设计|画出|写出|给定|已知|假设)", re.I)
 ATTACHMENT = re.compile(r"^_?\d+\.(?:unknown|vsd|emf|wmf)\s*$", re.I)
 DIAGRAM = re.compile(r"图|树|电路|figure|diagram|graph|tree|shown|illustrat", re.I)
+PAGE_LABEL = re.compile(r"^(?:[-—–\s]*\d+[-—–\s]*|\d+\s*/\s*\d+|第\s*\d+\s*页(?:\s*[,，/]?\s*共\s*\d+\s*页)?|page\s+\d+(?:\s+of\s+\d+)?)$", re.I)
+
+
+def scan_text_pages(blocks):
+    """A page number/header does not make a scanned body a native-text page."""
+    native, ocr = defaultdict(list), defaultdict(list)
+    for block in blocks:
+        locator = block["locator"]
+        page = locator.get("page")
+        if page is None or locator.get("image_url") or IMAGE_URL.search(block["text"]):
+            continue
+        if locator.get("page_preview") and locator.get("recognition") == "ocr":
+            ocr[page].extend(block["text"].splitlines())
+        elif not locator.get("page_preview") and not locator.get("recognition"):
+            native[page].extend(block["text"].splitlines())
+    line_pages = Counter(line for rows in native.values()
+                         for line in {unicodedata.normalize("NFKC", row).strip() for row in rows} if line)
+
+    def body(rows):
+        result = []
+        for row in rows:
+            row = unicodedata.normalize("NFKC", row).strip()
+            if (not row or PAGE_LABEL.fullmatch(row) or row.startswith("[图片文字 OCR")
+                    or (len(row) <= 100 and line_pages.get(row, 0) > 1)):
+                continue
+            result.append(row)
+        return result
+
+    pages = set()
+    for page, rows in ocr.items():
+        native_rows, ocr_rows = body(native[page]), body(rows)
+        native_size = len(re.sub(r"\s+", "", "".join(native_rows)))
+        ocr_size = len(re.sub(r"\s+", "", "".join(ocr_rows)))
+        numbered = any(PRIMARY.match(row) or PARENTHESIZED.match(row) for row in native_rows)
+        if (not native_size or (native_size < 80 and not numbered)
+                or native_size < ocr_size * 0.35):
+            pages.add(page)
+    return pages
 
 
 def question_groups(blocks):
@@ -19,25 +59,17 @@ def question_groups(blocks):
     number, explicit = "", False
     top_level = False
     page_previews = {}
-    native_text_pages = set()
     figure_units = set()
     def unit(locator):
         return tuple((key, locator[key]) for key in ("page", "paragraph", "table", "slide", "shape_path") if key in locator)
     for block in blocks:
         locator = block["locator"]
-        if (locator.get("page") is not None and not locator.get("page_preview")
-                and not locator.get("recognition") and not locator.get("image_url")
-                and not IMAGE_URL.search(block["text"]) and block["text"].strip()):
-            native_text_pages.add(locator["page"])
         if block["locator"].get("image_url") or IMAGE_URL.search(block["text"]):
             if block["locator"].get("page_preview"):
                 page_previews[block["locator"].get("page")] = block
             else:
                 figure_units.add(unit(block["locator"]))
-    scan_ocr_pages = {block["locator"]["page"] for block in blocks
-                      if block["locator"].get("page") is not None
-                      and block["locator"].get("page_preview")
-                      and block["locator"].get("recognition") == "ocr"} - native_text_pages
+    scan_ocr_pages = scan_text_pages(blocks)
 
     def flush():
         nonlocal current

@@ -10,6 +10,7 @@ from sqlalchemy import select
 from .config import ROOT, Settings
 from .models import AppMeta, Block, Chunk, Course, Document, Outline
 from .lexical import query_terms, lexical_score
+from .lexical_index import candidate_chunks
 
 logger = logging.getLogger(__name__)
 HNSW_FILES = {"header.bin", "data_level0.bin", "length.bin", "link_lists.bin"}
@@ -367,6 +368,9 @@ class RetrievalService:
                 statement = statement.where(Document.year == year)
             lexical = []
             if groups:
+                candidates = candidate_chunks(db, groups)
+                if candidates is not None:
+                    statement = statement.where(Chunk.id.in_(candidates))
                 for chunk_id, text in db.execute(statement):
                     score = lexical_score(text, groups)
                     if score:

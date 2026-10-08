@@ -5,6 +5,11 @@ import './math.css'
 import type { Source } from './types'
 import { API_BASE } from './api'
 
+interface RenderEnvironment { citations: Map<string, string> }
+const formulaCache = new Map<string, string>()
+let formulaCacheChars = 0
+const MAX_FORMULA_CACHE_CHARS = 500000
+
 function addMath(md: MarkdownIt) {
   const closingAt = (src: string, close: string, start: number) => {
     let end = start
@@ -17,11 +22,29 @@ function addMath(md: MarkdownIt) {
     return -1
   }
   const render = (text: string, displayMode: boolean) => {
-    try {
-      return katex.renderToString(text, { displayMode, throwOnError: false, trust: false, strict: 'ignore', maxExpand: 1000, maxSize: 20 })
-    } catch {
-      return `<code>${md.utils.escapeHtml(text)}</code>`
+    const key = `${displayMode ? 'block' : 'inline'}:${text}`
+    const cached = formulaCache.get(key)
+    if (cached !== undefined) {
+      formulaCache.delete(key); formulaCache.set(key, cached)
+      return cached
     }
+    let html: string
+    try {
+      html = katex.renderToString(text, { displayMode, throwOnError: false, trust: false, strict: 'ignore', maxExpand: 1000, maxSize: 20 })
+    } catch {
+      html = `<code>${md.utils.escapeHtml(text)}</code>`
+    }
+    const size = key.length + html.length
+    if (size <= MAX_FORMULA_CACHE_CHARS) {
+      while (formulaCache.size >= 256 || formulaCacheChars + size > MAX_FORMULA_CACHE_CHARS) {
+        const oldest = formulaCache.keys().next().value
+        if (oldest === undefined) break
+        formulaCacheChars -= oldest.length + formulaCache.get(oldest)!.length
+        formulaCache.delete(oldest)
+      }
+      formulaCache.set(key, html); formulaCacheChars += size
+    }
+    return html
   }
   md.block.ruler.before('fence', 'math_block', (state, startLine, endLine, silent) => {
     if (state.sCount[startLine] - state.blkIndent >= 4) return false
@@ -104,7 +127,7 @@ function addMath(md: MarkdownIt) {
   }
 }
 
-export function renderMarkdown(content: string, sources: Source[] = [], notePositions = false): string {
+function createMarkdown(notePositions: boolean): MarkdownIt {
   const md = new MarkdownIt({ html: false, linkify: false, breaks: true })
   addMath(md)
   if (notePositions) {
@@ -126,16 +149,9 @@ export function renderMarkdown(content: string, sources: Source[] = [], notePosi
       }
     }
   }
-  const allowed = new Map<string, string>()
-  for (const source of sources) {
-    allowed.set(`S${source.chunk_id}`, source.chunk_id)
-    if (source.source_id) {
-      allowed.set(source.source_id.replace(/^\[|\]$/g, ''), source.chunk_id)
-      allowed.set(`S${source.source_id.replace(/^S/, '')}`, source.chunk_id)
-    }
-  }
   md.inline.ruler.before('link', 'verified_citation', (state, silent) => {
     if (state.src[state.pos] !== '[') return false
+    const allowed = (state.env as RenderEnvironment).citations
     const match = /^\[(S[a-zA-Z0-9_-]+)\]/.exec(state.src.slice(state.pos))
     if (!match || !allowed.has(match[1])) return false
     if (!silent) {
@@ -169,5 +185,22 @@ export function renderMarkdown(content: string, sources: Source[] = [], notePosi
     }
     return `<span class="muted">[图片：${alt}]</span>`
   }
-  return md.render(content)
+  return md
+}
+
+const parsers = new Map<boolean, MarkdownIt>()
+
+export function renderMarkdown(content: string, sources: Source[] = [], notePositions = false): string {
+  let md = parsers.get(notePositions)
+  if (!md) { md = createMarkdown(notePositions); parsers.set(notePositions, md) }
+  // Per-render evidence belongs in env, never in shared parser closures.
+  const citations = new Map<string, string>()
+  for (const source of sources) {
+    citations.set(`S${source.chunk_id}`, source.chunk_id)
+    if (source.source_id) {
+      citations.set(source.source_id.replace(/^\[|\]$/g, ''), source.chunk_id)
+      citations.set(`S${source.source_id.replace(/^S/, '')}`, source.chunk_id)
+    }
+  }
+  return md.render(content, { citations } satisfies RenderEnvironment)
 }
