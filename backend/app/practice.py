@@ -366,7 +366,9 @@ section仅用于理解题目背景，无需输出。选项的key必须原样保�
             blocks = self._blocks(db, document_id)
             signature = self._signature(blocks)
             bank = db.get(PracticeSet, document_id)
-            if bank and bank.signature == signature and bank.status in ("queued", "processing", "ready"):
+            if bank and bank.signature == signature and (bank.status in ("queued", "processing")
+                    or bank.status == "ready" and db.scalar(select(PracticeQuestion.id).where(
+                        PracticeQuestion.document_id == document_id).limit(1))):
                 return {"status": bank.status}
             if not self.s.llm.configured:
                 raise HTTPException(409, "请先配置模型，再整理上传题目。")
@@ -515,6 +517,8 @@ answer_choices仅在明确上传答案可映射到选项时填写，否则空数
                     bank = db.get(PracticeSet, document_id)
                     bank.progress = (index + 1) / max(1, len(batches))
                     db.commit()
+            if not found:
+                raise StructuredOutputError("未识别到完整题目，请查看原文后重试整理；可更换模型后再次尝试。")
             block_order = {block["id"]: index for index, block in enumerate(blocks)}
             def source_order(pair):
                 base, offset = pair[0].split(":")

@@ -101,6 +101,7 @@ a { color: var(--accent); text-underline-offset: 3px; }
 .health-pill.offline { color: var(--danger); }
 .health-pill.offline span { background: var(--danger); }
 .main-content { max-width: 1420px; margin: 0 auto; padding: 34px 36px 24px; }
+.main-content.review-space-content { max-width: 1760px; padding: 18px 28px 16px; }
 .main-content:focus { outline: none; }
 .page-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 28px; gap: 24px; }
 .course-caption { color: var(--accent); font-size: 13px; font-weight: 600; margin-bottom: 9px; overflow-wrap: anywhere; }
@@ -327,6 +328,7 @@ a { color: var(--accent); text-underline-offset: 3px; }
   .breadcrumb { flex-basis: 100%; font-size: 12px; }
   .breadcrumb-course { max-width: 70%; }
   .main-content { padding: 24px 16px 20px; }
+  .main-content.review-space-content { padding: 16px; }
   .page-heading { margin-bottom: 22px; }
   .page-heading > div:first-child > p:last-child { font-size: 13px; line-height: 1.85; }
   .panel { padding: 20px 16px; border-radius: 12px; margin-bottom: 18px; }

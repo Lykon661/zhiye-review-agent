@@ -1,10 +1,11 @@
 import hashlib
 import json
 import logging
+from contextlib import contextmanager
 from pathlib import Path
 from threading import RLock
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 
 from .chunking import split_text
 from .config import Settings
@@ -13,10 +14,12 @@ from .file_chapters import document_role, file_order, file_title
 from .llm import ModelClient
 from .model_config import ModelConfigStore
 from .memory import MemoryService
-from .models import AppMeta, Block, Chapter, ChatSession, Chunk, Course, Document, Job, Message, Outline, PracticeAnswerIndex, PracticeSet, WrongQuestion, new_id
+from .models import AppMeta, Block, Chapter, ChatSession, Chunk, Course, Document, Job, Message, Outline, PracticeAnswerIndex, PracticeSet, RetrievalPassage, ReviewSpace, WrongQuestion, new_id
 from .parsing import parse_document
 from .practice_progress import answer_policy_current
 from .retrieval import RetrievalService
+from .retrieval_ranking import KnowledgeReranker
+from .knowledge_retrieval import KnowledgeRetrieval
 from .visual_recognition import VisualRecognizer
 
 logger = logging.getLogger(__name__)
@@ -37,8 +40,11 @@ class Services:
             self.retrieval.mark_unavailable()
         self.model_config = ModelConfigStore(settings)
         self.llm = llm if llm is not None else ModelClient(settings, self.model_config)
+        self.retrieval.reranker = KnowledgeReranker(self.llm, self.model_config)
+        self.knowledge = KnowledgeRetrieval(self)
         self.visual = VisualRecognizer(settings)
         self.chat_locks = {}
+        self.review_space_locks = {}
         self.practice_locks = {}
         self.answer_preparation_locks = {}
         self.explanation_locks = {}
@@ -114,6 +120,43 @@ class Services:
             for chapter in db.scalars(select(Chapter).where(Chapter.course_id == course_id)):
                 chapter.confirmed = False
 
+    @contextmanager
+    def _indexed_deletion(self, db, course_id, message):
+        """SQL rollback cannot undo Chroma writes; retain a repair checkpoint."""
+        try:
+            yield
+        except Exception as exc:
+            logger.exception("Indexed deletion failed for course %s", course_id)
+            db.rollback()
+            try:
+                flag = db.get(AppMeta, "index_repair:" + course_id)
+                if flag:
+                    flag.value = "rebuild_required"
+                else:
+                    db.add(AppMeta(key="index_repair:" + course_id, value="rebuild_required"))
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception("Could not persist the index repair checkpoint")
+            raise RuntimeError(message) from exc
+
+    def _cleanup_upload(self, path):
+        # Physical cleanup follows a committed business deletion. A locked file
+        # must not turn that successful deletion into an HTTP failure.
+        try:
+            path = Path(path).resolve()
+            if path.parent != self.upload_dir.resolve():
+                logger.warning("Skipped upload cleanup outside the uploads directory")
+                return
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Failed to remove retired upload %s", Path(path).name, exc_info=True)
+
+    def _require_chat_idle(self, db, course_id):
+        ids = db.scalars(select(ChatSession.id).where(ChatSession.course_id == course_id))
+        if any(self.chat_locks.get(identity) and self.chat_locks[identity].locked() for identity in ids):
+            raise ValueError("课程会话正在回答，请停止或完成后再删除")
+
     def remove_course(self, course_id: str):
         with self.lock, self.sessions() as db:
             course = db.get(Course, course_id)
@@ -121,6 +164,9 @@ class Services:
                 return False
             documents = db.scalars(select(Document).where(Document.course_id == course_id)).all()
             session_ids = list(db.scalars(select(ChatSession.id).where(ChatSession.course_id == course_id)))
+            space_ids = list(db.scalars(select(ReviewSpace.id).where(ReviewSpace.course_id == course_id)))
+            if any(self.review_space_locks.get(identity) and self.review_space_locks[identity].locked() for identity in space_ids):
+                raise ValueError("复习空间正在安排下一步，请等待完成或暂停后再删除课程")
             if any(doc.status in ("queued", "processing") for doc in documents):
                 raise ValueError("课程资料正在处理，请完成后再删除课程")
             if any((self.practice_locks.get(doc.id) and self.practice_locks[doc.id].locked())
@@ -129,20 +175,15 @@ class Services:
                 raise ValueError("正在整理题目或回答练习，请完成后再删除课程")
             if db.scalar(select(Job.id).join(Outline).where(Outline.course_id == course_id, Job.status.in_(["queued", "running"]))):
                 raise ValueError("课程笔记正在生成，请完成后再删除课程")
-            if any(self.chat_locks.get(identity) and self.chat_locks[identity].locked() for identity in session_ids):
-                raise ValueError("课程会话正在回答，请停止或完成后再删除课程")
+            self._require_chat_idle(db, course_id)
             # Resolve every file before deleting anything; never follow a saved path outside uploads.
             paths = [Path(doc.path).resolve() for doc in documents]
             if any(path.parent != self.upload_dir.resolve() for path in paths):
                 raise ValueError("资料保存位置异常，未删除课程，请检查后端配置")
-            try:
-                self.retrieval.delete_course(course_id)
-            except Exception as exc:
-                logger.exception("Course vector deletion failed; business records retained")
-                raise RuntimeError("课程索引删除失败，课程仍保留，请检查日志后重试") from exc
             document_ids = select(Document.id).where(Document.course_id == course_id)
             outline_ids = select(Outline.id).where(Outline.course_id == course_id)
-            try:
+            with self._indexed_deletion(db, course_id, "课程删除失败，课程仍保留；请重建索引或再次删除"):
+                self.retrieval.delete_course(course_id)
                 db.execute(delete(Chunk).where(Chunk.document_id.in_(document_ids)))
                 db.execute(delete(Block).where(Block.document_id.in_(document_ids)))
                 db.execute(delete(Document).where(Document.course_id == course_id))
@@ -155,26 +196,15 @@ class Services:
                 db.execute(delete(AppMeta).where(AppMeta.key == "file_chapter_policy:" + course_id))
                 db.execute(delete(AppMeta).where(AppMeta.key == "chapter_excluded:" + course_id))
                 db.execute(delete(AppMeta).where(AppMeta.key.in_(
-                    [prefix + doc.id for doc in documents for prefix in ("practice_answer_pair:", "practice_title:")])))
+                    [prefix + doc.id for doc in documents for prefix in ("practice_answer_pair:", "practice_title:", "knowledge_units:")])))
                 db.delete(course)
                 db.commit()
-            except Exception as exc:
-                db.rollback()
-                flag = db.get(AppMeta, "index_repair:" + course_id)
-                if flag:
-                    flag.value = "rebuild_required"
-                else:
-                    db.add(AppMeta(key="index_repair:" + course_id, value="rebuild_required"))
-                db.commit()
-                logger.exception("Course database deletion failed; index repair required")
-                raise RuntimeError("课程记录删除失败，课程仍保留；请重建索引或再次删除") from exc
             for identity in session_ids:
                 self.chat_locks.pop(identity, None)
+            for identity in space_ids:
+                self.review_space_locks.pop(identity, None)
             for path in paths:
-                try:
-                    path.unlink(missing_ok=True)
-                except OSError:
-                    logger.warning("Failed to remove retired upload %s", path.name, exc_info=True)
+                self._cleanup_upload(path)
             return True
 
     def excluded_chapter_documents(self, db, course_id: str):
@@ -323,6 +353,12 @@ class Services:
                 if replacement.disk_issue() or replacement.collection.count() != expected:
                     raise ValueError("新索引未能完整保存，未切换索引。请检查本地目录写入权限和后端日志。")
                 with self.sessions() as db:
+                    expected_passages = db.scalar(select(func.count()).select_from(RetrievalPassage).join(
+                        Document, RetrievalPassage.document_id == Document.id).where(
+                            Document.status == "ready", Document.kind.in_(["lecture", "note"])))
+                if replacement.knowledge_collection.count() != expected_passages:
+                    raise ValueError("整页/小节知识索引未能完整保存，未切换索引。请检查向量模型和后端日志。")
+                with self.sessions() as db:
                     marker = db.get(AppMeta, "vector_store_name")
                     if marker is None:
                         db.add(AppMeta(key="vector_store_name", value=replacement.store_name))
@@ -334,6 +370,7 @@ class Services:
                 old_client = self.retrieval.client
                 self.retrieval.client = replacement.client
                 self.retrieval.collection = replacement.collection
+                self.retrieval.knowledge_collection = replacement.knowledge_collection
                 self.retrieval.store_dir = replacement.store_dir
                 self.retrieval.store_name = replacement.store_name
                 replacement = None  # Ownership transferred to the live service.
@@ -341,7 +378,7 @@ class Services:
                     old_client.close()
                 except Exception:
                     logger.warning("Failed to close the retired index client", exc_info=True)
-                return {"documents": document_count, "chunks": expected}
+                return {"documents": document_count, "chunks": expected, "knowledge_passages": expected_passages}
             except Exception as exc:
                 # A failed replacement does not damage the live index. Existing
                 # repair flags stay in place until a replacement is published.
@@ -438,6 +475,7 @@ class Services:
             doc = db.get(Document, document_id)
             if doc is None:
                 return False
+            self._require_chat_idle(db, doc.course_id)
             if doc.status in ("queued", "processing"):
                 raise ValueError("资料正在处理，请完成后再删除资料")
             if self.practice_locks.get(doc.id) and self.practice_locks[doc.id].locked():
@@ -449,21 +487,21 @@ class Services:
                 db.execute(delete(AppMeta).where(AppMeta.key == "practice_title:" + doc.id))
                 db.delete(doc)
                 db.commit()
-                if file_path.resolve().parent == self.upload_dir.resolve():
-                    file_path.unlink(missing_ok=True)
+                self._cleanup_upload(file_path)
                 return True
-            self.retrieval.delete_document(doc.id)
-            db.execute(delete(Chunk).where(Chunk.document_id == doc.id))
-            db.execute(delete(Block).where(Block.document_id == doc.id))
             course_id, file_path = doc.course_id, Path(doc.path)
-            self.set_excluded_chapter_documents(db, course_id, self.excluded_chapter_documents(db, course_id) - {doc.id})
-            db.execute(delete(AppMeta).where(AppMeta.key.in_([
-                "practice_answer_pair:" + doc.id, "practice_title:" + doc.id])))
-            db.delete(doc)
-            db.flush()
-            self.draft_chapters(db, course_id)
-            db.commit()
-            # The saved path is generated internally and must remain inside the uploads directory.
-            if file_path.resolve().parent == self.upload_dir.resolve():
-                file_path.unlink(missing_ok=True)
+            if file_path.resolve().parent != self.upload_dir.resolve():
+                raise ValueError("资料保存位置异常，未删除资料，请检查后端配置")
+            with self._indexed_deletion(db, course_id, "资料删除失败，资料仍保留；请重建索引或再次删除"):
+                self.retrieval.delete_document(doc.id)
+                db.execute(delete(Chunk).where(Chunk.document_id == doc.id))
+                db.execute(delete(Block).where(Block.document_id == doc.id))
+                self.set_excluded_chapter_documents(db, course_id, self.excluded_chapter_documents(db, course_id) - {doc.id})
+                db.execute(delete(AppMeta).where(AppMeta.key.in_([
+                    "practice_answer_pair:" + doc.id, "practice_title:" + doc.id, "knowledge_units:" + doc.id])))
+                db.delete(doc)
+                db.flush()
+                self.draft_chapters(db, course_id)
+                db.commit()
+            self._cleanup_upload(file_path)
             return True

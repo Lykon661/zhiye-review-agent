@@ -1,12 +1,14 @@
 """Prompt limits and citations for evidence actually supplied to the model."""
 from copy import deepcopy
+from dataclasses import replace
 import json
 
 import pytest
 from sqlalchemy import select
 
 from app.agent import INPUT_BYTE_BUDGET, answer_messages, plan_messages
-from app.models import Chunk
+from app.models import Chunk, Message
+from app.prompt_budget import InputBudget
 from conftest import make_docx
 from test_app import blocks, chat, event_payload, session, upload
 
@@ -77,18 +79,23 @@ def long_source(client, course, app):
 
 
 def test_truncated_neighbor_citation_preserves_model_visible_copy(client, course, app, llm, monkeypatch):
+    app.state.services.model_config.value = replace(app.state.services.model_config.snapshot(), context_window=12288)
     source, current, _ = long_source(client, course, app)
     monkeypatch.setattr(app.state.services.retrieval, "search", lambda *args, **kwargs: [source])
     llm.stream_responses.append(f"根据所提供的原文片段解释。[S{current['id']}]")
     events = chat(client, session(client, course["id"]), "RAG")
 
     done = event_payload(events, "done")
-    citation = done["citations"][0]
+    assert done["citations"] == []
+    with app.state.services.sessions() as db:
+        persisted = db.get(Message, done["message_id"]).citations
+    citation = next(item for item in persisted if item["source_id"] == "S" + current["id"])
     payload = json.loads(llm.stream_calls[-1][-1]["content"])
     supplied = next(context for item in payload["sources"] for context in item["context"]
                     if context["block_id"] == current["id"])
-    assert message_bytes(llm.stream_calls[-1]) <= INPUT_BYTE_BUDGET
-    assert event_payload(events, "sources")["sources"] == payload["sources"]
+    budget = InputBudget(app.state.services.model_config.snapshot())
+    assert budget.messages_size(llm.stream_calls[-1]) <= budget.limit
+    assert "sources" not in [name for name, _ in events]
     assert citation["text"] == supplied["text"]
     assert citation["truncated"] is True
     assert citation["original_characters"] == len(current["text"])
@@ -96,7 +103,8 @@ def test_truncated_neighbor_citation_preserves_model_visible_copy(client, course
     assert len(citation["text"]) < len(current["text"])
 
 
-def test_budget_omitted_neighbor_cannot_pass_citation_validation(client, course, app, llm, monkeypatch):
+def test_budget_omitted_neighbor_cannot_become_persisted_evidence(client, course, app, llm, monkeypatch):
+    app.state.services.model_config.value = replace(app.state.services.model_config.snapshot(), context_window=12288)
     source, _, neighbor = long_source(client, course, app)
     monkeypatch.setattr(app.state.services.retrieval, "search", lambda *args, **kwargs: [source])
     omitted_id = "S" + neighbor["id"]
@@ -108,7 +116,12 @@ def test_budget_omitted_neighbor_cannot_pass_citation_validation(client, course,
     visible_ids = {item["source_id"] for item in payload["sources"]}
     visible_ids.update(context["source_id"] for item in payload["sources"] for context in item["context"])
     assert omitted_id not in visible_ids
-    assert "无效引用" in event_payload(events, "error")["message"]
-    assert not any(name == "done" for name, _ in events)
+    done = event_payload(events, "done")
+    assert omitted_id not in done["content"]
+    assert done["citations"] == []
+    with app.state.services.sessions() as db:
+        persisted = db.get(Message, done["message_id"]).citations
+    assert all(item["source_id"] != omitted_id for item in persisted)
     saved = client.get(f"/sessions/{session_id}/messages").json()
-    assert all(message["role"] != "assistant" for message in saved)
+    assert any(message["role"] == "assistant" for message in saved)
+    assert all(message["citations"] == [] for message in saved)

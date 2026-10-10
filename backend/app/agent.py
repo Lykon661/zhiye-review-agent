@@ -10,11 +10,14 @@ from .llm import model_failure_message, parse_json
 from .models import ChatSession, Course, Message
 from .chat_answers import asks_for_question_answer
 from .model_images import attach_question_images
+from .lexical import overview_request, query_terms
+from .prompt_budget import InputBudget, estimate_tokens, paragraphs_excerpt
+from .token_usage import TokenUsage, collect_usage
 
 logger = logging.getLogger(__name__)
 
-# A conservative byte budget, not a claim about a provider's tokenizer. Leave
-# room for the client's 4096 output tokens and transport/model framing on 16K.
+# Compatibility default for direct helper callers. Live chat passes the
+# configured model-window budget instead of this historical byte limit.
 INPUT_BYTE_BUDGET = 11000
 
 PLAN_PROMPT = """[TASK:PLAN]
@@ -73,8 +76,10 @@ def event(name: str, data: dict) -> str:
 
 
 class _PromptBudget:
-    def __init__(self, prompt, question, history, field, count, context_count=0, practice_context=None, note_context=None, memory=None):
+    def __init__(self, prompt, question, history, field, count, context_count=0, practice_context=None, note_context=None, memory=None, context_budget=None):
         self.prompt = prompt
+        self.context_budget = context_budget
+        self.limit = context_budget.limit if context_budget else INPUT_BYTE_BUDGET
         self.history = history[-12:]
         self.payload = {"question": question, "history": [], field: [],
                         "omitted": {"history": len(self.history), field: count, "context": context_count}}
@@ -96,13 +101,14 @@ class _PromptBudget:
         # sources get the rest before older history is considered.
         initial_size = self.size()
         for offset, index in enumerate(range(len(self.history) - 1, max(-1, len(self.history) - 3), -1), 1):
-            self.add_history(index, min(INPUT_BYTE_BUDGET, initial_size + offset * 600))
+            self.add_history(index, min(self.limit, initial_size + offset * (200 if context_budget else 600)))
         if memory:
             self.payload["memory"] = {"preferences": [], "summary": [], "learning": []}
             if not self.fits():
                 self.payload.pop("memory")
                 return
-            limit = min(INPUT_BYTE_BUDGET, self.size() + memory.get("max_bytes", 1400))
+            memory_allowance = memory.get("max_bytes", 1400) // 3 if context_budget else memory.get("max_bytes", 1400)
+            limit = min(self.limit, self.size() + memory_allowance)
             for pref in memory.get("preferences", []):
                 self.payload["memory"]["preferences"].append(pref)
                 if not self.fits(limit):
@@ -122,10 +128,12 @@ class _PromptBudget:
                 {"role": "user", "content": json.dumps(self.payload, ensure_ascii=False)}]
 
     def size(self):
+        if self.context_budget:
+            return self.context_budget.messages_size(self.messages())
         return len(json.dumps(self.messages(), ensure_ascii=False).encode("utf-8"))
 
-    def fits(self, limit=INPUT_BYTE_BUDGET):
-        return self.size() <= limit
+    def fits(self, limit=None):
+        return self.size() <= (self.limit if limit is None else limit)
 
     def add_full(self, container, item):
         container.append(item)
@@ -134,7 +142,7 @@ class _PromptBudget:
         container.pop()
         return False
 
-    def add_text(self, container, item, field="text", limit=INPUT_BYTE_BUDGET):
+    def add_text(self, container, item, field="text", limit=None):
         candidate = dict(item)
         text = str(candidate[field])
         original = candidate.get("original_characters", len(text))
@@ -157,7 +165,7 @@ class _PromptBudget:
         container.pop()
         return None
 
-    def add_history(self, index, limit=INPUT_BYTE_BUDGET):
+    def add_history(self, index, limit=None):
         if index in self._history_positions.values():
             return
         entry = dict(self.history[index])
@@ -180,9 +188,9 @@ class _PromptBudget:
         return self.messages()
 
 
-def plan_messages(question, history, observations, practice_context=None, note_context=None, memory=None):
+def plan_messages(question, history, observations, practice_context=None, note_context=None, memory=None, context_budget=None):
     budget = _PromptBudget(PLAN_PROMPT, question, history, "observations", len(observations),
-                           practice_context=practice_context, note_context=note_context, memory=memory)
+                           practice_context=practice_context, note_context=note_context, memory=memory, context_budget=context_budget)
     # The most recent result is most useful when deciding whether to search again.
     for observation in reversed(observations):
         query = observation["query"]
@@ -201,24 +209,41 @@ def plan_messages(question, history, observations, practice_context=None, note_c
     return budget.finish()
 
 
-def answer_messages(question, history, sources, practice_context=None, note_context=None, memory=None):
+def answer_messages(question, history, sources, practice_context=None, note_context=None, memory=None, context_budget=None):
     ranked = sorted(sources, key=lambda item: item.get("score", 0), reverse=True)
-    # Give each material kind a first chance; otherwise many lecture hits could
-    # suppress the note needed to explain a contradiction (or vice versa).
+    # Give each kind and requested topic a first chance before more of the same.
     first, rest, kinds = [], [], set()
     for source in ranked:
-        if source["kind"] not in kinds:
+        topics = source.get("matched_topics", [])
+        key = (source["kind"], topics[0] if topics else "")
+        if key not in kinds:
             first.append(source)
-            kinds.add(source["kind"])
+            kinds.add(key)
         else:
             rest.append(source)
     neighbor_ids = {item["block_id"] for source in sources for item in source.get("context", [])}
-    budget = _PromptBudget(ANSWER_PROMPT, question, history, "sources", len(sources), len(neighbor_ids), practice_context, note_context, memory)
+    budget = _PromptBudget(ANSWER_PROMPT, question, history, "sources", len(sources), len(neighbor_ids), practice_context, note_context, memory, context_budget)
     selected = []
-    for source in first + rest:
-        packed = {key: value for key, value in source.items() if key != "context"}
+    ordered = first + rest
+    first_ids = {s["source_id"] for s in first}
+    terms = [term for group in query_terms(question)[0] for term in group]
+    for index, source in enumerate(ordered):
+        packed = {key: value for key, value in source.items() if key not in ("context", "source_blocks")}
         packed["context"] = []
         budget.payload["omitted"]["sources"] -= 1
+        if context_budget and source.get("retrieval_unit_id"):
+            others = [s for s in ordered[index + 1:] if s["source_id"] in first_ids]
+            reserve = sum(min(estimate_tokens(s["text"]) + 100, 700) for s in others)
+            overhead = estimate_tokens({**packed, "text": ""}) + 100
+            remaining = budget.limit - budget.size()
+            reserve = min(reserve, max(0, remaining - overhead) * len(others) / (len(others) + 1))
+            allowance = max(0, remaining - overhead - reserve)
+            text, excerpted = paragraphs_excerpt(packed["text"], allowance, terms)
+            if not text:
+                budget.payload["omitted"]["sources"] += 1
+                continue
+            packed.update(text=text, excerpted=excerpted, truncated=bool(packed.get("truncated")) or excerpted,
+                          original_characters=packed.get("original_characters", len(source["text"])))
         if budget.add_full(budget.payload["sources"], packed):
             selected.append((source, packed))
         else:
@@ -231,8 +256,8 @@ def answer_messages(question, history, sources, practice_context=None, note_cont
                            "summary": memory.get("summary", "")[:100],
                            "summary_truncated": len(memory.get("summary", "")) > 100,
                            "learning": memory.get("learning", [])[:1], "max_bytes": 350}
-                return answer_messages(question, history, sources, practice_context, note_context, compact)
-            return answer_messages(question, history, sources, practice_context, note_context)
+                return answer_messages(question, history, sources, practice_context, note_context, compact, context_budget)
+            return answer_messages(question, history, sources, practice_context, note_context, context_budget=context_budget)
         raise ValueError("无法在模型输入预算内完整保留检索证据，请缩小问题或章节范围后重试。")
     allowed = {packed["source_id"]: packed for _, packed in selected}
     seen = set()
@@ -261,10 +286,11 @@ def answer_messages(question, history, sources, practice_context=None, note_cont
 
 
 class SearchTool(Tool):
-    def __init__(self, name, retrieval, course_id, chapter_id=None):
+    def __init__(self, name, retrieval, course_id, chapter_id=None, knowledge=None):
         super().__init__(name, "查找本课程真题" if name == "find_past_questions" else "查找本课程课件、笔记、练习题和已有答案")
         self.retrieval, self.course_id, self.chapter_id = retrieval, course_id, chapter_id
         self.last_sources = []
+        self.knowledge = knowledge
 
     def get_parameters(self):
         return [ToolParameter(name="query", type="string", description="独立检索问题"),
@@ -275,10 +301,14 @@ class SearchTool(Tool):
         year = parameters.get("year") if self.name == "find_past_questions" else None
         if year is not None and (not isinstance(year, int) or not 1900 <= year <= 2100):
             raise ValueError("检索年份无效。")
-        self.last_sources = self.retrieval.search(
-            self.course_id, query, kind="exam" if self.name == "find_past_questions" else "material",
-            chapter_id=self.chapter_id, year=year,
-        )
+        if self.name == "search_materials" and self.knowledge and overview_request(query):
+            self.last_sources, _ = self.knowledge.retrieve(self.course_id, query, request=query, overview=True,
+                chapter_ids=[self.chapter_id] if self.chapter_id else [])
+        else:
+            self.last_sources = self.retrieval.search(
+                self.course_id, query, kind="exam" if self.name == "find_past_questions" else "material",
+                chapter_id=self.chapter_id, year=year, limit=8 if self.name == "search_materials" else 5,
+            )
         return json.dumps({"sources": self.last_sources}, ensure_ascii=False)
 
 
@@ -288,6 +318,24 @@ class ReviewAgentService:
         self.answer_grounding = None
 
     def chat(self, session_id: str, question: str, practice_context=None, note_context=None):
+        usage = TokenUsage()
+        reply = self._chat(session_id, question, practice_context, note_context, usage)
+        try:
+            while True:
+                # StreamingResponse may resume a sync generator in different
+                # worker contexts. Enter/reset within each next(), never across
+                # a yield, so simultaneous chats cannot mix counters.
+                with collect_usage(usage):
+                    try:
+                        part = next(reply)
+                    except StopIteration:
+                        return
+                yield part
+        finally:
+            with collect_usage(usage):
+                reply.close()
+
+    def _chat(self, session_id, question, practice_context, note_context, usage):
         try:
             if self.answer_grounding:
                 practice_context = self.answer_grounding.current_question(practice_context)
@@ -323,17 +371,17 @@ class ReviewAgentService:
                     and not re.search(r"是什么|为什么|怎么|如何|多少|哪些|能否|能不能|[？?]", question)):
                 content = "已收到你的长期学习要求。偏好会在后台整理，你可以在“记忆”中查看和修改；这段对话也会按当前要求继续。"
                 with self.services.lock, self.services.sessions() as db:
-                    result = Message(session_id=session_id, role="assistant", content=content, citations=[])
+                    result = Message(session_id=session_id, role="assistant", content=content, citations=[], token_usage=usage.snapshot())
                     db.add(result)
                     db.commit()
                     self.services.memory.wake.set()
                     yield event("delta", {"text": content})
-                    yield event("done", {"message_id": result.id, "content": content, "citations": []})
+                    yield event("done", {"message_id": result.id, "content": content, "citations": [], "token_usage": result.token_usage})
                 return
             yield event("status", {"message": "正在理解问题并选择检索工具"})
             registry = ToolRegistry()
             for name in ("search_materials", "find_past_questions"):
-                registry.register_tool(SearchTool(name, self.services.retrieval, course_id))
+                registry.register_tool(SearchTool(name, self.services.retrieval, course_id, knowledge=self.services.knowledge))
             sources, observations, used = {}, [], set()
             query = question
             calls = 0
@@ -366,7 +414,8 @@ class ReviewAgentService:
                                              for s in baseline_tool.last_sources]})
             while calls < 3:
                 plan = parse_json(self.services.llm.complete(
-                    plan_messages(question, history, observations, practice_context, note_context, memory), json_mode=True))
+                    plan_messages(question, history, observations, practice_context, note_context, memory,
+                        InputBudget(self.services.model_config.snapshot())), json_mode=True))
                 query = str(plan.get("query", query)).strip()[:1500] or question
                 requested = plan.get("tools", [])
                 if not isinstance(requested, list):
@@ -400,7 +449,8 @@ class ReviewAgentService:
                 if not executed or plan.get("done"):
                     break
             verified_sources = self.answer_grounding.sources(course_id, list(sources.values()), practice_context, question) if self.answer_grounding else list(sources.values())
-            messages, evidence, sources = answer_messages(question, history, verified_sources, practice_context, note_context, memory)
+            messages, evidence, sources = answer_messages(question, history, verified_sources, practice_context, note_context, memory,
+                InputBudget(self.services.model_config.snapshot()))
             question_sources = [s for s in evidence if s["kind"] in ("exam", "exercise")]
             has_uploaded_answer = bool(practice_context and practice_context.get("reference_answer", {}).get("origin") in ("uploaded", "embedded"))
             has_matched_answers = any(s.get("matched_answers") for s in question_sources)
@@ -440,17 +490,17 @@ class ReviewAgentService:
                 for citation in citations:
                     if self.services.retrieval.source(db, citation["chunk_id"]) is None:
                         raise ValueError("本次使用的资料已发生变化，请重新提问。")
-                result = Message(session_id=session_id, role="assistant", content=content, citations=citations)
+                result = Message(session_id=session_id, role="assistant", content=content, citations=citations, token_usage=usage.snapshot())
                 db.add(result)
                 self.services.memory.record_discussion(db, message, course_id, question, practice_context, note_context)
                 self.services.memory.mark_session(db, session_id)
                 db.commit()
                 self.services.memory.wake.set()
-                yield event("done", {"message_id": result.id, "content": content, "citations": []})
+                yield event("done", {"message_id": result.id, "content": content, "citations": [], "token_usage": result.token_usage})
         except GeneratorExit:
             # Disconnected/aborted replies are never saved as completed assistant messages.
             raise
         except Exception as exc:
             logger.exception("Chat failed for session %s", session_id)
             message = str(exc) if isinstance(exc, ValueError) else model_failure_message(exc)
-            yield event("error", {"message": message})
+            yield event("error", {"message": message, "token_usage": usage.snapshot()})

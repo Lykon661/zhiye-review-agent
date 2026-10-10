@@ -8,9 +8,10 @@ from threading import RLock
 from sqlalchemy import select
 
 from .config import ROOT, Settings
-from .models import AppMeta, Block, Chunk, Course, Document, Outline
-from .lexical import query_terms, lexical_score
+from .models import AppMeta, Block, Chunk, Course, Document, Outline, RetrievalUnit
+from .lexical import query_terms, lexical_score, normalize
 from .lexical_index import candidate_chunks
+from .knowledge_index import KnowledgeIndex
 
 logger = logging.getLogger(__name__)
 HNSW_FILES = {"header.bin", "data_level0.bin", "length.bin", "link_lists.bin"}
@@ -218,6 +219,8 @@ class RetrievalService:
         self.store_name = store_name
         self.store_dir = (settings.data_dir / store_name).resolve()
         self._open_store()
+        self.knowledge = KnowledgeIndex(self)
+        self.reranker = None
 
     def _open_store(self):
         import chromadb
@@ -238,6 +241,10 @@ class RetrievalService:
         self.collection = self.client.get_or_create_collection(
             "course_materials", metadata={"hnsw:space": "cosine", "hnsw:batch_size": 100,
                                           "hnsw:sync_threshold": 100}, embedding_function=None,
+        )
+        self.knowledge_collection = self.client.get_or_create_collection(
+            "knowledge_units_v1", metadata={"hnsw:space": "cosine", "hnsw:batch_size": 100,
+                                            "hnsw:sync_threshold": 100}, embedding_function=None,
         )
 
     def close(self):
@@ -294,14 +301,17 @@ class RetrievalService:
                         "kind": document.kind, "year": document.year or 0,
                     } for c in group],
                 )
+        self.knowledge.index_document(document, blocks)
 
     def delete_document(self, document_id: str):
         with self.lock:
             self.collection.delete(where={"document_id": document_id})
+            self.knowledge_collection.delete(where={"document_id": document_id})
 
     def delete_course(self, course_id: str):
         with self.lock:
             self.collection.delete(where={"course_id": course_id})
+            self.knowledge_collection.delete(where={"course_id": course_id})
 
     def update_chapters(self, document: Document, blocks: list[Block], chunks: list[Chunk]):
         by_id = {b.id: b for b in blocks}
@@ -315,6 +325,20 @@ class RetrievalService:
             } for c in chunks])
 
     def source(self, db, source_id: str, context: bool = False):
+        unit = db.get(RetrievalUnit, source_id)
+        if unit is not None:
+            doc = db.get(Document, unit.document_id)
+            if doc is None or doc.status != "ready":
+                return None
+            blocks = {b.id: b for b in db.scalars(select(Block).where(Block.id.in_(unit.block_ids)))}
+            if len(blocks) != len(unit.block_ids):
+                return None
+            return {"source_id": "S" + unit.id, "chunk_id": unit.id, "retrieval_unit_id": unit.id,
+                "block_id": unit.block_ids[0], "document_id": doc.id, "course_id": doc.course_id,
+                "text": unit.text, "title": unit.title, "filename": doc.filename, "kind": doc.kind,
+                "year": doc.year, "chapter_id": unit.chapter_id, "locator": source_locator(unit.locator),
+                "context": [], "source_blocks": [{"block_id": identity, "source_id": "S" + identity,
+                    "locator": source_locator(blocks[identity].locator)} for identity in unit.block_ids]}
         chunk = db.get(Chunk, source_id)
         block = db.get(Block, chunk.block_id) if chunk else db.get(Block, source_id)
         if block is None:
@@ -342,13 +366,94 @@ class RetrievalService:
                                   and (doc.kind == "exam" or b.chapter_id == block.chapter_id)]
         return source
 
+    def overview_queries(self, course_id: str, query: str, limit: int = 12):
+        """Discover child terms from this course's headings, never from a syllabus guess.
+
+        PPT body shapes often omit the algorithm name present in their title.
+        Find relevant documents first, then use their actual titles as separate
+        hybrid queries. Aliases here translate names; they do not supply facts.
+        """
+        limit = max(1, min(limit, 12))
+        with self.sessions() as db:
+            course = db.get(Course, course_id)
+            if course is None:
+                return []
+            notes = db.scalar(select(Outline.markdown).where(
+                Outline.course_id == course_id, Outline.status == "completed", Outline.version == course.version,
+            ).order_by(Outline.created_at.desc()).limit(1)) or ""
+            groups, _ = query_terms(query, notes)
+            if not groups:
+                return []
+            documents = list(db.scalars(select(Document).where(
+                Document.course_id == course_id, Document.status == "ready", Document.kind.in_(["lecture", "note"]),
+            ).order_by(Document.filename, Document.id)))
+            relevant = {doc.id for doc in documents if lexical_score(doc.filename, groups)}
+            # A topic need not appear in the filename. Look up literal matches
+            # through the same transactional keyword index as normal retrieval.
+            statement = select(Chunk.document_id, Chunk.text).join(Document, Chunk.document_id == Document.id).where(
+                Document.course_id == course_id, Document.status == "ready", Document.kind.in_(["lecture", "note"]),
+            )
+            candidates = candidate_chunks(db, groups)
+            if candidates is not None:
+                statement = statement.where(Chunk.id.in_(candidates))
+            for document_id, text in db.execute(statement):
+                if document_id not in relevant and lexical_score(text, groups):
+                    relevant.add(document_id)
+            if not relevant:
+                return []
+            blocks = db.scalars(select(Block).join(Document, Block.document_id == Document.id).where(
+                Block.document_id.in_(relevant),
+            ).order_by(Document.filename, Block.order, Block.id))
+            queries, seen = [], {normalize(query)}
+            for block in blocks:
+                title = (block.heading or block.text).strip()
+                if not title or len(title) > 100 or "\n" in title:
+                    continue
+                terms, _ = query_terms(title, notes)
+                # Translated subtopic names are reliable automatic query seeds.
+                # For other vocabulary retain actual topic-bearing headings;
+                # the planner can supply additional queries for arbitrary fields.
+                child = next((group for group in terms if group not in groups and len(group) > 1), None)
+                seed = child[0] if child else title if lexical_score(title, groups) else ""
+                if not seed or (child is None and terms == groups):
+                    continue
+                key = normalize(seed)
+                if key not in seen:
+                    queries.append(seed)
+                    seen.add(key)
+                    if len(queries) == limit:
+                        break
+            return queries
+
     def search(self, course_id: str, query: str, kind: str = "material", chapter_id: str | None = None,
-               year: int | None = None, limit: int = 5, expand: bool = True):
+               year: int | None = None, limit: int = 5, expand: bool = True, prefer_summary: bool = False,
+               rerank: bool = True, candidate_limit: int = 60):
+        if not query.strip():
+            return []
+        limit = max(1, min(limit, 20))
+        if kind == "exam":
+            return self._search_chunks(course_id, query, "exam", chapter_id, year, limit, expand)
+        with self.sessions() as db:
+            if db.get(AppMeta, "index_repair:" + course_id):
+                raise ValueError("课程索引需要重建，请点击“重新建立索引”。")
+            course = db.get(Course, course_id)
+            course_version = course.version if course else None
+        sources = self.knowledge.candidates(course_id, query, chapter_id, year, candidate_limit)
+        if kind == "material":
+            supplements = self._search_chunks(course_id, query, "supplement", chapter_id, year, 20, expand)
+            sources = sources + supplements
+        if rerank and self.reranker:
+            sources, _ = self.reranker.rank(query, sources, context={"course_id": course_id,
+                "course_version": course_version, "chapter_id": chapter_id, "year": year, "kind": kind})
+        return sources[:limit]
+
+    def _search_chunks(self, course_id, query, kind="material", chapter_id=None, year=None,
+                       limit=5, expand=True, prefer_summary=False):
         if not query.strip():
             return []
         limit = max(1, min(limit, 20))
         pool_size = max(20, limit * 4)
-        material_kinds = ["exam"] if kind == "exam" else ["lecture", "note"] if kind == "knowledge" else ["lecture", "note", "exercise", "answer"]
+        material_kinds = ["exam"] if kind == "exam" else ["exercise", "answer"] if kind == "supplement" else ["lecture", "note", "exercise", "answer"]
         with self.sessions() as db:
             if db.get(AppMeta, "index_repair:" + course_id):
                 raise ValueError("课程索引需要重建，请点击“重新建立索引”。")
@@ -366,6 +471,8 @@ class RetrievalService:
                 statement = statement.where(Block.chapter_id == chapter_id)
             if year is not None:
                 statement = statement.where(Document.year == year)
+            if db.scalar(statement.with_only_columns(Chunk.id).limit(1)) is None:
+                return []
             lexical = []
             if groups:
                 candidates = candidate_chunks(db, groups)
@@ -374,6 +481,12 @@ class RetrievalService:
                 for chunk_id, text in db.execute(statement):
                     score = lexical_score(text, groups)
                     if score:
+                        if prefer_summary and len(text) < 140 and re.search(
+                            r"分析|性质|特点|复杂度|\b(?:analysis|properties|characteristics|complexity)\b", text, re.I,
+                        ):
+                            # Summary slide titles point to the body shapes with
+                            # time/space/stability facts needed for comparisons.
+                            score += 0.2
                         lexical.append((chunk_id, score))
             lexical.sort(key=lambda item: item[1], reverse=True)
             lexical = lexical[:pool_size]

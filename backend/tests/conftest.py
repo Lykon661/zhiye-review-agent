@@ -60,13 +60,21 @@ class ControlledLLM:
         self.complete_calls.append(messages)
         if self.fail_complete:
             raise RuntimeError("Controlled LLM timeout")
+        prompt = "\n".join(str(message.get("content", "")) for message in messages)
+        payload = json.loads(messages[-1]["content"])
+        # Internal retrieval calls do not consume queued planner/generation
+        # responses. These neutral rankings do not assert retrieval quality.
+        if "[TASK:KNOWLEDGE_RERANK]" in prompt:
+            return json.dumps({"rankings": [{"id": c["id"], "score": 70,
+                "topics": payload["requested_topics"]} for c in payload["candidates"]], "coverage": []}, ensure_ascii=False)
+        if "[TASK:KNOWLEDGE_SCOPE]" in prompt:
+            return json.dumps({"topics": [{"name": payload["topic"], "queries": [payload["topic"]],
+                "unit_ids": [c["id"] for c in payload["catalog"][:1]]}], "facets": []}, ensure_ascii=False)
         if self.complete_responses:
             value = self.complete_responses.popleft()
             if isinstance(value, Exception):
                 raise value
             return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-        prompt = "\n".join(str(message.get("content", "")) for message in messages)
-        payload = json.loads(messages[-1]["content"])
         if "[TASK:PLAN]" in prompt:
             question = payload["question"]
             tool = "find_past_questions" if ("真题" in question or "past question" in question.lower()) else "search_materials"

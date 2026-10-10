@@ -73,6 +73,34 @@ class Chunk(Base):
     text: Mapped[str] = mapped_column(Text)
 
 
+class RetrievalUnit(Base):
+    """Derived page/section views; original Blocks remain the source of truth."""
+    __tablename__ = "retrieval_units"
+    __table_args__ = (UniqueConstraint("document_id", "unit_key"),)
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id", ondelete="CASCADE"), index=True)
+    document_id: Mapped[str] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
+    # Chapter IDs are derived labels, not ownership: directory edits must not
+    # be blocked by a cache foreign key.
+    chapter_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    unit_key: Mapped[str] = mapped_column(String)
+    position: Mapped[int] = mapped_column(Integer)
+    title: Mapped[str] = mapped_column(String)
+    text: Mapped[str] = mapped_column(Text)
+    index_text: Mapped[str] = mapped_column(Text)
+    block_ids: Mapped[list] = mapped_column(JSON)
+    locator: Mapped[dict] = mapped_column(JSON)
+
+
+class RetrievalPassage(Base):
+    __tablename__ = "retrieval_passages"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    unit_id: Mapped[str] = mapped_column(ForeignKey("retrieval_units.id", ondelete="CASCADE"), index=True)
+    document_id: Mapped[str] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
+    position: Mapped[int] = mapped_column(Integer)
+    text: Mapped[str] = mapped_column(Text)
+
+
 class ChatSession(Base):
     __tablename__ = "sessions"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=new_id)
@@ -88,6 +116,7 @@ class Message(Base):
     role: Mapped[str] = mapped_column(String)
     content: Mapped[str] = mapped_column(Text)
     citations: Mapped[list] = mapped_column(JSON, default=list)
+    token_usage: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[str] = mapped_column(String, default=now)
 
 
@@ -243,3 +272,18 @@ class LearningEvent(Base):
     topic_pending: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     forgotten: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[str] = mapped_column(String, default=now)
+
+
+class ReviewSpace(Base):
+    __tablename__ = "review_spaces"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=new_id)
+    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id", ondelete="CASCADE"), index=True)
+    goal: Mapped[str] = mapped_column(String)
+    # Legacy storage columns keep existing SQLite records readable; unused by chat.
+    minutes: Mapped[int] = mapped_column(Integer, default=0)
+    question_count: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String, default="processing", index=True)
+    state: Mapped[dict] = mapped_column(JSON, default=dict)
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[str] = mapped_column(String, default=now)
+    updated_at: Mapped[str] = mapped_column(String, default=now)

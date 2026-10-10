@@ -1,9 +1,10 @@
 <script setup lang="ts">
-type IconName = 'library' | 'outline' | 'practice' | 'wrong' | 'settings' | 'upload' | 'chat'
+type IconName = 'library' | 'outline' | 'space' | 'practice' | 'wrong' | 'settings' | 'upload' | 'chat'
 defineProps<{ name: IconName }>()
 const paths: Record<IconName, string> = {
   library: 'M4 4h5v16H4z M9 7h5v13H9z M17 4l4 15-4 1-4-15z',
   outline: 'M7 3h10a2 2 0 0 1 2 2v16l-7-4-7 4V5a2 2 0 0 1 2-2z M9 8h6 M9 12h4',
+  space: 'M12 3a9 9 0 1 0 9 9 M12 7a5 5 0 1 0 5 5 M12 11a1 1 0 1 0 1 1 M15 3v6h6 M15 9l6-6',
   practice: 'M9 4H5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h13a2 2 0 0 0 2-2v-4 M9 15l3-1 9-9-2-2-9 9-1 3z M17 5l2 2',
   wrong: 'M12 3l2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-3-5.6 3 1.1-6.2L3 9.6l6.2-.9L12 3z',
   settings: 'M9 3h6l1 3 3 1 2 5-2 5-3 1-1 3H9l-1-3-3-1-2-5 2-5 3-1 1-3z M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0z',

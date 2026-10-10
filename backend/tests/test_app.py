@@ -10,6 +10,7 @@ import sqlite3
 
 from fastapi.testclient import TestClient
 import pytest
+from app.models import Message
 
 from conftest import make_docx, make_pdf, make_pptx
 
@@ -93,6 +94,11 @@ def chat(client, session_id, question):
 
 def event_payload(events, name):
     return next(value for event, value in events if event == name)
+
+
+def stored_evidence(app, message_id):
+    with app.state.services.sessions() as db:
+        return db.get(Message, message_id).citations
 
 
 @pytest.mark.parametrize("filename,content,location_key", [
@@ -179,18 +185,19 @@ def test_new_upload_invalidates_outline_and_confirmation(client, course):
     assert client.post(f"/courses/{course['id']}/outlines").status_code == 409
 
 
-def test_chat_stream_citations_and_persistent_history(client, course, llm):
+def test_chat_hides_public_citations_but_preserves_internal_evidence(client, course, llm, app):
     document = upload(client, course["id"])
     session_id = session(client, course["id"])
     events = chat(client, session_id, "RAG")
     names = [event for event, _ in events]
-    assert {"status", "sources", "delta", "done"}.issubset(names)
+    assert {"status", "delta", "done"}.issubset(names)
+    assert "sources" not in names
     assert "error" not in names
-    returned = items(event_payload(events, "sources"), "sources")
-    assert returned and all(row["document_id"] == document["id"] for row in returned)
     final = event_payload(events, "done")
-    assert final["citations"]
-    for citation in final["citations"]:
+    returned = stored_evidence(app, final["message_id"])
+    assert returned and all(row["document_id"] == document["id"] for row in returned)
+    assert final["citations"] == []
+    for citation in returned:
         source = client.get(f"/sources/{citation['source_id']}")
         assert source.status_code == 200, source.text
         assert source.json()["document_id"] == document["id"]
@@ -201,37 +208,44 @@ def test_chat_stream_citations_and_persistent_history(client, course, llm):
     assert any("RAG" in message["content"] for message in payload["history"])
     saved = items(client.get(f"/sessions/{session_id}/messages").json(), "messages")
     assert [message["role"] for message in saved] == ["user", "assistant", "user", "assistant"]
-    assert saved[1]["citations"]
+    assert all(message["citations"] == [] for message in saved)
+    assert stored_evidence(app, saved[1]["id"]) == returned
 
 
 def test_answer_without_evidence_reports_insufficiency(client, course, llm):
     session_id = session(client, course["id"])
     events = chat(client, session_id, "Unrelated alien spacecraft details")
-    assert not items(event_payload(events, "sources"), "sources")
+    assert "sources" not in [name for name, _ in events]
     done = event_payload(events, "done")
     answer = done.get("answer", done.get("content", ""))
     assert "不足" in answer or "没有" in answer or "未找到" in answer
     assert not done["citations"]
 
 
-def test_invalid_citation_is_rejected_before_saving_answer(client, course, llm):
+def test_generated_reference_markers_cannot_become_internal_evidence(client, course, llm, app):
     upload(client, course["id"])
     session_id = session(client, course["id"])
     fabricated = "S" + "0" * 32
     llm.stream_responses.append(f"编造引用 [{fabricated}]")
     events = chat(client, session_id, "RAG")
-    assert "error" in [name for name, _ in events]
+    assert "error" not in [name for name, _ in events]
+    done = event_payload(events, "done")
+    assert fabricated not in done["content"]
+    evidence = stored_evidence(app, done["message_id"])
+    assert evidence
+    assert all(item["source_id"] != fabricated for item in evidence)
+    assert all(item["course_id"] == course["id"] for item in evidence)
     saved = items(client.get(f"/sessions/{session_id}/messages").json(), "messages")
     assert all(fabricated not in message["content"] for message in saved if message["role"] == "assistant")
 
 
-def test_cross_course_filter_and_document_delete(client, course, llm):
+def test_cross_course_filter_and_document_delete(client, course, llm, app):
     own = upload(client, course["id"])
     other = client.post("/courses", json={"name": "另一门课程"}).json()
     alien = upload(client, other["id"], "alien.docx", make_docx(["RAG OTHER_COURSE_SECRET"], include_table=False))
     llm.complete_responses.append({"query": "RAG", "tools": [{"name": "search_materials", "query": "RAG", "course_id": other["id"]}]})
     events = chat(client, session(client, course["id"]), "RAG")
-    sources = items(event_payload(events, "sources"), "sources")
+    sources = stored_evidence(app, event_payload(events, "done")["message_id"])
     assert sources
     assert all(source["document_id"] != alien["id"] for source in sources)
     source_id = sources[0]["source_id"]
@@ -243,17 +257,17 @@ def test_cross_course_filter_and_document_delete(client, course, llm):
     assert client.get(f"/sources/{source_id}").status_code == 404
 
 
-def test_past_question_preserves_neighboring_page_and_missing_answer(client, course, llm):
+def test_past_question_preserves_neighboring_page_and_missing_answer(client, course, llm, app):
     exam = upload(client, course["id"], "past2024.pdf", make_pdf(["RAG question: explain retrieval", "CONTINUED_QUESTION_CONTEXT: and how generation uses evidence"]), kind="exam", year=2024)
     session_id = session(client, course["id"])
     events = chat(client, session_id, "RAG 真题")
-    sources = items(event_payload(events, "sources"), "sources")
+    sources = stored_evidence(app, event_payload(events, "done")["message_id"])
     assert any(source["document_id"] == exam["id"] and source.get("year") == 2024 for source in sources)
     answer_prompt = "\n".join(message["content"] for message in llm.stream_calls[-1])
     assert "CONTINUED_QUESTION_CONTEXT" in answer_prompt
     done = event_payload(events, "done")
     answer = done.get("answer", done.get("content", ""))
-    assert "未提供答案" in answer or "没有答案" in answer or "未提供标准答案" in answer
+    assert "尚未核验到对应的原文答案" in answer
 
 
 def test_model_failure_ends_stream_and_task_can_retry(client, course, llm):

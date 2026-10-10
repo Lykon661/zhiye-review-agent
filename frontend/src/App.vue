@@ -1,7 +1,10 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { api, chatStream, downloadOutline } from './api'
-import type { Block, Chapter, ChapterDraft, Course, Document, DocumentKind, Health, Job, Message, NoteChatContext, Outline, PracticeChatContext, Session, Source } from './types'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { api } from './api'
+import { useReviewChat } from './useReviewChat'
+import { useOutlineTasks } from './useOutlineTasks'
+import { useCourseMaterials } from './useCourseMaterials'
+import type { Chapter, ChapterDraft, Course, Document, Health, NoteChatContext, Outline, PracticeChatContext, Session } from './types'
 import { kindLabels, uploadKindLabels } from './types'
 import ChapterEditor from './components/ChapterEditor.vue'
 import MarkdownContent from './components/MarkdownContent.vue'
@@ -10,13 +13,14 @@ import ManagementDialog from './components/ManagementDialog.vue'
 import ModelSettings from './components/ModelSettings.vue'
 import MemorySettings from './components/MemorySettings.vue'
 import PracticePanel from './components/PracticePanel.vue'
+import ReviewSpacePanel from './components/ReviewSpacePanel.vue'
 import WrongQuestionsPanel from './components/WrongQuestionsPanel.vue'
 import NotesReader from './components/NotesReader.vue'
 import UiIcon from './components/UiIcon.vue'
-import { supportsUpload, uploadAccept, uploadFormatsLabel } from './uploadFormats'
+import TokenUsage from './components/TokenUsage.vue'
+import { uploadAccept, uploadFormatsLabel } from './uploadFormats'
 
-type Section = 'library' | 'outline' | 'practice' | 'wrong'
-interface VisibleMessage extends Message { pending?: boolean; incomplete?: boolean }
+type Section = 'library' | 'outline' | 'space' | 'practice' | 'wrong'
 const section = ref<Section>('library')
 const courses = ref<Course[]>([])
 const courseId = ref('')
@@ -35,6 +39,7 @@ const memoryOpen = ref(false)
 const memoryBusy = ref(false)
 const practiceBusy = ref(false)
 const practiceModelBusy = ref(false)
+const spaceBusy = ref(false)
 const wrongBusy = ref(false)
 const wrongRevision = ref(0)
 const practiceContext = ref<PracticeChatContext | null>(null)
@@ -42,6 +47,13 @@ const wrongContext = ref<PracticeChatContext | null>(null)
 const noteContext = ref<NoteChatContext | null>(null)
 const currentChatContext = computed(() => section.value === 'practice' ? practiceContext.value : section.value === 'wrong' ? wrongContext.value : null)
 const currentNoteContext = computed(() => section.value === 'outline' ? noteContext.value : null)
+const chat = useReviewChat({
+  courseId, canChat: () => canChat.value, practiceContext: () => currentChatContext.value,
+  noteContext: () => currentNoteContext.value, namingNewSession: () => management.value?.action === 'new-session',
+  clearFeedback, error: setError, refreshHealth,
+})
+const { sessions, sessionId, messages, messagesLoading, question, chatting, newSessionBusy, chatStatus, chatBox,
+  selectSession, newSession, scrollChat, sendQuestion, keyboard, stopChat } = chat
 const currentSession = computed(() => sessions.value.find(item => item.id === sessionId.value))
 watch(section, () => { void scrollChat() })
 type ManagementAction = 'rename-course' | 'delete-course' | 'new-session' | 'rename-session' | 'delete-session' | 'delete-outline'
@@ -50,63 +62,44 @@ const management = ref<Management | null>(null)
 const managementBusy = ref(false)
 const managementError = ref('')
 let managementGeneration = 0
-const documents = ref<Document[]>([])
 const chapters = ref<Chapter[]>([])
 const knowledgeChapters = computed(() => chapters.value.filter(chapter => (chapter.kind || 'knowledge') === 'knowledge'))
-const groups = ref<{ document: Document; blocks: Block[] }[]>([])
 const chapterBusy = ref(false)
 const indexRepairBusy = ref(false)
-const uploadKind = ref<DocumentKind>('lecture')
-const uploadYear = ref('')
-const fileInput = ref<HTMLInputElement | null>(null)
-const uploadBusy = ref(false)
-const uploadLabel = ref('')
-const documentBusy = ref<string | null>(null)
-const dragOver = ref(false)
-const sessions = ref<Session[]>([])
-const sessionId = ref('')
-const messages = ref<VisibleMessage[]>([])
-const messagesLoading = ref(false)
-const question = ref('')
-const chatting = ref(false)
-const newSessionBusy = ref(false)
-const chatStatus = ref('')
-const chatBox = ref<HTMLElement | null>(null)
-const outlines = ref<Outline[]>([])
-const outline = ref<Outline | null>(null)
-const selectedOutlineId = ref('')
-const outlineLoading = ref(false)
-const outlineBusy = ref(false)
-const job = ref<Job | null>(null)
-// Track the course's running task independently of the selected history entry.
-const runningJob = ref<Job | null>(null)
-const showDrawer = ref(false)
-const source = ref<Source | null>(null)
-const sourceLoading = ref(false)
-const sourceError = ref('')
-let activeController: AbortController | null = null
+const outlineTasks = useOutlineTasks({
+  courseId, managementRevision: () => managementGeneration, blocked: () => chapterBusy.value,
+  beforeSelect: () => { noteContext.value = null }, clearFeedback, error: setError,
+})
+const { outlines, outline, selectedOutlineId, outlineLoading, outlineBusy, activeJob, displayedJob,
+  selectOutline, createOutline, retryOutline, exportOutline } = outlineTasks
+const materials = useCourseMaterials({
+  courseId, courses, chapters, outlines, outline, actionError, success,
+  managementRevision: () => managementGeneration, chapterBusy: () => chapterBusy.value,
+  indexRepairRequired: () => indexRepairRequired.value, indexRepairBusy: () => indexRepairBusy.value,
+  deletionBlocked: () => practiceBusy.value || indexRepairBusy.value || managementBusy.value || chapterBusy.value || chatting.value,
+  clearFeedback, error: setError, refreshHealth,
+})
+const { documents, groups, uploadKind, uploadYear, fileInput, uploadBusy, uploadLabel, documentBusy, dragOver,
+  showDrawer, source, sourceLoading, sourceError, loadGroups, refreshDocuments, upload, drop,
+  practiceDocumentRenamed, deleteDocument, retryDocument, reparseDocument, preview } = materials
 let pollTimer: ReturnType<typeof setInterval> | undefined
 let pollInFlight = false
 let pollCount = 0
 let courseGeneration = 0
-let sourceGeneration = 0
-let sessionGeneration = 0
-let outlineGeneration = 0
 const readyCount = computed(() => documents.value.filter(document => document.status === 'ready').length)
+const spaceMaterialsReady = computed(() => documents.value.some(document => document.status === 'ready' && ['lecture', 'note'].includes(document.kind)))
 const unitCount = computed(() => documents.value.reduce((sum, document) => sum + (document.units_with_text || 0), 0))
 const confirmed = computed(() => knowledgeChapters.value.length > 0 && chapters.value.every(chapter => chapter.confirmed))
 const processingCount = computed(() => documents.value.filter(document => ['queued', 'processing'].includes(document.status)).length)
-const activeJob = computed(() => !!(runningJob.value && ['queued', 'running'].includes(runningJob.value.status))
-  || outlines.value.some(item => ['queued', 'running'].includes(item.status)))
-const displayedJob = computed(() => activeJob.value ? runningJob.value : job.value)
 const modelConfigured = computed(() => health.value?.llm_configured === true)
 const indexRepairRequired = computed(() => !!courseId.value && (health.value?.index_repair_courses || []).includes(courseId.value))
-const courseSwitchBusy = computed(() => memoryBusy.value || initialLoading.value || courseLoading.value || chatting.value || uploadBusy.value || chapterBusy.value || outlineBusy.value || indexRepairBusy.value || !!documentBusy.value || newSessionBusy.value || creatingCourse.value || managementBusy.value || practiceBusy.value || wrongBusy.value)
+const courseSwitchBusy = computed(() => spaceBusy.value || memoryBusy.value || initialLoading.value || courseLoading.value || chatting.value || uploadBusy.value || chapterBusy.value || outlineBusy.value || indexRepairBusy.value || !!documentBusy.value || newSessionBusy.value || creatingCourse.value || managementBusy.value || practiceBusy.value || wrongBusy.value)
 const chapterControlsBusy = computed(() => chapterBusy.value || courseLoading.value || indexRepairBusy.value || uploadBusy.value || processingCount.value > 0 || !!documentBusy.value || outlineBusy.value || !!activeJob.value || chatting.value || managementBusy.value)
 const canChat = computed(() => !memoryBusy.value && modelConfigured.value && (readyCount.value > 0 || !!currentChatContext.value || !!currentNoteContext.value) && !indexRepairRequired.value && !indexRepairBusy.value && !courseLoading.value && !messagesLoading.value && !managementBusy.value && !chapterBusy.value && !newSessionBusy.value)
 const sectionMeta: Record<Section, { title: string; intro: string; label: string }> = {
   library: { title: '课程资料', intro: '上传课件、笔记和真题，确认章节后开始复习。', label: '资料库' },
   outline: { title: '复习笔记', intro: '按章节阅读知识重点，选中不理解的段落即可提问。', label: '复习笔记' },
+  space: { title: '复习空间', intro: '写下目标，根据每次作答调整讲解和练习，按自己的节奏继续。', label: '复习空间' },
   practice: { title: '在线练习', intro: '作答与进度自动保存。按原文或模型参考答案判题，答错自动收录。', label: '在线练习' },
   wrong: { title: '错题本', intro: '回顾需要巩固的题目，重新作答，或与右侧助手讨论。', label: '错题本' },
 }
@@ -186,36 +179,23 @@ async function submitManagement(name: string) {
       if (courseId.value === target.courseId) {
         sessions.value = sessions.value.filter(item => item.id !== target.id)
         if (sessionId.value === target.id) {
-          ++sessionGeneration; messages.value = []; messagesLoading.value = false; sessionId.value = ''; question.value = ''
+          chat.clearSession()
           if (sessions.value[0]) await selectSession(sessions.value[0].id)
         }
       }
     } else if (target.action === 'delete-outline') {
-      await api<void>(`/outlines/${target.id}`, { method: 'DELETE' })
-      if (courseId.value === target.courseId) {
-        outlines.value = outlines.value.filter(item => item.id !== target.id)
-        if (selectedOutlineId.value === target.id) {
-          ++outlineGeneration; selectedOutlineId.value = ''; outline.value = null; job.value = null; outlineLoading.value = false
-          if (outlines.value[0]) await selectOutline(outlines.value[0].id)
-        }
-      }
+      await outlineTasks.removeOutline(target.id)
     }
     management.value = null
     success.value = target.action.startsWith('delete') ? '已删除。' : target.action === 'new-session' ? '复习会话已创建。' : '名称已保存。'
-  } catch (error) { managementError.value = errorText(error) }
+  } catch (error) { managementError.value = errorText(error); if (target.action === 'delete-course') await refreshHealth() }
   finally { managementBusy.value = false; ++managementGeneration }
-}
-async function loadGroups(id = courseId.value) {
-  const candidates = documents.value.filter(document => document.status === 'ready')
-  const result = await Promise.all(candidates.map(async document => ({ document, blocks: await api<Block[]>(`/documents/${document.id}/blocks`) })))
-  if (courseId.value === id) groups.value = result
 }
 async function loadCourse(id: string) {
   practiceContext.value = null; wrongContext.value = null; noteContext.value = null
   const generation = ++courseGeneration
-  ++sessionGeneration; ++outlineGeneration
-  ++sourceGeneration; showDrawer.value = false; question.value = ''; messagesLoading.value = false; outlineLoading.value = false
-  clearFeedback(); documents.value = []; chapters.value = []; groups.value = []; sessions.value = []; messages.value = []; sessionId.value = ''; outlines.value = []; outline.value = null; selectedOutlineId.value = ''; job.value = null; runningJob.value = null
+  chat.reset(); outlineTasks.reset(); materials.reset()
+  clearFeedback(); chapters.value = []
   if (!id) { courseLoading.value = false; return }
   courseLoading.value = true
   try {
@@ -225,12 +205,8 @@ async function loadCourse(id: string) {
     ])
     if (generation !== courseGeneration) return
     ;[documents.value, chapters.value, sessions.value, outlines.value] = result
-    const runningOutline = outlines.value.find(item => ['queued', 'running'].includes(item.status))
-    if (runningOutline?.job_id) {
-      const resultJob = await api<Job>(`/jobs/${runningOutline.job_id}`)
-      if (generation !== courseGeneration) return
-      runningJob.value = resultJob
-    }
+    await outlineTasks.loadLatestJob()
+    if (generation !== courseGeneration) return
     await loadGroups(id)
     if (generation !== courseGeneration) return
     sessionId.value = sessions.value[0]?.id || ''
@@ -243,92 +219,6 @@ async function loadCourse(id: string) {
   finally { if (generation === courseGeneration) courseLoading.value = false }
 }
 watch(courseId, id => { if (id) localStorage.setItem('review-course-id', id); else localStorage.removeItem('review-course-id'); void loadCourse(id) })
-async function refreshDocuments() {
-  const id = courseId.value
-  const generation = managementGeneration
-  if (!id) return
-  const next = await api<Document[]>(`/courses/${id}/documents`)
-  if (id !== courseId.value || generation !== managementGeneration) return
-  const signature = (items: Document[]) => items.map(item => `${item.id}:${item.status}:${!!item.chapter_excluded}`).join('|')
-  const changed = signature(documents.value) !== signature(next)
-  documents.value = next
-  if (changed) {
-    const [updatedChapters, updatedCourses, updatedOutlines] = await Promise.all([api<Chapter[]>(`/courses/${id}/chapters`), api<Course[]>('/courses'), api<Outline[]>(`/courses/${id}/outlines`)])
-    if (id !== courseId.value || generation !== managementGeneration) return
-    chapters.value = updatedChapters; courses.value = updatedCourses; outlines.value = updatedOutlines
-    if (outline.value) outline.value.stale = updatedOutlines.find(value => value.id === outline.value?.id)?.stale ?? outline.value.stale
-    await loadGroups(id)
-  }
-}
-async function upload(files: FileList | File[]) {
-  if (!courseId.value || uploadBusy.value || chapterBusy.value || !files.length) return
-  if (indexRepairRequired.value || indexRepairBusy.value) { actionError.value = '请先重新建立索引，再上传新资料。'; return }
-  const id = courseId.value
-  if (uploadYear.value && (!/^\d{4}$/.test(uploadYear.value) || Number(uploadYear.value) < 1900 || Number(uploadYear.value) > 2100)) { actionError.value = '年份请填写 1900–2100 范围内的四位数字，未知可以留空。'; return }
-  clearFeedback(); uploadBusy.value = true
-  const failed: string[] = []; let accepted = 0; let updated = 0
-  for (const [index, file] of Array.from(files).entries()) {
-    uploadLabel.value = `正在上传 ${index + 1}/${files.length}：${file.name}`
-    if (!supportsUpload(file.name)) { failed.push(`${file.name}：${uploadFormatsLabel}`); continue }
-    const body = new FormData(); body.append('file', file); body.append('kind', uploadKind.value)
-    if (uploadYear.value) body.append('year', uploadYear.value)
-    try {
-      const result = await api<Document & { metadata_updated?: boolean }>(`/courses/${id}/documents`, { method: 'POST', body })
-      accepted += 1
-      if (result.metadata_updated) updated += 1
-    }
-    catch (error) { failed.push(`${file.name}：${errorText(error)}`) }
-  }
-  uploadBusy.value = false; uploadLabel.value = ''
-  if (fileInput.value) fileInput.value.value = ''
-  if (id !== courseId.value) return
-  if (accepted) success.value = `已接收 ${accepted} 份资料，解析和索引进度会显示在列表中。${updated ? `其中 ${updated} 份已有资料已更新类型或年份，并重新解析。` : ''}`
-  if (failed.length) actionError.value = failed.join('\n')
-  try { await refreshDocuments() } catch (error) { setError(error) }
-}
-function drop(event: DragEvent) { dragOver.value = false; if (event.dataTransfer?.files) void upload(event.dataTransfer.files) }
-function practiceDocumentRenamed(document: Document) {
-  documents.value = documents.value.map(item => item.id === document.id ? { ...item, practice_title: document.practice_title } : item)
-}
-async function deleteDocument(document: Document) {
-  if (documentBusy.value || uploadBusy.value || practiceBusy.value || indexRepairBusy.value || managementBusy.value || chapterBusy.value || ['queued', 'processing'].includes(document.status)) return
-  const isGenerated = document.kind === 'generated'
-  const isPaper = document.kind === 'exam' || document.kind === 'exercise'
-  const description = isGenerated ? '会删除这组 AI 题目及作答进度，无法恢复。已收录的错题会保留。' : isPaper
-    ? '会删除这份试卷文件、练习题目和检索内容，无法恢复。已收录的错题会保留，旧笔记将标记为过期。'
-    : '对应的检索内容也会删除，旧笔记将标记为过期。'
-  if (!window.confirm(`删除“${document.practice_title || document.filename}”？${description}`)) return
-  clearFeedback(); documentBusy.value = document.id
-  try { await api(`/documents/${document.id}`, { method: 'DELETE' }); await refreshDocuments(); success.value = isGenerated ? 'AI 练习已删除。' : isPaper ? '试卷已删除。' : '资料已删除。' }
-  catch (error) { setError(error) }
-  finally { documentBusy.value = null }
-}
-async function retryDocument(id: string) {
-  if (chapterBusy.value) return
-  clearFeedback(); documentBusy.value = id
-  try { await api(`/documents/${id}/retry`, { method: 'POST' }); await refreshDocuments() }
-  catch (error) { setError(error) }
-  finally { documentBusy.value = null }
-}
-async function reparseDocument(id: string) {
-  if (chapterBusy.value) return
-  clearFeedback(); documentBusy.value = id
-  try {
-    await api(`/documents/${id}/reparse`, { method: 'POST' })
-    await refreshDocuments()
-    success.value = '已开始重新解析资料，无法识别的内容会自动跳过。'
-  } catch (error) { setError(error) }
-  finally { documentBusy.value = null }
-}
-async function preview(document: Document) {
-  showDrawer.value = true; sourceLoading.value = true; source.value = null; sourceError.value = ''; const generation = ++sourceGeneration
-  try {
-    const blocks = await api<Block[]>(`/documents/${document.id}/blocks`)
-    if (generation !== sourceGeneration) return
-    source.value = { chunk_id: document.id, source_id: '原文提取预览', filename: document.filename, kind: document.kind, year: document.year, chapter_id: null, locator: { label: `${blocks.length} 个内容块 · 图片 OCR 与公式识别结果均标注在正文中` }, text: blocks.map(block => `${block.locator.label}${block.heading ? ` · ${block.heading}` : ''}\n${block.text || '（此位置未提取到文字）'}`).join('\n\n──────────\n\n') || '未提取到可预览的原文。' }
-  } catch (error) { if (generation === sourceGeneration) sourceError.value = errorText(error) }
-  finally { if (generation === sourceGeneration) sourceLoading.value = false }
-}
 async function draftChapters() {
   if (!courseId.value || chapterControlsBusy.value) return
   const id = courseId.value
@@ -414,121 +304,12 @@ async function repairIndex() {
   } catch (error) { setError(error); await refreshCourseDetails() }
   finally { indexRepairBusy.value = false }
 }
-async function selectSession(id: string) {
-  if (chatting.value) return
-  sessionId.value = id; const generation = ++sessionGeneration; messagesLoading.value = true; messages.value = []
-  try { const result = await api<Message[]>(`/sessions/${id}/messages`); if (generation === sessionGeneration) messages.value = result }
-  catch (error) { if (generation === sessionGeneration) setError(error) }
-  finally { if (generation === sessionGeneration) { messagesLoading.value = false; await scrollChat() } }
-}
-async function newSession(title = '新复习对话', id = courseId.value) {
-  if (newSessionBusy.value) return
-  clearFeedback()
-  newSessionBusy.value = true
-  try {
-    const result = await api<Session>(`/courses/${id}/sessions`, { method: 'POST', body: JSON.stringify({ title }) })
-    if (id === courseId.value) { ++sessionGeneration; sessions.value.unshift(result); sessionId.value = result.id; messages.value = []; messagesLoading.value = false }
-  } catch (error) { if (management.value?.action === 'new-session') throw error; setError(error) }
-  finally { newSessionBusy.value = false }
-}
-async function scrollChat() { await nextTick(); if (chatBox.value) chatBox.value.scrollTop = chatBox.value.scrollHeight }
 function explainNote(context: NoteChatContext) {
   if (chatting.value) return
   noteContext.value = { ...context }
   question.value = '请解释选中的这段笔记，结合课程资料讲清概念、适用条件和推导过程。'
   void sendQuestion()
 }
-async function sendQuestion() {
-  const text = question.value.trim()
-  if (!text || chatting.value || !canChat.value) return
-  const context = currentChatContext.value ? JSON.parse(JSON.stringify(currentChatContext.value)) as PracticeChatContext : null
-  const note = currentNoteContext.value ? { ...currentNoteContext.value } : null
-  clearFeedback()
-  chatting.value = true
-  if (!sessionId.value) { await newSession(); if (!sessionId.value) { chatting.value = false; return } }
-  const currentSession = sessionId.value
-  question.value = ''; chatting.value = true; chatStatus.value = '正在准备检索…'
-  const controller = new AbortController(); activeController = controller
-  const user: VisibleMessage = { id: `local-user-${Date.now()}`, role: 'user', content: text, citations: [], created_at: new Date().toISOString(), practice_context: context, note_context: note }
-  const answer = ref<VisibleMessage>({ id: `local-assistant-${Date.now()}`, role: 'assistant', content: '', citations: [], created_at: new Date().toISOString(), pending: true })
-  messages.value.push(user, answer.value)
-  // Use the reactive array member so streaming updates render immediately.
-  const visibleAnswer = messages.value[messages.value.length - 1]
-  let completed = false
-  let streamedContent = ''
-  let streamTimer: ReturnType<typeof setTimeout> | undefined
-  function publishStream() {
-    if (streamTimer !== undefined) clearTimeout(streamTimer)
-    streamTimer = undefined
-    visibleAnswer.content = streamedContent
-  }
-  try {
-    await chatStream(currentSession, text, controller.signal, event => {
-      let data: Record<string, unknown>
-      try { data = JSON.parse(event.data) } catch { throw new Error('回答流包含无法解析的数据。请重试。') }
-      if (event.event === 'status') chatStatus.value = String(data.message || '正在整理答案…')
-      if (event.event === 'delta') {
-        streamedContent += String(data.text || '')
-        if (streamTimer === undefined) streamTimer = setTimeout(() => { publishStream(); void scrollChat() }, 80)
-      }
-      if (event.event === 'error') throw new Error(String(data.message || '回答生成失败。'))
-      if (event.event === 'done') {
-        completed = true; visibleAnswer.id = String(data.message_id || visibleAnswer.id)
-        streamedContent = typeof data.content === 'string' ? data.content : streamedContent
-        publishStream()
-        visibleAnswer.citations = []
-      }
-    }, context, note)
-    if (!completed) throw new Error('回答流意外结束，未收到完成确认。')
-    sessions.value = await api<Session[]>(`/courses/${courseId.value}/sessions`)
-  } catch (error) {
-    visibleAnswer.incomplete = !completed
-    if ((error as Error).name === 'AbortError') chatStatus.value = '已停止生成'
-    else { setError(error); chatStatus.value = '生成失败'; await refreshHealth() }
-  } finally {
-    publishStream()
-    visibleAnswer.pending = false; chatting.value = false; activeController = null
-    if (completed) chatStatus.value = ''
-    await scrollChat()
-  }
-}
-function keyboard(event: KeyboardEvent) { if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); void sendQuestion() } }
-async function selectOutline(id: string) {
-  noteContext.value = null
-  const generation = ++outlineGeneration; selectedOutlineId.value = id; outlineLoading.value = true
-  try {
-    const result = await api<Outline>(`/outlines/${id}`)
-    if (generation !== outlineGeneration) return
-    const resultJob = await api<Job>(`/jobs/${result.job_id}`)
-    if (generation !== outlineGeneration) return
-    outline.value = result; job.value = resultJob
-    try { localStorage.setItem(`review-note-outline:${courseId.value}`, id) } catch { /* Optional reading history. */ }
-  } catch (error) { if (generation === outlineGeneration) setError(error) }
-  finally { if (generation === outlineGeneration) outlineLoading.value = false }
-}
-async function createOutline() {
-  if (outlineBusy.value || activeJob.value || chapterBusy.value) return
-  clearFeedback(); outlineBusy.value = true
-  try {
-    const result = await api<{ job_id: string; outline_id: string }>(`/courses/${courseId.value}/outlines`, { method: 'POST' })
-    runningJob.value = { id: result.job_id, outline_id: result.outline_id, status: 'queued', progress: 0, stage: '等待生成' }
-    outlines.value = await api<Outline[]>(`/courses/${courseId.value}/outlines`)
-    await selectOutline(result.outline_id)
-  } catch (error) { setError(error) }
-  finally { outlineBusy.value = false }
-}
-async function retryOutline() {
-  if (!job.value || outlineBusy.value || activeJob.value || chapterBusy.value) return
-  clearFeedback(); outlineBusy.value = true
-  try {
-    const result = await api<{ job_id: string; outline_id: string }>(`/jobs/${job.value.id}/retry`, { method: 'POST' })
-    runningJob.value = { id: result.job_id, outline_id: result.outline_id, status: 'queued', progress: 0, stage: '等待生成' }
-    outlines.value = await api<Outline[]>(`/courses/${courseId.value}/outlines`)
-    await selectOutline(result.outline_id)
-  } catch (error) { setError(error) }
-  finally { outlineBusy.value = false }
-}
-async function exportOutline() { if (outline.value) { try { await downloadOutline(outline.value.id) } catch (error) { setError(error) } } }
 async function poll() {
   if (pollInFlight || initialLoading.value || courseLoading.value || managementBusy.value || chapterBusy.value) return
   const generation = managementGeneration
@@ -540,26 +321,12 @@ async function poll() {
     if (pollCount % 4 === 0 || connectionError.value) await refreshHealth()
     if (courseId.value) await refreshDocuments()
     if (id !== courseId.value || currentCourseGeneration !== courseGeneration || generation !== managementGeneration) return
-    const runningOutline = outlines.value.find(item => ['queued', 'running'].includes(item.status))
-    const currentId = runningJob.value && ['queued', 'running'].includes(runningJob.value.status)
-      ? runningJob.value.id : runningOutline?.job_id
-    if (currentId) {
-      const result = await api<Job>(`/jobs/${currentId}`)
-      if (id !== courseId.value || currentCourseGeneration !== courseGeneration || generation !== managementGeneration) return
-      runningJob.value = result
-      if (outline.value?.id === result.outline_id) job.value = result
-      if (!['queued', 'running'].includes(result.status)) {
-        const resultOutlines = await api<Outline[]>(`/courses/${id}/outlines`)
-        if (id !== courseId.value || currentCourseGeneration !== courseGeneration || generation !== managementGeneration) return
-        outlines.value = resultOutlines
-        if (selectedOutlineId.value) await selectOutline(selectedOutlineId.value)
-      }
-    }
+    await outlineTasks.pollTasks()
   } catch (error) { if (id === courseId.value && currentCourseGeneration === courseGeneration && generation === managementGeneration) connectionError.value = errorText(error) }
   finally { pollInFlight = false }
 }
 onMounted(async () => { await initialise(); pollTimer = setInterval(() => void poll(), 2500) })
-onUnmounted(() => { if (pollTimer) clearInterval(pollTimer); activeController?.abort() })
+onUnmounted(() => { if (pollTimer) clearInterval(pollTimer); stopChat() })
 </script>
 
 <template>
@@ -579,10 +346,10 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer); activeController?.a
     </aside>
     <div class="workspace managed-workspace">
       <header class="topbar"><div class="breadcrumb"><span class="breadcrumb-course">{{ course?.name || '复习空间' }}</span><span class="breadcrumb-divider">/</span><span>{{ sectionMeta[section].label }}</span></div><div class="topbar-actions"><button v-if="courseId" class="button subtle small" @click="memoryOpen = true">记忆</button><button class="button subtle small" @click="modelSettingsOpen = true"><UiIcon name="settings" />模型配置</button><div :class="['health-pill', { offline: !!connectionError }]" :title="connectionError || '后端服务已连接'"><span></span>{{ initialLoading ? '连接中' : connectionError ? '服务未连接' : '服务已连接' }}</div></div></header>
-      <main id="main-content" tabindex="-1" class="main-content" :class="{ 'with-review-chat': courseId && section !== 'library' }">
-        <div class="page-heading"><div><p class="course-caption">{{ course?.name || '从一门课程开始' }}</p><h1>{{ sectionMeta[section].title }}</h1><p>{{ sectionMeta[section].intro }}</p></div><div v-if="course" class="heading-note"><span>当前课程</span><strong>{{ readyCount }} 份资料可用于复习</strong></div></div>
+      <main id="main-content" tabindex="-1" class="main-content" :class="{ 'with-review-chat': courseId && section !== 'library' && section !== 'space', 'review-space-content': courseId && section === 'space' }">
+        <div v-if="section !== 'space' || !courseId" class="page-heading"><div><p class="course-caption">{{ course?.name || '从一门课程开始' }}</p><h1>{{ sectionMeta[section].title }}</h1><p>{{ sectionMeta[section].intro }}</p></div><div v-if="course" class="heading-note"><span>当前课程</span><strong>{{ readyCount }} 份资料可用于复习</strong></div></div>
         <div v-if="connectionError" class="notice error" role="alert"><strong>无法连接服务</strong><span>{{ connectionError }}</span><button class="text-button" @click="initialise">重新连接</button></div>
-        <div v-else-if="health && !modelConfigured" class="notice warning"><strong>聊天模型尚未配置</strong><span>资料上传与目录整理可以使用。点击“模型配置”，选择服务商并填写模型和 API Key，保存后即可生成回答和复习笔记。</span><button class="text-button" @click="modelSettingsOpen = true">配置模型</button></div>
+        <div v-else-if="health && !modelConfigured" class="notice warning"><strong>聊天模型尚未配置</strong><span>资料上传与目录整理可以使用。点击“模型配置”，添加模型并填写 API Key 或登录订阅账号，保存后即可生成回答和复习笔记。</span><button class="text-button" @click="modelSettingsOpen = true">配置模型</button></div>
         <div v-if="health && !health.embedding_ready && documents.length && !indexRepairRequired" class="notice info"><span>检索模型将在需要时加载。已下载的模型直接从本地读取；尚未下载时需要联网获取模型文件。</span></div>
         <div v-if="indexRepairRequired" class="notice warning"><strong>本地检索索引需要重新建立</strong><span>{{ indexRepairBusy ? '正在用本地向量模型重新处理已保存资料，请等待完成。首次加载模型可能较慢；此操作不会调用聊天模型。' : '资料、章节目录和复习笔记仍保留。点击重新建立索引后再使用问答；复习笔记仍可正常生成。' }}</span><button class="button subtle small" :disabled="indexRepairBusy || chapterBusy || !!activeJob || chatting" @click="repairIndex">{{ indexRepairBusy ? '正在重新建立…' : '重新建立索引' }}</button></div>
         <div v-if="actionError" class="notice error feedback" role="alert"><span>{{ actionError }}</span><button class="icon-button small" aria-label="关闭错误提示" @click="actionError = ''">×</button></div>
@@ -597,13 +364,17 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer); activeController?.a
             <div :class="['upload-area', { dragging: dragOver, busy: uploadBusy }]" @dragover.prevent="dragOver = true" @dragleave.prevent="dragOver = false" @drop.prevent="drop"><div class="upload-icon"><UiIcon name="upload" /></div><div class="upload-description"><h3>{{ uploadBusy ? '正在接收资料…' : '拖入课程资料' }}</h3><p>{{ uploadLabel || (indexRepairRequired ? '请先重新建立索引，再加入新资料' : '可以一次选择多个文件') }}</p><small>{{ uploadFormatsLabel }}</small></div><button class="button primary" :disabled="uploadBusy || indexRepairRequired || indexRepairBusy" @click="fileInput?.click()">{{ uploadBusy ? '上传中…' : '选择文件' }}</button><input ref="fileInput" type="file" multiple :accept="uploadAccept" hidden @change="upload(($event.target as HTMLInputElement).files || [])" /></div>
             <div class="list-heading"><strong>全部资料 <span class="count-badge">{{ documents.length }}</span></strong><div class="inline-actions"><button v-if="readyCount && !indexRepairRequired" class="text-button" :disabled="indexRepairBusy || chapterBusy || !!activeJob || chatting" @click="repairIndex">{{ indexRepairBusy ? '正在修复…' : '修复索引' }}</button><button class="text-button" @click="refreshDocuments().catch(setError)">刷新状态 ↻</button></div></div>
             <div v-if="!documents.length" class="empty-state compact"><p>还没有课程资料</p><span>建议先上传少量资料，检查解析内容后再逐批加入。</span></div>
-            <div v-for="document in documents" :key="document.id" class="document-row"><div :class="['file-type', document.filename.split('.').pop()?.toLowerCase()]">{{ document.filename.split('.').pop()?.toUpperCase() }}</div><div class="document-info"><h3>{{ document.filename }}</h3><div class="document-meta"><span>{{ kindLabels[document.kind] }}</span><span v-if="document.year">{{ document.year }} 年</span><span v-if="document.units_total">{{ document.units_with_text }} / {{ document.units_total }} 处有内容</span></div><p v-if="document.error" class="document-error">{{ document.error }}</p></div><span :class="['badge', document.status]">{{ statusLabels[document.status] || document.status }}</span><div class="document-actions"><button class="text-button" :disabled="['queued', 'processing'].includes(document.status)" @click="preview(document)">原文预览</button><button v-if="document.status === 'ready'" class="text-button" :disabled="!!documentBusy || uploadBusy || indexRepairRequired || indexRepairBusy || !!activeJob || processingCount > 0" @click="reparseDocument(document.id)">重新解析（OCR）</button><button v-if="document.status === 'failed'" class="text-button" :disabled="!!documentBusy || indexRepairRequired || indexRepairBusy || !!activeJob" @click="retryDocument(document.id)">重试</button><button class="text-button danger" :disabled="documentBusy === document.id || uploadBusy || ['queued', 'processing'].includes(document.status)" @click="deleteDocument(document)">删除</button></div></div>
+            <div v-for="document in documents" :key="document.id" class="document-row"><div :class="['file-type', document.filename.split('.').pop()?.toLowerCase()]">{{ document.filename.split('.').pop()?.toUpperCase() }}</div><div class="document-info"><h3>{{ document.filename }}</h3><div class="document-meta"><span>{{ kindLabels[document.kind] }}</span><span v-if="document.year">{{ document.year }} 年</span><span v-if="document.units_total">{{ document.units_with_text }} / {{ document.units_total }} 处有内容</span></div><p v-if="document.error" class="document-error">{{ document.error }}</p></div><span :class="['badge', document.status]">{{ statusLabels[document.status] || document.status }}</span><div class="document-actions"><button class="text-button" :disabled="['queued', 'processing'].includes(document.status)" @click="preview(document)">原文预览</button><button v-if="document.status === 'ready'" class="text-button" :disabled="!!documentBusy || uploadBusy || indexRepairRequired || indexRepairBusy || !!activeJob || processingCount > 0" @click="reparseDocument(document.id)">重新解析（OCR）</button><button v-if="document.status === 'failed'" class="text-button" :disabled="!!documentBusy || indexRepairRequired || indexRepairBusy || !!activeJob" @click="retryDocument(document.id)">重试</button><button class="text-button danger" :disabled="!!documentBusy || uploadBusy || practiceBusy || indexRepairBusy || managementBusy || chapterBusy || chatting || ['queued', 'processing'].includes(document.status)" @click="deleteDocument(document)">删除</button></div></div>
           </section>
           <ChapterEditor :key="courseId" :chapters="chapters" :groups="groups" :busy="chapterControlsBusy" @save="saveChapters" @edit="editChapters" @delete="deleteChapter" @draft="draftChapters" />
           <div v-if="confirmed" class="next-step"><span>复习路线已经准备好了。</span><button class="text-button" @click="section = 'outline'">生成复习笔记</button></div>
         </template>
 
-        <div v-if="courseId" v-show="section !== 'library'" class="study-workspace">
+        <KeepAlive v-if="courseId" :key="`space:${courseId}`">
+          <ReviewSpacePanel v-if="section === 'space'" :course-id="courseId" :course-name="course?.name || '当前课程'" :chapters="chapters" :model-configured="modelConfigured" :blocked="!spaceMaterialsReady || courseLoading || indexRepairRequired || indexRepairBusy || processingCount > 0 || uploadBusy || managementBusy || !!documentBusy" @busy="spaceBusy = $event" @change="wrongRevision++" />
+        </KeepAlive>
+
+        <div v-if="courseId" v-show="section !== 'library' && section !== 'space'" class="study-workspace">
           <div class="study-content">
         <template v-if="section === 'outline'">
           <section class="outline-intro panel"><div class="outline-illustration" aria-hidden="true"><UiIcon name="outline" /></div><div><h2>按课程资料生成笔记</h2><p>整理概念、公式和方法，用表格比较容易混淆的知识。</p><div class="outline-checks"><span :class="{ checked: readyCount > 0 }">{{ readyCount > 0 ? '✓' : '○' }} {{ readyCount }} 份可用资料</span><span :class="{ checked: confirmed }">{{ confirmed ? '✓' : '○' }} {{ confirmed ? '章节已确认' : '章节待确认' }}</span></div></div><button class="button primary" :disabled="!confirmed || !readyCount || !modelConfigured || indexRepairBusy || outlineBusy || !!activeJob || !!processingCount" @click="createOutline">{{ activeJob ? '正在生成…' : outlineBusy ? '创建任务…' : '生成复习笔记' }}</button></section>
@@ -632,9 +403,9 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer); activeController?.a
               <div v-if="currentNoteContext" class="chat-question-context" role="status"><strong>正在解释 · {{ currentNoteContext.heading }}</strong><span :title="currentNoteContext.selected_text">{{ currentNoteContext.selected_text }}</span><button type="button" class="text-button" :disabled="chatting" @click="noteContext = null">取消段落上下文</button></div>
               <button v-if="section === 'wrong' && currentChatContext" type="button" class="text-button chat-clear-context" :disabled="chatting" @click="wrongContext = null">取消题目上下文</button>
               <div ref="chatBox" class="message-list" aria-live="polite"><p v-if="messagesLoading" class="muted">正在读取历史会话…</p><div v-else-if="!messages.length" class="chat-welcome"><div class="chat-welcome-mark"><UiIcon name="chat" /></div><h2>{{ currentChatContext ? '这道题，哪里还没弄懂？' : currentNoteContext ? '一起读懂这段笔记' : '在这里理清思路' }}</h2><p>{{ currentChatContext ? '已带上当前题目和你的作答，直接提问即可。' : currentNoteContext ? '已带上选中的笔记段落，可以继续追问概念、公式或例子。' : '可以提问课程概念、比较解题方法，也可以继续追问。回答会结合当前课程资料。' }}</p></div>
-                <article v-for="message in messages" :key="message.id" :class="['message', message.role]"><div class="message-avatar">{{ message.role === 'user' ? '我' : '知' }}</div><div class="message-body"><div class="message-label">{{ message.role === 'user' ? '你' : '复习助手' }}<span v-if="message.pending" class="streaming-label">正在整理…</span><span v-if="message.incomplete" class="incomplete-label">未完成 · 仅本地保留</span></div><div v-if="message.role === 'user'" class="user-text"><small v-if="message.practice_context" class="message-question-label">第 {{ message.practice_context.number }} 题 · {{ message.practice_context.filename }}</small><small v-if="message.note_context" class="message-question-label">笔记 · {{ message.note_context.heading }} · {{ message.note_context.selected_text.slice(0, 90) }}</small>{{ message.content }}</div><MarkdownContent v-else-if="message.content" :content="message.content" hide-citations /><div v-else-if="message.pending" class="thinking"><span></span><span></span><span></span><small>{{ chatStatus }}</small></div><p v-else-if="message.incomplete" class="muted">本次没有收到完整回答，可以重新提问。</p></div></article>
+                <article v-for="message in messages" :key="message.id" :class="['message', message.role]"><div class="message-avatar">{{ message.role === 'user' ? '我' : '知' }}</div><div class="message-body"><div class="message-label">{{ message.role === 'user' ? '你' : '复习助手' }}<span v-if="message.pending" class="streaming-label">正在整理…</span><span v-if="message.incomplete" class="incomplete-label">未完成 · 仅本地保留</span></div><div v-if="message.role === 'user'" class="user-text"><small v-if="message.practice_context" class="message-question-label">第 {{ message.practice_context.number }} 题 · {{ message.practice_context.filename }}</small><small v-if="message.note_context" class="message-question-label">笔记 · {{ message.note_context.heading }} · {{ message.note_context.selected_text.slice(0, 90) }}</small>{{ message.content }}</div><MarkdownContent v-else-if="message.content" :content="message.content" hide-citations /><div v-else-if="message.pending" class="thinking"><span></span><span></span><span></span><small>{{ chatStatus }}</small></div><p v-else-if="message.incomplete" class="muted">本次没有收到完整回答，可以重新提问。</p><TokenUsage v-if="message.role === 'assistant' && !message.pending" :usage="message.token_usage" /></div></article>
               </div>
-              <form class="chat-composer" @submit.prevent="sendQuestion"><div v-if="chatting" class="chat-status"><span class="pulse-dot"></span>{{ chatStatus || '正在生成回答…' }}<button type="button" class="text-button" @click="activeController?.abort()">停止生成</button></div><div v-if="indexRepairRequired" class="composer-notice">课程检索索引需要修复，请点击上方“重新建立索引”。</div><div v-else-if="!modelConfigured" class="composer-notice">配置聊天模型后，即可使用复习问答。</div><div v-else-if="!readyCount && !currentChatContext && !currentNoteContext" class="composer-notice">先上传并处理至少一份资料，再开始提问。</div><div class="composer-input"><textarea v-model="question" rows="2" :disabled="!canChat || chatting" :placeholder="currentChatContext ? '直接问这道题，也可以结合你的作答追问…' : currentNoteContext ? '围绕选中的笔记段落继续追问…' : '围绕课程资料提问，或继续追问…'" aria-label="复习问题" @keydown="keyboard"></textarea><button class="send-button" aria-label="发送问题" :disabled="!question.trim() || !canChat || chatting">↑</button></div><div class="composer-footer"><span>Enter 发送 · Shift + Enter 换行</span><span>基于当前课程资料回答</span></div></form>
+              <form class="chat-composer" @submit.prevent="sendQuestion"><div v-if="chatting" class="chat-status"><span class="pulse-dot"></span>{{ chatStatus || '正在生成回答…' }}<button type="button" class="text-button" @click="stopChat()">停止生成</button></div><div v-if="indexRepairRequired" class="composer-notice">课程检索索引需要修复，请点击上方“重新建立索引”。</div><div v-else-if="!modelConfigured" class="composer-notice">配置聊天模型后，即可使用复习问答。</div><div v-else-if="!readyCount && !currentChatContext && !currentNoteContext" class="composer-notice">先上传并处理至少一份资料，再开始提问。</div><div class="composer-input"><textarea v-model="question" rows="2" :disabled="!canChat || chatting" :placeholder="currentChatContext ? '直接问这道题，也可以结合你的作答追问…' : currentNoteContext ? '围绕选中的笔记段落继续追问…' : '围绕课程资料提问，或继续追问…'" aria-label="复习问题" @keydown="keyboard"></textarea><button class="send-button" aria-label="发送问题" :disabled="!question.trim() || !canChat || chatting">↑</button></div><div class="composer-footer"><span>Enter 发送 · Shift + Enter 换行</span><span>基于当前课程资料回答</span></div></form>
             </div></aside>
         </div>
         <footer class="page-footer"><span>知页 · 课程复习工作台</span><span>资料与学习记录保存在本机</span></footer>
@@ -642,7 +413,7 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer); activeController?.a
     </div>
     <SourceDrawer v-if="showDrawer" :source="source" :loading="sourceLoading" :error="sourceError" @close="showDrawer = false; ++sourceGeneration" />
     <MemorySettings v-if="memoryOpen && courseId" :course-id="courseId" :course-name="course?.name || '当前课程'" :session-id="sessionId" :active="chatting" @close="memoryOpen = false" @busy="memoryBusy = $event" />
-    <ModelSettings v-if="modelSettingsOpen" :active="chatting || !!activeJob || practiceModelBusy" @close="modelSettingsOpen = false" @saved="refreshHealth" />
+    <ModelSettings v-if="modelSettingsOpen" :active="spaceBusy || chatting || !!activeJob || practiceModelBusy" @close="modelSettingsOpen = false" @saved="refreshHealth" />
     <ManagementDialog v-if="management" :key="`${management.action}:${management.id}`" :title="management.title" :description="management.description" :initial-name="management.initialName" :confirm-text="management.confirmText" :danger="management.danger" :busy="managementBusy" :error="managementError" @close="management = null" @submit="submitManagement" />
   </div>
 </template>

@@ -4,11 +4,16 @@ import re
 import shutil
 import subprocess
 from dataclasses import asdict
+from functools import lru_cache
 from threading import Thread
 from time import monotonic
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, build_opener, HTTPRedirectHandler
 
 from .config import ROOT, Settings
 from .model_config import ModelConfig, ModelConfigStore
+from .model_registry import ENV_KEYS
+from .token_usage import call_stage, record_usage
 
 
 class ModelNotConfigured(ValueError):
@@ -24,10 +29,11 @@ class ModelImageNotSupported(ValueError):
 
 
 class ModelRuntimeError(RuntimeError):
-    def __init__(self, message, status_code=None, timed_out=False):
+    def __init__(self, message, status_code=None, timed_out=False, auth_mode=None):
         super().__init__(message)
         self.status_code = status_code
         self.timed_out = timed_out
+        self.auth_mode = auth_mode
 
 
 def model_failure_message(error: Exception) -> str:
@@ -40,8 +46,12 @@ def model_failure_message(error: Exception) -> str:
         if status == 402:
             return "模型服务余额或额度不足（HTTP 402）。请检查当前 API Key 所属账户，恢复余额或更换可用模型配置后重试。"
         if status == 401:
+            if getattr(current, "auth_mode", None) == "oauth":
+                return "订阅认证失效（HTTP 401），请在模型配置中重新登录订阅账号。"
             return "模型服务认证失败（HTTP 401）。请在页面“模型配置”中更换 API Key。"
         if status == 403:
+            if getattr(current, "auth_mode", None) == "oauth":
+                return "订阅账号无权使用此模型（HTTP 403），请确认订阅权限或改选账号可用的模型。"
             return "模型服务拒绝访问（HTTP 403）。请检查当前 API Key 的模型使用权限。"
         if status == 404:
             return "模型或接口不存在（HTTP 404）。请在“模型配置”中检查模型名称、协议和接口根地址。"
@@ -112,16 +122,22 @@ class ModelClient:
                     key = request.get("config", {}).get("api_key")
                     if key:
                         message = message.replace(key, "[密钥已隐藏]")
+                    for value in request.get("config", {}).get("headers", {}).values():
+                        if value:
+                            message = message.replace(value, "[请求头已隐藏]")
                     # Providers sometimes include request bodies or headers in error messages.
                     status = event.get("status")
                     if status is None:
                         match = re.search(r"(?:HTTP\s*|status(?:_code)?[\s:=]+|^)([45]\d\d)\b", message, re.I)
                         status = int(match.group(1)) if match else None
-                    if "模型运行依赖未安装" in message or "当前页面不支持" in message:
+                    if ("模型运行依赖未安装" in message or "当前页面不支持" in message
+                            or event.get("code") == "invalid_model_options"):
                         safe_message = message
                     else:
-                        safe_message = "模型请求失败。请检查模型配置、网络和服务商额度。"
-                    raise ModelRuntimeError(safe_message, status, event.get("timeout", False))
+                        safe_message = ("订阅模型调用失败，请尝试重新登录，并确认账号的模型权限与额度。"
+                            if request.get("config", {}).get("credential_mode") == "oauth"
+                            else "模型请求失败。请检查模型配置、网络和服务商额度。")
+                    raise ModelRuntimeError(safe_message, status, event.get("timeout", False), request.get("config", {}).get("credential_mode"))
                 terminal = event.get("type") in ("done", "catalog") or terminal
                 yield event
             if not terminal:
@@ -135,20 +151,74 @@ class ModelClient:
             if not process.stdin.closed:
                 process.stdin.close()
 
+    @lru_cache(maxsize=1)
     def catalog(self):
         for event in self._events({"action": "catalog"}, 30):
             if event["type"] == "catalog":
-                return event["providers"]
+                return [{**provider, "env_key": ENV_KEYS.get(provider["id"])} for provider in event["providers"]]
         raise ModelRuntimeError("未能读取模型目录。")
+
+    def discover(self, config: ModelConfig):
+        if config.api not in ("openai-completions", "openai-responses"):
+            raise ValueError("获取模型列表适用于 OpenAI 兼容接口；其他协议可从内置目录添加或手动填写模型 ID")
+
+        class NoRedirect(HTTPRedirectHandler):
+            def redirect_request(self, *_args, **_kwargs):
+                return None
+
+        headers = {**config.headers, "Accept": "application/json"}
+        if config.api_key:
+            headers["Authorization"] = f"Bearer {config.api_key}"
+        request = Request(config.base_url.rstrip("/") + "/models", headers=headers)
+        try:
+            # Never forward a credential to another endpoint via a redirect.
+            with build_opener(NoRedirect).open(request, timeout=min(config.timeout_seconds, 30)) as response:
+                data = response.read(4 * 1024 * 1024 + 1)
+            if len(data) > 4 * 1024 * 1024:
+                raise ModelRuntimeError("服务返回的模型列表过大，请手动填写模型 ID。")
+            body = json.loads(data)
+        except HTTPError as exc:
+            if exc.code in (404, 405):
+                raise ModelRuntimeError("服务没有提供 /models 列表接口，请从内置目录添加或手动填写模型 ID。") from exc
+            raise ModelRuntimeError("无法获取模型列表。", status_code=exc.code) from exc
+        except (URLError, TimeoutError) as exc:
+            raise ModelRuntimeError("无法连接模型列表接口，请检查地址和网络。") from exc
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ModelRuntimeError("模型列表接口未返回有效 JSON，请手动填写模型 ID。") from exc
+        items = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(items, list):
+            raise ModelRuntimeError("服务返回的模型列表格式不受支持，请手动填写模型 ID。")
+        identities = sorted({item["id"].strip() for item in items if isinstance(item, dict)
+            and isinstance(item.get("id"), str) and 0 < len(item["id"].strip()) <= 200})
+        return {"models": [{"id": identity, "name": identity} for identity in identities[:2000]],
+            "message": "已获取模型 ID；列表未声明的视觉能力、推理能力和 token 上限需要自行确认。"}
 
     def _request(self, messages, action, json_mode=False, config: ModelConfig | None = None, max_tokens=None):
         config = config or self.config_store.snapshot()
         if not config.configured:
-            raise ModelNotConfigured("请点击页面右上角“模型配置”，填写服务商、模型和 API Key 后保存。")
+            raise ModelNotConfigured("请点击页面右上角“模型配置”，添加服务商与模型，填写 API Key 或完成订阅登录后保存。")
         request = {"action": action, "config": asdict(config), "messages": messages, "json_mode": json_mode}
         if max_tokens is not None:
             request["max_tokens"] = max_tokens
-        return self._events(request, config.timeout_seconds)
+        return self._usage_events(request, config.timeout_seconds)
+
+    def _usage_events(self, request, timeout):
+        stage = call_stage(request["messages"], request["action"])
+        reported = False
+        try:
+            for event in self._events(request, timeout):
+                if event.get("type") == "usage":
+                    record_usage(event.get("usage"), stage)
+                    reported = True
+                elif event.get("type") == "done" and not reported:
+                    # Keep adapters that attach usage to done compatible. An
+                    # absent value is unknown, never a claimed zero-token call.
+                    record_usage(event.get("usage"), stage)
+                    reported = True
+                yield event
+        finally:
+            if not reported:
+                record_usage(None, stage)
 
     @staticmethod
     def _text(event):
@@ -178,10 +248,13 @@ class ModelClient:
                 self._text(event)
 
     def check(self, config: ModelConfig):
-        for event in self._request([{"role": "user", "content": "请只回复 OK。"}], "complete", config=config, max_tokens=256):
+        budget = min(config.max_tokens, 4096 if config.reasoning and config.thinking_level != "off" else 256)
+        for event in self._request([{"role": "user", "content": "请只回复 OK。"}], "complete", config=config, max_tokens=budget):
             if event["type"] == "done":
                 # A short probe may consume its budget in reasoning; receiving text still proves transport.
                 if not event.get("text", "").strip():
+                    if event.get("stop_reason") == "length":
+                        return {"message": "服务已连接，但检查请求在输出正文前达到 token 上限。可降低思考强度或增加最大输出后再检查。", "model": config.model}
                     raise StructuredOutputError("服务已响应但没有返回正文，请调整模型或关闭推理后重试。")
                 return {"message": "模型已连接并返回正文。", "model": config.model}
         raise StructuredOutputError("模型未返回连接结果。")

@@ -20,11 +20,14 @@ from .chat_answers import ChatAnswerGrounding
 from .config import Settings
 from .file_chapters import chapter_role, document_role
 from .llm import ModelClient, ModelRuntimeError, model_failure_message
-from .models import AppMeta, Block, Chapter, ChatSession, Course, Document, Job, Message, Outline, PracticeQuestion, PracticeSet, new_id
+from .models import AppMeta, Block, Chapter, ChatSession, Course, Document, Job, Message, Outline, PracticeQuestion, PracticeSet, ReviewSpace, new_id
 from .model_images import image_resolution_current
+from .model_registry import ModelRegistryInput, ModelProbeInput, ProviderInput, OAuthAnswerInput, ModelRemovalInput, ProviderLogoutInput
+from .model_oauth import ModelOAuthManager
 from .outlines import NOTES_STYLE, OutlineService
 from .practice import PracticeService
 from .practice_progress import answer_policy_current
+from .review_space import ReviewSpaceService
 from .store import Services
 from .upload_formats import SUPPORTED_SUFFIXES, SUPPORTED_FORMATS_LABEL
 
@@ -220,6 +223,83 @@ class SessionMemoryInput(BaseModel):
     revision: int = Field(ge=0)
 
 
+class ReviewSpaceScopeFields(BaseModel):
+    chapter_ids: list[str] = Field(default_factory=list, max_length=100)
+
+    @field_validator("chapter_ids")
+    @classmethod
+    def valid_chapters(cls, value):
+        if any(not identity.strip() or len(identity) > 100 for identity in value) or len(set(value)) != len(value):
+            raise ValueError("章节选择包含无效或重复的 ID")
+        return value
+
+
+class ReviewSpaceScopeInput(ReviewSpaceScopeFields):
+    revision: int = Field(ge=0)
+
+
+class ReviewSpaceInput(ReviewSpaceScopeFields):
+    goal: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("goal")
+    @classmethod
+    def clean_goal(cls, value):
+        value = value.strip()
+        if not value:
+            raise ValueError("请输入想复习的内容")
+        return value
+
+
+class ReviewSpaceAdvanceInput(BaseModel):
+    revision: int = Field(ge=0)
+    feedback: str = Field(default="", max_length=2000)
+
+
+class ReviewSpaceRenameInput(BaseModel):
+    revision: int = Field(ge=0)
+    title: str = Field(min_length=1, max_length=80)
+
+    @field_validator("title")
+    @classmethod
+    def clean_title(cls, value):
+        value = value.strip()
+        if not value:
+            raise ValueError("请输入复习记录名称")
+        return value
+
+
+class ReviewSpaceDeleteInput(BaseModel):
+    revision: int = Field(ge=0)
+
+
+class ReviewSpaceControlInput(BaseModel):
+    revision: int = Field(ge=0)
+    action: Literal["pause", "finish"]
+
+
+class ReviewSpaceDraftInput(BaseModel):
+    step_id: str = Field(min_length=1, max_length=100)
+    selected: list[str] = Field(default_factory=list, max_length=4)
+    own_answer: str = Field(default="", max_length=4000)
+    used_hint: bool = False
+    seen_answer: bool = False
+    draft_revision: int = Field(ge=1)
+
+
+class ReviewSpaceAnswerInput(BaseModel):
+    step_id: str = Field(min_length=1, max_length=100)
+    selected: list[str] = Field(default_factory=list, max_length=4)
+    own_answer: str = Field(default="", max_length=4000)
+    used_hint: bool = False
+    seen_answer: bool = False
+    revision: int = Field(ge=0)
+
+
+class ReviewSpaceRevealInput(BaseModel):
+    step_id: str = Field(min_length=1, max_length=100)
+    revision: int = Field(ge=0)
+
+
 def row(obj):
     return {column.name: getattr(obj, column.name) for column in obj.__table__.columns
             if column.name not in ("path", "snapshot", "chapter_results")}
@@ -244,11 +324,13 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
     services = Services(settings, embedder, llm)
     agent, outline_service = ReviewAgentService(services), OutlineService(services)
     practice = PracticeService(services)
+    review_space = ReviewSpaceService(practice)
     agent.answer_grounding = ChatAnswerGrounding(practice)
 
     @asynccontextmanager
     async def lifespan(app):
         services.recover()
+        review_space.recover()
         services.memory.start()
         yield
         services.memory.close()
@@ -286,10 +368,12 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
     def model_configuration():
         return services.model_config.public()
 
+    model_catalog_client = ModelClient(settings, services.model_config)
+
     @app.get("/system/model-catalog")
     def model_catalog():
         try:
-            return ModelClient(settings, services.model_config).catalog()
+            return model_catalog_client.catalog()
         except ModelRuntimeError as exc:
             raise HTTPException(503, model_failure_message(exc)) from exc
 
@@ -298,6 +382,7 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
         with services.lock, services.sessions() as db:
             if (db.scalar(select(Job.id).where(Job.status.in_(["queued", "running"])).limit(1))
                     or any(lock.locked() for lock in services.chat_locks.values())
+                    or any(lock.locked() for lock in services.review_space_locks.values())
                     or any(lock.locked() for lock in services.practice_locks.values())
                     or any(lock.locked() for lock in services.explanation_locks.values())
                     or any(lock.locked() for lock in services.answer_preparation_locks.values())):
@@ -314,6 +399,129 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
         try:
             candidate = services.model_config.candidate(payload.model_dump())
             return ModelClient(settings, services.model_config).check(candidate)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(502, model_failure_message(exc)) from exc
+
+    @app.get("/system/model-registry")
+    def model_registry():
+        return services.model_config.public_registry()
+
+    model_oauth = ModelOAuthManager(services.model_config)
+
+    def ensure_model_idle():
+        with services.sessions() as db:
+            if (db.scalar(select(Job.id).where(Job.status.in_(["queued", "running"])).limit(1))
+                    or any(lock.locked() for locks in (services.chat_locks, services.review_space_locks,
+                        services.practice_locks, services.explanation_locks, services.answer_preparation_locks)
+                        for lock in locks.values())):
+                raise HTTPException(409, "正在处理复习任务，请结束任务后再更改模型配置")
+
+    @app.post("/system/model-registry/oauth/start")
+    def start_model_oauth(payload: ProviderInput):
+        try:
+            with services.lock:
+                ensure_model_idle()
+                return model_oauth.start(payload.model_dump())
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        except (OSError, ModelRuntimeError) as exc:
+            raise HTTPException(503, "无法启动订阅登录，请检查 Node.js 和 model-runtime 依赖") from exc
+
+    @app.get("/system/model-registry/oauth/{identity}")
+    def model_oauth_state(identity: str):
+        try:
+            return model_oauth.public(identity)
+        except KeyError as exc:
+            raise HTTPException(404, "登录会话已不存在，请重新登录") from exc
+
+    @app.post("/system/model-registry/oauth/{identity}/answer")
+    def answer_model_oauth(identity: str, payload: OAuthAnswerInput):
+        try:
+            return model_oauth.answer(identity, payload.prompt_id, payload.value)
+        except KeyError as exc:
+            raise HTTPException(404, "登录会话已不存在，请重新登录") from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(503, "登录进程已结束，请重新登录") from exc
+
+    @app.delete("/system/model-registry/oauth/{identity}")
+    def cancel_model_oauth(identity: str):
+        try:
+            return model_oauth.cancel(identity)
+        except KeyError as exc:
+            raise HTTPException(404, "登录会话已不存在") from exc
+
+    @app.post("/system/model-registry/providers/{provider_id}/logout")
+    def logout_model_provider(provider_id: str, payload: ProviderLogoutInput):
+        try:
+            with services.lock:
+                ensure_model_idle()
+                existing = next((item for item in services.model_config.registry['providers'] if item['id'] == provider_id), None)
+                model_oauth.logout(provider_id, existing['provider'] if existing else payload.provider)
+                return services.model_config.deactivate_provider(provider_id)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        except (OSError, ModelRuntimeError) as exc:
+            raise HTTPException(503, "无法退出订阅登录，请检查运行依赖与本机数据目录权限") from exc
+
+    @app.delete("/system/model-registry/providers/{provider_id}")
+    def remove_model_provider(provider_id: str, payload: ProviderLogoutInput):
+        try:
+            with services.lock:
+                ensure_model_idle()
+                services.model_config.oauth_path(provider_id)
+                existing = next((item for item in services.model_config.registry['providers'] if item['id'] == provider_id), None)
+                model_oauth.logout(provider_id, existing['provider'] if existing else payload.provider)
+                return services.model_config.remove_provider(provider_id)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        except (OSError, ModelRuntimeError) as exc:
+            raise HTTPException(503, "无法删除服务商，请检查运行依赖与本机数据目录权限") from exc
+
+    @app.delete("/system/model-registry/providers/{provider_id}/models")
+    def remove_registry_model(provider_id: str, payload: ModelRemovalInput):
+        try:
+            with services.lock:
+                ensure_model_idle()
+                return services.model_config.remove_model(provider_id, payload.model_id)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(500, "无法移除模型，请检查本机数据目录权限") from exc
+
+    @app.put("/system/model-registry")
+    def save_model_registry(payload: ModelRegistryInput):
+        with services.lock, services.sessions() as db:
+            if (db.scalar(select(Job.id).where(Job.status.in_(["queued", "running"])).limit(1))
+                    or any(lock.locked() for locks in (services.chat_locks, services.review_space_locks,
+                        services.practice_locks, services.explanation_locks, services.answer_preparation_locks)
+                        for lock in locks.values())):
+                raise HTTPException(409, "正在处理复习任务，请结束任务后再保存或切换模型")
+            try:
+                return services.model_config.save_registry(payload.model_dump())
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
+            except OSError as exc:
+                raise HTTPException(500, "无法保存模型配置，请检查本地 data 目录的写入权限") from exc
+
+    @app.post("/system/model-registry/check")
+    def check_registry_model(payload: ModelProbeInput):
+        try:
+            config = services.model_config.probe_candidate(payload.provider.model_dump(), payload.model.model_dump())
+            return ModelClient(settings, services.model_config).check(config)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(502, model_failure_message(exc)) from exc
+
+    @app.post("/system/model-registry/discover")
+    def discover_provider_models(payload: ModelProbeInput):
+        try:
+            config = services.model_config.probe_candidate(payload.provider.model_dump(), payload.model.model_dump(), require_model=False)
+            return ModelClient(settings, services.model_config).discover(config)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         except Exception as exc:
@@ -373,6 +581,54 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
             return [{**doc, "chapter_excluded": doc["id"] in excluded}
                     for doc in practice_document_rows(db, db.scalars(select(Document).where(
                         Document.course_id == course_id, Document.kind != "generated").order_by(Document.created_at)))]
+
+    @app.get("/courses/{course_id}/review-spaces")
+    def review_spaces(course_id: str):
+        return review_space.list(course_id)
+
+    @app.post("/courses/{course_id}/review-spaces", status_code=202)
+    def start_review_space(course_id: str, payload: ReviewSpaceInput, tasks: BackgroundTasks):
+        return review_space.start(course_id, payload.model_dump(), tasks)
+
+    @app.get("/review-spaces/{space_id}")
+    def get_review_space(space_id: str):
+        return review_space.get(space_id)
+
+    @app.get("/review-spaces/{space_id}/retrieval-report")
+    def review_space_retrieval_report(space_id: str, message_id: str | None = None):
+        return review_space.retrieval_report(space_id, message_id)
+
+    @app.put("/review-spaces/{space_id}/title")
+    def rename_review_space(space_id: str, payload: ReviewSpaceRenameInput):
+        return review_space.rename(space_id, payload.title, payload.revision)
+
+    @app.put("/review-spaces/{space_id}/scope")
+    def update_review_space_scope(space_id: str, payload: ReviewSpaceScopeInput):
+        return review_space.set_scope(space_id, payload.chapter_ids, payload.revision)
+
+    @app.delete("/review-spaces/{space_id}")
+    def delete_review_space(space_id: str, payload: ReviewSpaceDeleteInput):
+        return review_space.remove(space_id, payload.revision)
+
+    @app.post("/review-spaces/{space_id}/advance", status_code=202)
+    def advance_review_space(space_id: str, payload: ReviewSpaceAdvanceInput, tasks: BackgroundTasks):
+        return review_space.advance(space_id, payload.model_dump(), tasks)
+
+    @app.post("/review-spaces/{space_id}/control")
+    def control_review_space(space_id: str, payload: ReviewSpaceControlInput):
+        return review_space.control(space_id, payload.action, payload.revision)
+
+    @app.put("/review-spaces/{space_id}/draft")
+    def save_review_space_draft(space_id: str, payload: ReviewSpaceDraftInput):
+        return review_space.draft(space_id, payload.model_dump())
+
+    @app.post("/review-spaces/{space_id}/answer")
+    def answer_review_space(space_id: str, payload: ReviewSpaceAnswerInput):
+        return review_space.answer(space_id, payload.model_dump())
+
+    @app.post("/review-spaces/{space_id}/reveal")
+    def reveal_review_space_answer(space_id: str, payload: ReviewSpaceRevealInput):
+        return review_space.reveal(space_id, payload.step_id, payload.revision)
 
     @app.get("/courses/{course_id}/practice/generated")
     def generated_practice_sets(course_id: str):
@@ -479,6 +735,8 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
                 raise HTTPException(404, "资料不存在")
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(503, str(exc)) from exc
         return Response(status_code=204)
 
     @app.get("/documents/{document_id}/practice")

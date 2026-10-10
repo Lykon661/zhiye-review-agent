@@ -177,13 +177,17 @@ function schedule(token: number) {
   if (active(token)) timer = setTimeout(() => { void read(token) }, 1800)
 }
 async function read(token: number, restoreProgress = false) {
+  let restoring = false
   try {
     const value = await api<PracticeState>(`/documents/${documentId.value}/practice`, { signal: requestController?.signal })
     if (!active(token)) return
     const keepPairingSelection = pairingDirty.value && !restoreProgress
+    restoring = value.status === 'ready' && (restoreProgress || !progress.ready(documentId.value, value.questions))
+    // Do not expose editable questions until the first saved draft is restored.
+    if (restoring) loading.value = true
     bank.value = value
     if (!keepPairingSelection) pairingSelection.value = savedPairingSelection.value
-    if (value.status === 'ready' && (restoreProgress || !progress.ready(documentId.value, value.questions))) {
+    if (restoring) {
       const saved = await progress.restore(documentId.value, value.questions, () => active(token))
       if (!saved || !active(token)) return
       restoringProgress = true
@@ -195,7 +199,8 @@ async function read(token: number, restoreProgress = false) {
     progress.flush()
     if (['queued', 'processing'].includes(value.status)
         || ['processing', 'waiting'].includes(value.answer_preparation?.status || '')) schedule(token)
-  } catch (reason) { if (active(token)) error.value = message(reason) }
+  } catch (reason) { if (active(token)) { error.value = message(reason); if (restoring) bank.value = null } }
+  finally { if (restoring && active(token)) loading.value = false }
 }
 async function load() {
   cancel()
@@ -482,21 +487,21 @@ onUnmounted(() => { progress.dispose(); window.removeEventListener('pagehide', s
     <div class="section-top"><div><h2>我的练习</h2><p class="muted">{{ currentFile ? `正在练习：${practiceName(currentFile)}` : 'AI 生成、上传的练习题和往年真题都可以在这里作答。' }}</p></div><div v-if="files.length" class="inline-actions"><button class="text-button" :disabled="modelBusy || !currentFile || ['queued', 'processing'].includes(currentFile.status)" @click="openRenamePractice">改名</button><button class="text-button" :disabled="questionBusy || generationBusy || deletionBusy || !!renameTarget" @click="refreshPractice">刷新题目 ↻</button><button class="text-button danger" :disabled="working || !currentFile || ['queued', 'processing'].includes(currentFile.status)" :aria-label="currentFile ? `删除练习 ${practiceName(currentFile)}` : '删除练习'" @click="deleteCurrentFile">{{ deletingDocumentId === documentId ? '删除中…' : isGenerated ? '删除 AI 练习' : '删除试卷' }}</button></div></div>
     <label v-if="files.length" class="practice-set-selector">选择练习<select v-model="documentId" aria-label="选择练习" :disabled="working"><option v-for="file in files" :key="file.id" :value="file.id">{{ practiceName(file) }}{{ file.kind === 'generated' ? ` · ${new Date(file.created_at).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}` : file.status !== 'ready' ? ' · 正在解析或待重试' : '' }}</option></select></label>
     <div v-if="generatedListError" class="notice error" role="alert"><span>读取 AI 练习失败：{{ generatedListError }}</span><button class="text-button" @click="loadGeneratedSets">重试</button></div>
-    <div v-if="error" class="notice error" role="alert"><span>{{ error }}</span><button v-if="bank?.status === 'queued' || bank?.status === 'processing'" class="text-button" @click="load">重新连接</button></div>
+    <div v-if="error" class="notice error" role="alert"><span>{{ error }}</span><button v-if="!bank || bank.status === 'queued' || bank.status === 'processing'" class="text-button" @click="load">重新连接</button></div>
     <div v-if="!generatedLoaded" class="empty-state compact" role="status"><p>正在读取练习列表…</p></div>
     <div v-else-if="!files.length" class="empty-state compact"><h3>还没有练习题</h3><p>使用上方“AI 生题”生成练习，或点击“上传题目”加入试卷。</p></div>
     <div v-else-if="currentFile?.status !== 'ready'" class="empty-state compact"><h3>{{ currentFile?.status === 'failed' ? '题目资料解析失败' : '正在解析题目资料…' }}</h3><p>{{ currentFile?.error || '解析完成后会自动整理成在线练习。可在资料库查看处理状态或重试。' }}</p></div>
     <div v-else-if="loading || bank?.status === 'queued' || bank?.status === 'processing'" class="practice-loading" role="status"><h3>{{ isGenerated ? '正在生成 AI 练习…' : '正在整理上传题目…' }}</h3><p class="muted">{{ isGenerated ? '正在生成题目与参考解析，完成后即可作答。' : '提取题干与选项，保留原题内容。' }}</p><div class="progress-track"><span :style="{ width: `${Math.round((bank?.progress || 0) * 100)}%` }"></span></div></div>
     <div v-else-if="bank?.status === 'new'" class="empty-state compact"><p>{{ modelConfigured ? '题目尚未整理' : '请先配置模型，用于整理题目及生成参考答案。' }}</p><button class="button primary" :disabled="!modelConfigured" @click="prepare">整理题目</button></div>
     <div v-else-if="bank?.status === 'failed'" class="empty-state compact"><h3>{{ isGenerated ? 'AI 生题未完成' : '题目整理未完成' }}</h3><p>{{ bank.error }}</p><button class="button primary" :disabled="!modelConfigured" @click="prepare">{{ isGenerated ? '重试生题' : '重新整理' }}</button></div>
-    <div v-else-if="bank?.status === 'ready' && !bank.questions.length" class="empty-state compact"><h3>当前练习没有题目</h3><p>{{ isGenerated ? '题目已全部删除，可在上方重新生成一组练习。' : '题目可能未识别或已删除。可在资料库查看原文，或上传新的题目文件。' }}</p></div>
+    <div v-else-if="bank?.status === 'ready' && !bank.questions.length" class="empty-state compact"><h3>当前练习没有题目</h3><p>{{ isGenerated ? '题目已全部删除，可在上方重新生成一组练习。' : '可查看原文，或重新整理原文件中的题目。重新整理也会恢复之前删除的题目。' }}</p><button v-if="!isGenerated" class="button primary" :disabled="!modelConfigured || working" @click="prepare">重新整理原文件</button></div>
     <template v-else-if="current && bank?.status === 'ready'">
       <div v-if="answersPreparing" class="practice-answer-preparation" role="status"><span>正在准备上传答案 · {{ Math.round((bank.answer_preparation?.progress || 0) * 100) }}%</span><span>可以先作答，准备完成后提交更快。</span></div>
       <div class="practice-summary"><span>第 {{ index + 1 }} / {{ bank.questions.length }} 题 · {{ saveStatus }}</span><span v-if="answered">已判 {{ answered }} 题 · 答对 {{ correct }} 题</span></div>
       <div class="practice-layout">
         <aside class="practice-navigation" aria-label="题目导航"><button v-for="(item, position) in bank.questions" :key="item.id" :class="['practice-number', { active: index === position, correct: results[item.id]?.correct === true, incorrect: results[item.id]?.correct === false, viewed: visible[item.id] && item.question_type === 'other' }]" :aria-label="`第 ${position + 1} 题${results[item.id]?.correct === true ? '，已答对' : results[item.id]?.correct === false ? '，已答错' : visible[item.id] ? '，已查看答案' : '，未判题'}`" :aria-current="index === position ? 'step' : undefined" :disabled="questionBusy" @click="move(position)">{{ position + 1 }}<span v-if="results[item.id]?.correct === true || results[item.id]?.correct === false" class="practice-state" aria-hidden="true">{{ results[item.id]?.correct ? '✓' : '×' }}</span></button></aside>
         <article class="practice-question" :key="current.id">
-          <div class="practice-question-meta"><span class="badge neutral">{{ current.question_type === 'single_choice' ? '单选题' : current.question_type === 'multiple_choice' ? '多选题' : '其他题型 · 自行对照' }}</span><span v-if="current.section">{{ current.section }}</span><span v-if="current.number && !isGenerated">原题 {{ current.number }}</span><span v-if="current.locator.label">{{ current.locator.label }}</span><button class="text-button danger practice-delete-question" :disabled="modelBusy" @click="confirmDeleteQuestion">{{ deletingQuestion === current.id ? '删除中…' : '删除题目' }}</button></div>
+          <div class="practice-question-meta"><span class="badge neutral">{{ current.question_type === 'single_choice' ? '单选题' : current.question_type === 'multiple_choice' ? '多选题' : '其他题型 · 自行对照' }}</span><span v-if="current.locator.external_knowledge" class="badge neutral">含模型自行搜索的知识</span><span v-if="current.locator.model_knowledge" class="badge neutral">含模型已有知识的补充</span><span v-if="current.section">{{ current.section }}</span><span v-if="current.number && !isGenerated">原题 {{ current.number }}</span><span v-if="current.locator.label">{{ current.locator.label }}</span><button class="text-button danger practice-delete-question" :disabled="modelBusy" @click="confirmDeleteQuestion">{{ deletingQuestion === current.id ? '删除中…' : '删除题目' }}</button></div>
           <div v-if="hasEnglish || current.translation" class="practice-translation-actions">
             <button class="button subtle" :disabled="questionBusy || (!current.translation && !modelConfigured)" :aria-expanded="!!translationVisible[current.id]" @click="toggleTranslation">
               {{ translatingQuestion === current.id ? '正在翻译…' : translationVisible[current.id] ? '隐藏中文翻译' : current.translation ? '显示中文翻译' : '翻译题目和选项' }}

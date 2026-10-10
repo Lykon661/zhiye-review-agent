@@ -37,11 +37,10 @@ def test_pdf_page_ordinals_include_blank_pages(tmp_path: Path) -> None:
     assert [block.order for block in result.blocks] == [0, 1]
     assert "Page replacement" in result.blocks[-1].text
     assert "FIFO" in result.blocks[-1].text
-    assert any("第 2 页未提取到文字" in warning for warning in result.warnings)
-    assert any("复杂公式" in warning for warning in result.warnings)
+    assert result.warnings == [], "Partial recognition diagnostics stay out of the public parse result."
 
 
-def test_pdf_image_warning_and_scanned_pdf_rejection(tmp_path: Path) -> None:
+def test_pdf_skips_unreadable_images_without_public_warnings(tmp_path: Path) -> None:
     image = make_image(tmp_path / "scan.png")
     mixed = tmp_path / "mixed.pdf"
     pdf = canvas.Canvas(str(mixed))
@@ -49,13 +48,14 @@ def test_pdf_image_warning_and_scanned_pdf_rejection(tmp_path: Path) -> None:
     pdf.drawImage(str(image), 30, 600, width=80, height=50)
     pdf.save()
     result = parse_document(mixed, mixed.name)
-    assert any("第 1 页含图片" in warning for warning in result.warnings)
+    assert result.warnings == []
+    assert "Visible digital text" in result.blocks[0].text
 
     scan = tmp_path / "scan.pdf"
     pdf = canvas.Canvas(str(scan))
     pdf.drawImage(str(image), 30, 600, width=80, height=50)
     pdf.save()
-    with pytest.raises(ValueError, match="未提取到可用文字.*OCR"):
+    with pytest.raises(ValueError, match="未提取到可用内容"):
         parse_document(scan, scan.name)
 
 
@@ -104,8 +104,7 @@ def test_pptx_group_text_table_and_slide_positions(tmp_path: Path) -> None:
     assert table_block.text == "算法\t条件\nLRU\t局部性"
     assert table_block.heading == "第一章 内存管理"
     assert result.blocks[-1].locator["slide"] == 2
-    assert any("第 2 张幻灯片含 1 张图片" in warning for warning in result.warnings)
-    assert any("第 3 张幻灯片未提取到正文文字" in warning for warning in result.warnings)
+    assert result.warnings == []
 
 
 def test_docx_preserves_body_order_heading_and_table_position(tmp_path: Path) -> None:
@@ -138,9 +137,7 @@ def test_docx_preserves_body_order_heading_and_table_position(tmp_path: Path) ->
     assert result.blocks[3].locator["paragraph"] == 4
     assert result.blocks[-1].heading == "第二章 调度"
     assert all("page" not in block.locator for block in result.blocks)
-    assert any("Office 公式" in warning for warning in result.warnings)
-    assert any("图片引用" in warning for warning in result.warnings)
-    assert any("2 个空文本段落" in warning for warning in result.warnings)
+    assert result.warnings == []
 
 
 def test_docx_nested_table_text_is_not_silently_lost(tmp_path: Path) -> None:
@@ -204,5 +201,5 @@ def test_textless_office_documents_are_rejected(tmp_path: Path, suffix: str) -> 
     else:
         document = Document()
     document.save(str(path))
-    with pytest.raises(ValueError, match="未提取到可用文字"):
+    with pytest.raises(ValueError, match="未提取到可用内容"):
         parse_document(path, path.name)

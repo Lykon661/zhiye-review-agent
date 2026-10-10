@@ -88,8 +88,13 @@ async function prepare() {
     if (panel) layoutObserver.observe(panel)
     if (main) layoutObserver.observe(main)
   }
+  await nextTick()
+  if (mounted && previous.value && headings.value.length) {
+    jump(previous.value.heading, previous.value.offset, 'auto')
+  }
 }
 function savePosition() {
+  if (previous.value) return
   const root = body.value
   if (!root || !headings.value.length || root.getBoundingClientRect().top > 160 || root.getBoundingClientRect().bottom < 80) return
   let index = 0
@@ -107,7 +112,7 @@ function scroll() {
   if (timer) clearTimeout(timer)
   timer = setTimeout(savePosition, 300)
 }
-function jump(index: number, offset = 0) {
+function jump(index: number, offset = 0, behavior: ScrollBehavior = 'smooth') {
   const targetIndex = Math.min(Math.max(0, index), headings.value.length - 1)
   const heading = headings.value[targetIndex]
   if (!heading) return
@@ -118,7 +123,7 @@ function jump(index: number, offset = 0) {
   const span = next ? next.element.getBoundingClientRect().top - heading.element.getBoundingClientRect().top
     : (body.value?.getBoundingClientRect().bottom || 0) - heading.element.getBoundingClientRect().top
   const bounded = Math.min(Math.max(0, offset), Math.max(0, span - 60))
-  window.scrollTo({ top: Math.max(0, window.scrollY + heading.element.getBoundingClientRect().top + bounded - 24), behavior: 'smooth' })
+  window.scrollTo({ top: Math.max(0, window.scrollY + heading.element.getBoundingClientRect().top + bounded - 24), behavior })
   previous.value = null
   tocOpen.value = false
 }
@@ -198,8 +203,7 @@ onBeforeUnmount(() => {
     <div class="notes-body">
       <div class="notes-reading-tools">
         <button v-if="tocEntries.length && !tocDocked" type="button" class="text-button" :aria-expanded="tocOpen" @click="tocOpen = !tocOpen">章节目录</button>
-        <button v-if="previous && headings.length" type="button" class="text-button" @click="jump(previous.heading, previous.offset)">继续上次阅读 · {{ previous.title }}</button>
-        <span class="muted">阅读位置自动保存 · 选中文字可解释这段</span>
+        <span class="muted">自动继续上次阅读 · 阅读位置自动保存 · 选中文字可解释这段</span>
       </div>
       <div v-if="selected || selectionError" class="notes-selection" role="status">
         <template v-if="selected"><span>已选择：{{ selected.selected_text.slice(0, 90) }}{{ selected.selected_text.length > 90 ? '…' : '' }}</span><button type="button" class="button subtle" :disabled="discussionBusy" @mousedown.prevent @click="explain">解释这段</button></template>
