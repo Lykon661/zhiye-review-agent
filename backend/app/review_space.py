@@ -20,7 +20,7 @@ from .prompt_budget import InputBudget, estimate_tokens, paragraphs_excerpt
 from .token_usage import TokenUsage, collect_usage
 
 logger = logging.getLogger(__name__)
-SOURCE_POLICY = "page_section_coverage_v3"
+SOURCE_POLICY = "granite_int8_review_note_terms_v8"
 PLAN = """[TASK:REVIEW_SPACE_PLAN]
 你是聊天式复习助手。依据用户最新消息、对话上下文和课程资料，决定怎样回答。
 默认通过对话讲解、梳理知识点、回答追问，也可以自然地提一个简短理解问题。不强制诊断、不强制做题、不自动结束对话。
@@ -39,6 +39,7 @@ generate_question：按用户最新出题要求生成练习，topic 可以是新
 严格遵守用户要求的主题、题型、数量、难度与附加条件；不能把“给我三道栈的简答题”替换成刚才讨论的树的单选题。用户明确要求生成新题时使用 generate_question，不拿已有题代替。
 explain：依据已检索的课程资料和补充网页讲解 topic，它会等待用户阅读和反馈。
 generate_question/explain 的 knowledge_source=materials 表示只用已检索依据；课程资料不足但你已有相关知识时，使用 knowledge_source=model，允许自身知识补充，系统会标明模型知识补充。不要求先联网。
+用户要求仅依据课程资料/原文时，必须使用 materials；资料不足也用 explain 说明本轮证据不足，不改用 model 或联网补充。无依据的说明也是有效回答。
 finish：仅在最新用户消息明确表示结束本次复习时使用，不要求先做题。普通总结请求使用 explain，整理后仍可继续聊天。
 依据用户反馈调整讲法，不固定执行“讲解→出题→总结”。用户要求做题时，可结合其薄弱点选难度；
 用户要求一批题时，只依次展示这批已要求的题目，做完后回到对话；不擅自追加新题。用户随时可以改为聊天。用提示或看过答案后答对不能当作独立掌握；同一原题重做不算新变式。
@@ -64,7 +65,9 @@ dialogue 只用于理解用户卡点，不是事实依据；普通总结请求�
 优先依据 materials 实际提供的课程原文。knowledge_source=model 时可以用自身已有知识补充，但不能声称来自课程或已经联网；不确定时说明缺口，不编造事实、引用或链接。
 course_chapters 只提供课程结构和术语，不是具体知识的证据；检索到部分资料时不能声称已经覆盖整门课。
 search_scope.mode=all_chapters 表示全部章节；selected_chapters 表示用户选定的章节，course_chapters 仅列出该范围内的章节。限定章节时只说明该范围内的原文依据与缺项，可建议扩大范围，不能断言范围外的课件缺失或未上传。历史对话中的原文不能冒充本轮所选范围的检索证据。
+search_scope.chapter_ids 和 chapters 是本轮完整选择；documents 是该范围内的文件。不能根据最后一章、某个文件或检索命中多少推断用户只选了该文件；materials 中各文件均来自本轮允许范围。
 requested_topics/ requested_facets 是本轮要覆盖的范围；coverage_gaps 表示经过检索或上下文裁剪后仍缺少明确原文依据的部分。对应格子说明本次原文依据不足，不编造课程结论、不要求用户重贴已经上传的课件。
+scope_incomplete 为真表示课程范围规划有省略或失败，本轮主题清单可能不完整，应说明此限制，不能声称已列举全部类型。
 title 和 locator 定位整页/小节；text 是回读的相关父级原文。excerpted 为真表示仅保留了部分原文段落，不能声称读过全部。
 course_materials 是已上传文件清单，不是内容证据。检索片段缺失不等于用户未提供文件，不要求用户贴出已经上传并就绪的课件；直接说明当前原文证据的具体缺口。
 materials[].context 是同一页/幻灯片的其他原文块，各有独立来源位置，可结合标题和正文理解。truncated、omitted_materials、omitted_context 表示上下文预算裁剪，不是资料不存在。
@@ -80,6 +83,22 @@ content_kind=search_snippet 只有搜索结果摘要，不能声称读过整页�
 
 class Cancelled(Exception):
     pass
+
+
+class GenerationFailed(StructuredOutputError):
+    """The bounded repair already ran; do not restart it in the planner."""
+
+
+def materials_only_request(text, history=()):
+    for request in [text, *reversed(history)]:
+        if re.search(r"(?<!不)(?<!未)(?:允许|可以|可用|同意)(?:用|使用)?(?:模型|自身|通用|外部)(?:知识)?补充|(?<!不)允许联网补充", request):
+            return False
+        if re.search(
+            r"(?:只|仅|严格)(?:根据|依据|用|使用|给出|填)[^。！？\n]{0,100}(?:课程|课件|资料|原文|依据)"
+            r"|(?:资料|课件|原文)[^。！？\n]{0,40}(?:未写|未讲|没写)[^。！？\n]{0,30}不要猜"
+            r"|\b(?:only|solely)\b[^.\n]{0,80}\b(?:materials|slides|sources)\b", request, re.I):
+            return True
+    return False
 
 
 class ReviewSpaceService:
@@ -610,6 +629,8 @@ class ReviewSpaceService:
         evidence = self._evidence(sources)
         budget = InputBudget(self.s.model_config.snapshot())
         payload["omitted_materials"] = len(evidence)
+        if report:
+            payload["scope_incomplete"] = bool(report.get("omitted_catalog_titles", 0))
         while len(payload.get("dialogue", [])) > 3:
             payload["dialogue"].pop(0)
         # Optional directory/history must not consume the room reserved for
@@ -755,7 +776,7 @@ class ReviewSpaceService:
         if not retrieved:
             # A narrower follow-up topic may differ from the last search topic.
             # Use the same hybrid retrieval here too, never keyword-only failure.
-            retrieved = self._course_sources(value, topic)
+            retrieved = self._course_sources(value, topic, request=requirements)
         local = [{**s, "id": s["chunk_id"]} for s in retrieved]
         local = list({s["id"]: s for s in [*local, *(s for pool in context["pools"] for s in pool)]}.values())
         pool = self._evidence(local + [s for s in supplemental_sources if s.get("kind") == "web"])
@@ -774,9 +795,14 @@ class ReviewSpaceService:
         used = self._pack_materials(rules, payload, pool)
         if pool and not used:
             raise StructuredOutputError("当前模型上下文不足，请缩小复习目标")
+        # Only these short, supplied IDs are promoted back to real sources.
+        for index, (material, source) in enumerate(zip(payload["materials"], used)):
+            material["id"] = source["citation_id"] = "M" + str(index)
+            material.pop("source_id", None)
         for retry in range(2):
             try:
-                question = self.p.generated._question(self._json(rules, payload), request, topic, previous, used)
+                attempt = self._json(rules, payload)
+                question = self.p.generated._question(attempt, request, topic, previous, used)
                 if not question["resolution"]["sources"] and not allow_model_knowledge:
                     raise StructuredOutputError("生成题目没有提供可核对的资料依据")
                 if allow_model_knowledge:
@@ -791,20 +817,24 @@ class ReviewSpaceService:
                 return question
             except StructuredOutputError as exc:
                 if retry:
-                    raise
+                    raise GenerationFailed("出题及一次修复后仍未通过校验：" + str(exc)) from exc
                 rules += "\n上次校验未通过：" + str(exc) + "。请纠正并返回完整 JSON。"
+                if "attempt" in locals():
+                    payload["previous_output"] = attempt
+                payload["allowed_source_ids"] = [m["id"] for m in payload["materials"]]
                 while payload["materials"] and self._prompt_size(rules, payload) > self._budget():
                     payload["materials"].pop()
                     used.pop()
+                payload["allowed_source_ids"] = [m["id"] for m in payload["materials"]]
                 if not used and not allow_model_knowledge:
-                    raise
+                    raise GenerationFailed("当前上下文预算无法保留修复出题所需的课程依据：" + str(exc)) from exc
 
     def _course_sources(self, value, query, *, overview=False, queries=None, overview_topic=None,
-                        request="", with_report=False, prior_report=None):
+                        request="", with_report=False):
         target = retrieval_topic(overview_topic if overview and overview_topic else query) or query
         seeds = [query, *(queries or [])] if normalize(target) != normalize(query) else queries
         hits, report = self.s.knowledge.retrieve(value.course_id, target, request=request,
-            overview=overview, queries=seeds, prior_report=prior_report, chapter_ids=value.state.get("chapter_ids", []))
+            overview=overview, queries=seeds, chapter_ids=value.state.get("chapter_ids", []))
         return (hits, report) if with_report else hits
 
     @staticmethod
@@ -820,6 +850,7 @@ class ReviewSpaceService:
         result["material_summary"] = {"source_count": len(sources),
             "local_count": sum(s.get("kind") != "web" for s in sources),
             "web_count": sum(s.get("kind") == "web" for s in sources),
+            "scope_incomplete": bool(report.get("omitted_catalog_titles", 0)),
             "coverage": self._coverage_summary(report.get("coverage", []))}
         for observation in result.get("observations", []):
             if observation.get("action") == "search_materials":
@@ -885,7 +916,12 @@ class ReviewSpaceService:
     def _explanation_context(self, value, topic, payload, course_name, course_materials, sources, report,
                              knowledge_source="materials"):
         explanation = {"goal": value.goal[:400], "topic": topic, "feedback": payload["feedback"],
-            "search_scope": {"mode": "selected_chapters" if value.state.get("chapter_ids") else "all_chapters"},
+            "search_scope": {"mode": "selected_chapters" if value.state.get("chapter_ids") else "all_chapters",
+                "chapter_ids": list(value.state.get("chapter_ids", [])),
+                "chapters": list(value.state.get("chapters", [])),
+                "documents": [d["filename"] for d in course_materials],
+                "document_count": payload.get("course_material_status", {}).get("count", len(course_materials)),
+                "omitted_documents": max(0, payload.get("course_material_status", {}).get("count", len(course_materials)) - len(course_materials))},
             "course": course_name, "course_chapters": deepcopy(payload["course_chapters"]),
             "course_materials": deepcopy(course_materials),
             "requested_topics": report.get("topics", []), "requested_facets": report.get("facets", []),
@@ -1018,6 +1054,11 @@ class ReviewSpaceService:
                 topic = str(plan.get("topic") or value.goal).strip()[:200]
                 difficulty = str(plan.get("difficulty", "basic"))
                 knowledge_source = str(plan.get("knowledge_source", "materials"))
+                materials_only = materials_only_request(payload["feedback"],
+                    [value.goal, *(m["content"] for m in history if m["role"] == "user")])
+                if materials_only:
+                    knowledge_source = "materials"
+                    sources = [s for s in sources if s.get("kind") != "web"]
                 kind = str(plan.get("question_type", "single_choice"))
                 count = plan.get("count", 1)
                 with self.s.lock, self.s.sessions() as db:
@@ -1067,7 +1108,7 @@ class ReviewSpaceService:
                         same_topic = normalize(source_topic) == normalize(topic)
                         hits, source_report = self._course_sources(value, query, queries=queries,
                             overview=overview, overview_topic=topic, request=payload["feedback"],
-                            with_report=True, prior_report=source_report if same_topic else None)
+                            with_report=True)
                         retained = sources if same_topic and not overview else [s for s in sources if same_topic and s.get("kind") == "web"]
                         sources = self._merge_sources(retained, hits)
                         source_overview = (overview and bool(hits)) or (same_topic and source_overview)
@@ -1087,6 +1128,8 @@ class ReviewSpaceService:
                             next_plan = {"action": "explain", "topic": topic, "knowledge_source": "materials",
                                 "reason": "请求明确，课程原文已覆盖所需主题和维度，直接讲解"}
                     elif action == "search_web":
+                        if materials_only:
+                            raise StructuredOutputError("用户要求仅依据课程原文，请用 explain 说明已找到的依据或本轮缺口")
                         if normalize(topic) not in course_search_topics:
                             raise StructuredOutputError("请先按当前 topic 查阅课程资料，再判断需要补充什么")
                         if web_count >= 2:
@@ -1133,7 +1176,8 @@ class ReviewSpaceService:
                     elif action == "explain":
                         if knowledge_source not in ("materials", "model"):
                             raise StructuredOutputError("knowledge_source 应为 materials 或 model")
-                        if (normalize(topic) not in course_search_topics or normalize(source_topic) != normalize(topic)
+                        same_request = source_report.get("request") == payload["feedback"]
+                        if ((not same_request and (normalize(topic) not in course_search_topics or normalize(source_topic) != normalize(topic)))
                                 or (overview and (not source_overview or source_report.get("request") != payload["feedback"]))):
                             # A reworded topic must not burn another planner turn.
                             # Fetch its own evidence instead of rejecting the reply.
@@ -1145,13 +1189,14 @@ class ReviewSpaceService:
                             source_topic = topic
                             source_overview = overview
                             course_search_topics.add(normalize(topic))
-                        if not sources and knowledge_source != "model":
-                            raise StructuredOutputError("暂无检索依据，已有相关知识时可使用 knowledge_source=model，不确定时才联网兜底")
                         source_report["planner"] = deepcopy(planning)
                         explanation, used = self._explanation_context(value, topic, payload, course_name,
                             course_materials, sources, source_report, knowledge_source)
-                        content = self.s.llm.complete_markdown([{"role": "system", "content": EXPLAIN},
-                            {"role": "user", "content": json.dumps(explanation, ensure_ascii=False)}])
+                        if not used and knowledge_source == "materials":
+                            content = "本轮未找到支持这个问题的课程原文依据，无法据此给出结论或规定。这不表示全部课程资料都没有相关内容。"
+                        else:
+                            content = self.s.llm.complete_markdown([{"role": "system", "content": EXPLAIN},
+                                {"role": "user", "content": json.dumps(explanation, ensure_ascii=False)}])
                         if not content.strip() or len(content) > 12000:
                             raise StructuredOutputError("讲解为空或过长，请缩小范围")
                         web = [s for s in used if s.get("kind") == "web"]
@@ -1173,6 +1218,14 @@ class ReviewSpaceService:
                     # Only completed actions count as duplicates. A failed explain
                     # can be retried after retrieval or corrected parameters.
                     executed.add(key)
+                except GenerationFailed as exc:
+                    with self.s.lock, self.s.sessions() as checkpoint:
+                        progress = self._check(checkpoint, identity, token)
+                        trace = deepcopy(progress.state["trace"])
+                        trace[-1]["result"] = "未完成：" + str(exc)[:300]
+                        progress.state = {**progress.state, "trace": trace}
+                        checkpoint.commit()
+                    raise
                 except (HTTPException, StructuredOutputError, ValueError) as exc:
                     result = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
                     observations.append({"action": action, "error": result[:400]})

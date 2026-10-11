@@ -20,7 +20,7 @@ from .chat_answers import ChatAnswerGrounding
 from .config import Settings
 from .file_chapters import chapter_role, document_role
 from .llm import ModelClient, ModelRuntimeError, model_failure_message
-from .models import AppMeta, Block, Chapter, ChatSession, Course, Document, Job, Message, Outline, PracticeQuestion, PracticeSet, ReviewSpace, new_id
+from .models import AppMeta, Block, Chapter, ChatSession, Course, Document, Job, Message, Outline, PracticeQuestion, PracticeSet, new_id
 from .model_images import image_resolution_current
 from .model_registry import ModelRegistryInput, ModelProbeInput, ProviderInput, OAuthAnswerInput, ModelRemovalInput, ProviderLogoutInput
 from .model_oauth import ModelOAuthManager
@@ -362,6 +362,7 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
             repair_courses = list(db.scalars(select(AppMeta.key).where(AppMeta.key.like("index_repair:%"))))
         return {"status": "ok", "llm_configured": bool(services.llm.configured),
                 "embedding_model": settings.embedding_model, "embedding_ready": services.retrieval.ready,
+                "embedding_index_compatible": services.retrieval.index_compatible,
                 "index_repair_courses": [key.split(":", 1)[1] for key in repair_courses]}
 
     @app.get("/system/model-config")

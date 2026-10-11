@@ -77,7 +77,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-tika.ps1
 | --- | --- |
 | 页面 | Vue 3、TypeScript、Vite；Markdown 与 KaTeX 渲染 |
 | 后端 | FastAPI、SQLAlchemy、SQLite |
-| 检索 | 本地 BGE Small ONNX 向量化、Chroma、关键词检索 |
+| 检索 | 本地 Granite 311M 多语言 INT8 ONNX 向量化、Chroma、关键词检索 |
 | 解析 | PDF / Office 解析器、RapidOCR、独立公式识别进程、Apache Tika |
 | Agent | HelloAgents 检索工具循环；复习空间根据对话选择检索与讲解，练习由用户选择；pi-ai 提供模型调用 |
 
@@ -104,6 +104,7 @@ docs/             使用说明与致谢
 ## 文档
 
 - [使用说明](docs/USAGE.md)：模型设置、资料管理、笔记与练习。
+- [数据结构课程评测](docs/EVALUATION.md)：固定题集、真实复习流程、证据覆盖与人工复核。
 - [致谢](docs/ACKNOWLEDGEMENTS.md)：学习资料、核心依赖与模型来源。
 
 ## 许可证

@@ -1,4 +1,3 @@
-import hashlib
 import json
 import logging
 from contextlib import contextmanager
@@ -17,7 +16,7 @@ from .memory import MemoryService
 from .models import AppMeta, Block, Chapter, ChatSession, Chunk, Course, Document, Job, Message, Outline, PracticeAnswerIndex, PracticeSet, RetrievalPassage, ReviewSpace, WrongQuestion, new_id
 from .parsing import parse_document
 from .practice_progress import answer_policy_current
-from .retrieval import RetrievalService
+from .retrieval import EMBEDDING_RUNTIME, RetrievalService
 from .retrieval_ranking import KnowledgeReranker
 from .knowledge_retrieval import KnowledgeRetrieval
 from .visual_recognition import VisualRecognizer
@@ -50,28 +49,32 @@ class Services:
         self.explanation_locks = {}
         self.memory = MemoryService(self)
         with self.sessions() as db:
+            # Retire the separate model-extracted glossary; review notes now supply names.
+            db.execute(delete(AppMeta).where(AppMeta.key.like("course_vocabulary:%")))
             model = db.get(AppMeta, "embedding_model")
-            if model and model.value != settings.embedding_model and db.scalar(select(Chunk.id).limit(1)):
-                raise ValueError("现有向量库使用另一向量模型。请使用新的 DATA_DIR 重新入库，避免混用向量。")
-            if model is None:
-                db.add(AppMeta(key="embedding_model", value=settings.embedding_model))
-            elif model.value != settings.embedding_model:
-                model.value = settings.embedding_model
-            if embedder is None:
-                runtime = db.get(AppMeta, "embedding_runtime")
-                runtime_name = "onnx-cls-fp32-v1"
-                if runtime is None or runtime.value != runtime_name:
-                    for course_id in set(db.scalars(select(Document.course_id).where(Document.status == "ready"))):
-                        key = "index_repair:" + course_id
-                        flag = db.get(AppMeta, key)
-                        if flag is None:
-                            db.add(AppMeta(key=key, value="rebuild_required"))
-                        else:
-                            flag.value = "rebuild_required"
-                    if runtime is None:
-                        db.add(AppMeta(key="embedding_runtime", value=runtime_name))
+            runtime = db.get(AppMeta, "embedding_runtime")
+            changed = (model is not None and model.value != settings.embedding_model) or (
+                embedder is None and (runtime is None or runtime.value != EMBEDDING_RUNTIME))
+            existing = model is not None or db.scalar(select(Chunk.id).limit(1)) is not None
+            if changed and existing:
+                # Keep the published model identity until a full replacement succeeds.
+                self.retrieval.index_compatible = False
+                for course_id in set(db.scalars(select(Document.course_id).where(Document.status == "ready"))):
+                    key = "index_repair:" + course_id
+                    flag = db.get(AppMeta, key)
+                    if flag is None:
+                        db.add(AppMeta(key=key, value="rebuild_required"))
                     else:
-                        runtime.value = runtime_name
+                        flag.value = "rebuild_required"
+                logger.warning("Embedding model/runtime changed; rebuild required before retrieval or ingestion")
+            else:
+                if model is None:
+                    db.add(AppMeta(key="embedding_model", value=settings.embedding_model))
+                if embedder is None:
+                    if runtime is None:
+                        db.add(AppMeta(key="embedding_runtime", value=EMBEDDING_RUNTIME))
+                    else:
+                        runtime.value = EMBEDDING_RUNTIME
             db.commit()
 
     def recover(self):
@@ -364,6 +367,13 @@ class Services:
                         db.add(AppMeta(key="vector_store_name", value=replacement.store_name))
                     else:
                         marker.value = replacement.store_name
+                    for key, value in (("embedding_model", self.settings.embedding_model),
+                                       ("embedding_runtime", EMBEDDING_RUNTIME)):
+                        marker = db.get(AppMeta, key)
+                        if marker is None:
+                            db.add(AppMeta(key=key, value=value))
+                        else:
+                            marker.value = value
                     for flag in db.scalars(select(AppMeta).where(AppMeta.key.like("index_repair:%"))):
                         db.delete(flag)
                     db.commit()
@@ -373,6 +383,7 @@ class Services:
                 self.retrieval.knowledge_collection = replacement.knowledge_collection
                 self.retrieval.store_dir = replacement.store_dir
                 self.retrieval.store_name = replacement.store_name
+                self.retrieval.index_compatible = True
                 replacement = None  # Ownership transferred to the live service.
                 try:
                     old_client.close()
@@ -398,6 +409,7 @@ class Services:
         # Only SQLite publication holds the global lock; OCR/model work does not.
         with self.ingest_lock:
             try:
+                self.retrieval.require_current_index()
                 with self.lock, self.sessions() as db:
                     doc = db.get(Document, document_id)
                     if not doc or doc.status != "queued":

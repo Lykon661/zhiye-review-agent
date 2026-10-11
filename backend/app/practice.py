@@ -616,19 +616,6 @@ answer_choices仅在明确上传答案可映射到选项时填写，否则空数
                 "answer_policy": ANSWER_POLICY, "source": "模型暂无法确定", "sources": sources,
                 "image_policy": IMAGE_INPUT_POLICY}
 
-    def _uploaded_resolution(self, answer, labels, q, filename):
-        keys = {o["key"] for o in q.options}
-        if q.question_type in CHOICE_TYPES:
-            labels = choices_from_text(answer, keys) or labels
-            if not labels:
-                value = self._json("只将给定的上传答案映射为原题选项，不自行解题或纠正上传答案。"
-                                   "返回 {\"choices\":[\"A\"]}；无法确定对应选项时返回空数组。",
-                                   {"question": {"stem": q.stem, "options": q.options}, "uploaded_answer": answer}, require_images=True)
-                labels = value.get("choices")
-        labels = self._labels(labels, keys, q.question_type)
-        return {"answer": answer, "choices": labels, "origin": "embedded", "source": filename, "sources": [],
-                "answer_policy": ANSWER_POLICY}
-
     def _resolve(self, q, doc, quick=False):
         if doc.kind == "generated":
             if q.resolution.get("generated") and answer_policy_current(q.resolution):
