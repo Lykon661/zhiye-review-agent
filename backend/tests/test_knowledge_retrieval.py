@@ -10,6 +10,7 @@ from sqlalchemy import delete, select
 from app.db import create_database
 from app.knowledge_retrieval import KnowledgeRetrieval
 from app.knowledge_index import KnowledgeIndex
+from app.lexical import query_terms
 from app.model_config import ModelConfig
 from app.models import Block, Chunk, Course, Document, RetrievalPassage, RetrievalUnit
 from app.prompt_budget import InputBudget
@@ -140,6 +141,8 @@ def test_existing_parsed_blocks_upgrade_once_without_replacing_original_chunks(t
             assert db.get(Block, "body").text == "Build a heap and sift down."
             unit = db.scalar(select(RetrievalUnit).where(RetrievalUnit.document_id == "d"))
             assert unit.title == "Heap Sort" and "sift down" in unit.text
+        catalog = index.catalog("c")
+        assert catalog[0]["text"] == unit.text
     finally:
         engine.dispose()
 
@@ -190,18 +193,22 @@ def test_quote_supported_source_counts_even_if_model_omits_topic_assignment():
     assert rows[0]["has_material"] and rows[0]["missing_facets"] == ["稳定性"]
 
 
-def test_named_comparison_scope_does_not_readd_every_sort_from_catalog():
-    catalog = [{"id": str(i), "title": name, "filename": "lecture.pptx"}
-               for i, name in enumerate(["Heap Sort", "Quick Sort", "Insertion Sort"])]
-    class ScopeLLM:
-        def complete(self, messages, json_mode=False):
-            return json.dumps({"topics": [{"name": c["title"], "queries": [c["title"]], "unit_ids": [c["id"]]}
-                                          for c in catalog], "facets": ["稳定性"]})
-    service = KnowledgeRetrieval(SimpleNamespace(retrieval=SimpleNamespace(), llm=ScopeLLM(), model_config=config_store()))
-    service._catalog = lambda *args: catalog
-    topics, facets, _ = service._scope("c", "排序算法", "只比较快排和堆排的稳定性", [], ["插入排序"], [])
+def scope_service(concepts, facets=(), incomplete=0):
+    vocabulary = SimpleNamespace(read=lambda *args: (concepts, list(facets), incomplete))
+    return KnowledgeRetrieval(SimpleNamespace(retrieval=SimpleNamespace(knowledge=SimpleNamespace(vocabulary=vocabulary))))
+
+
+def concept(name, aliases, parents=(), identity="p1"):
+    return {"name": name, "aliases": aliases, "parents": list(parents), "unit_ids": [identity]}
+
+
+def test_named_comparison_uses_course_aliases_without_model_or_unrelated_seeds():
+    concepts = [concept("Heap Sort", ["堆排", "堆排序"]), concept("Quick Sort", ["快排", "快速排序"]),
+                concept("Insertion Sort", ["插入排序"])]
+    service = scope_service(concepts, [concept("Stability", ["稳定性"])])
+    topics, facets, omitted = service._scope("c", "排序算法", "只比较快排和堆排的稳定性", [], ["插入排序"], [])
     assert {t["name"] for t in topics} == {"Heap Sort", "Quick Sort"}
-    assert facets == ["稳定性"]
+    assert facets == ["Stability"] and omitted == 0
 
 
 def test_prompt_coverage_does_not_claim_quotes_omitted_from_actual_input():
@@ -228,3 +235,43 @@ def test_configured_window_expands_input_budget_with_output_reserved():
     payload = {"materials": "课程知识" * 2000}
     assert not small.fits("Answer from originals.", payload)
     assert large.fits("Answer from originals.", payload)
+
+
+def test_scope_expands_course_relations_without_model_and_honors_exclusions():
+    concepts = [concept("Metabolism", ["药物代谢", "代谢反应"]),
+                concept("Oxidation", ["氧化反应"], ["Metabolism"]),
+                concept("Reduction", ["还原反应"], ["Metabolism"])]
+    service = scope_service(concepts)
+    topics, _, omitted = service._scope("c", "药物代谢", "列举所有代谢反应，不包括还原反应", [], [], ["one"])
+    assert {t["name"] for t in topics} == {"Metabolism", "Oxidation"} and omitted > 0
+
+
+def test_scope_does_not_infer_taxonomy_from_shared_words():
+    concepts = [concept("Sorting", ["排序"]), concept("Quick Sort", ["快排"], ["Sorting"]),
+                concept("Topological Sort", ["拓扑排序"])]
+    topics, _, _ = scope_service(concepts)._scope("c", "排序", "列举各种排序", [], [], [])
+    assert {t["name"] for t in topics} == {"Sorting", "Quick Sort"}
+
+
+def test_missing_vocabulary_preserves_query_and_discloses_incomplete_inventory():
+    topics, _, omitted = scope_service([], incomplete=1)._scope("c", "树", "列举所有树类型", [], [], ["one"])
+    assert topics == [{"name": "树", "queries": ["树"], "unit_ids": []}] and omitted > 0
+
+
+def test_failed_scope_is_disclosed_to_the_explanation():
+    service = ReviewSpaceService(SimpleNamespace(s=SimpleNamespace(model_config=config_store())))
+    payload = {"topic": "药物代谢", "materials": []}
+    service._pack_materials("Use supplied originals.", payload, [],
+                            {"omitted_catalog_titles": 1, "coverage": []})
+    assert payload["scope_incomplete"] is True
+
+
+def test_literal_terms_preserve_symbols_and_numeric_examples_without_translation():
+    question = "哈希碰撞：18 和 35 对表长 17 取模"
+    groups, semantic_query = query_terms(question)
+    assert {("18",), ("35",), ("17",)} <= set(groups)
+    assert not any("collision" in group for group in groups)
+    assert semantic_query == question
+    assert query_terms("B+tree、2-3 tree")[0][-2:] == [("b+tree",), ("2-3 tree",)]
+    assert query_terms("和弦")[0] == [("和弦",)]
+    assert query_terms("foo_bar and heap_sort")[0] == [("foo_bar",), ("heap_sort",)]

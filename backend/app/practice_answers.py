@@ -1,7 +1,6 @@
 """Prepare uploaded answers with local matching, short model requests and caching."""
 import json
 import logging
-import re
 from threading import Lock
 from time import monotonic
 

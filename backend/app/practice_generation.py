@@ -235,8 +235,14 @@ class PracticeGenerationService:
             raise StructuredOutputError("生成的题目重复，请重试")
         ids = value.get("source_ids", [])
         allowed = {source["id"]: source for source in sources}
-        if not isinstance(ids, list) or any(not isinstance(identity, str) or identity not in allowed for identity in ids):
-            raise StructuredOutputError("生成的资料引用无效，请重试")
+        aliases = {alias: source["id"] for source in sources for alias in
+                   (source.get("source_id"), "S" + source["id"], source.get("citation_id")) if alias}
+        if not isinstance(ids, list) or any(not isinstance(identity, str) for identity in ids):
+            raise StructuredOutputError("source_ids 必须为本次 materials.id 的字符串数组")
+        ids = [identity if identity in allowed else aliases.get(identity, identity) for identity in ids]
+        if any(identity not in allowed for identity in ids):
+            raise StructuredOutputError("生成的资料引用无效；只能使用本次 materials.id：" +
+                                        ", ".join(source.get("citation_id", source["id"]) for source in sources))
         used = [{"chunk_id": identity, "source_id": "S" + identity, **allowed[identity]} for identity in dict.fromkeys(ids)]
         topic = value.get("knowledge_point", target)
         if not isinstance(topic, str) or not topic.strip():

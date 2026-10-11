@@ -7,20 +7,22 @@ from threading import RLock
 
 from sqlalchemy import select
 
-from .config import ROOT, Settings
-from .models import AppMeta, Block, Chunk, Course, Document, Outline, RetrievalUnit
-from .lexical import query_terms, lexical_score, normalize
+from .config import DEFAULT_EMBEDDING_MODEL, ROOT, Settings
+from .models import AppMeta, Block, Chunk, Course, Document, RetrievalUnit
+from .lexical import query_terms, lexical_score
+from .course_vocabulary import alias_groups
 from .lexical_index import candidate_chunks
 from .knowledge_index import KnowledgeIndex
 
 logger = logging.getLogger(__name__)
 HNSW_FILES = {"header.bin", "data_level0.bin", "length.bin", "link_lists.bin"}
-ONNX_BGE_REPO = "Xenova/bge-small-zh-v1.5"
-ONNX_BGE_REVISION = "75c43b069aac4d136ba6bc1122f995fedcfd2781"
+ONNX_GRANITE_REVISION = "44399559930365213510b1ee2eb15ded83374f0e"
+ONNX_MODEL_FILE = "model_quint8_avx2.onnx"
+EMBEDDING_RUNTIME = f"granite-311m:{ONNX_GRANITE_REVISION}:onnx-quint8-avx2-cls-768-512-v1"
 ONNX_MODEL_FILES = [
-    "onnx/model.onnx", "onnx/model.onnx_data", "onnx/model.onnx.data",
+    "onnx/" + ONNX_MODEL_FILE,
     "config.json", "tokenizer.json", "tokenizer_config.json",
-    "special_tokens_map.json", "1_Pooling/config.json", "sentence_bert_config.json",
+    "special_tokens_map.json", "1_Pooling/config.json",
 ]
 
 
@@ -56,8 +58,8 @@ class LocalEmbedder:
         return self._model is not None
 
     def _model_source(self):
-        if self.settings.embedding_model in ("BAAI/bge-small-zh-v1.5", ONNX_BGE_REPO):
-            return ONNX_BGE_REPO, ONNX_BGE_REVISION
+        if self.settings.embedding_model == DEFAULT_EMBEDDING_MODEL:
+            return DEFAULT_EMBEDDING_MODEL, ONNX_GRANITE_REVISION
         return self.settings.embedding_model, None
 
     def _cache_folder(self):
@@ -68,7 +70,7 @@ class LocalEmbedder:
 
     @staticmethod
     def _model_file(folder):
-        for path in (folder / "onnx" / "model.onnx", folder / "model.onnx"):
+        for path in (folder / "onnx" / ONNX_MODEL_FILE, folder / ONNX_MODEL_FILE):
             if path.is_file():
                 return path
         return None
@@ -96,7 +98,7 @@ class LocalEmbedder:
             if snapshots.is_dir():
                 candidates.extend(sorted((path for path in snapshots.iterdir() if path.is_dir()), key=lambda path: path.stat().st_mtime, reverse=True))
         for path in candidates:
-            required = ("config.json", "tokenizer.json")
+            required = ("config.json", "tokenizer.json", "1_Pooling/config.json")
             if not all((path / name).is_file() for name in required):
                 continue
             if self._model_file(path) is None:
@@ -122,39 +124,35 @@ class LocalEmbedder:
             if self._model is None:
                 if self.settings.embedding_device != "cpu":
                     raise ValueError("当前 ONNX 向量模型使用 CPU，请设置 EMBEDDING_DEVICE=cpu。")
-                from tokenizers import Tokenizer, normalizers
+                from tokenizers import Tokenizer
                 import onnxruntime as ort
                 folder = self.prepare_model()
                 model_file = self._model_file(folder)
                 if model_file is None:
-                    raise ValueError("向量模型目录缺少非量化 ONNX 文件 onnx/model.onnx。")
+                    raise ValueError("向量模型目录缺少 Granite INT8 文件 onnx/" + ONNX_MODEL_FILE + "。")
                 config = json.loads((folder / "config.json").read_text(encoding="utf-8"))
-                if config.get("model_type") != "bert" or config.get("hidden_size") != 512:
-                    raise ValueError("当前向量运行器仅支持 512 维 BGE Small BERT 模型。")
+                if config.get("model_type") != "modernbert" or config.get("hidden_size") != 768:
+                    raise ValueError("当前向量运行器要求 768 维 Granite 311M ModernBERT 模型。")
+                pooling = json.loads((folder / "1_Pooling" / "config.json").read_text(encoding="utf-8"))
+                if not pooling.get("pooling_mode_cls_token") or pooling.get("pooling_mode_mean_tokens"):
+                    raise ValueError("Granite 311M 向量模型必须使用 CLS pooling。")
                 token_config_file = folder / "tokenizer_config.json"
                 token_config = json.loads(token_config_file.read_text(encoding="utf-8")) if token_config_file.is_file() else {}
-                sentence_config_file = folder / "sentence_bert_config.json"
-                sentence_config = json.loads(sentence_config_file.read_text(encoding="utf-8")) if sentence_config_file.is_file() else {}
-                lowercase = sentence_config.get("do_lower_case", self.settings.embedding_model in (
-                    "BAAI/bge-small-zh-v1.5", ONNX_BGE_REPO,
-                ))
                 counter = Tokenizer.from_file(str(folder / "tokenizer.json"))
                 counter.no_truncation()
                 counter.no_padding()
                 batch_tokenizer = Tokenizer.from_file(str(folder / "tokenizer.json"))
-                if lowercase:
-                    for tokenizer in (counter, batch_tokenizer):
-                        sequence = [normalizers.Lowercase()]
-                        if tokenizer.normalizer is not None:
-                            sequence.append(tokenizer.normalizer)
-                        tokenizer.normalizer = normalizers.Sequence(sequence)
+                # Preserve the official <bos> post-processor and case-sensitive vocabulary.
                 batch_tokenizer.enable_truncation(max_length=512, direction="right")
                 if token_config.get("padding_side", "right") != "right":
-                    raise ValueError("当前 BGE CLS 运行器要求右侧 padding。")
+                    raise ValueError("当前 Granite CLS 运行器要求右侧 padding。")
                 batch_tokenizer.enable_padding(
                     direction="right",
-                    pad_id=config.get("pad_token_id", 0), pad_token="[PAD]",
+                    pad_id=config.get("pad_token_id", 0), pad_token=token_config.get("pad_token", "<pad>"),
                 )
+                bos = batch_tokenizer.encode("Granite", add_special_tokens=True).ids
+                if not bos or bos[0] != config.get("cls_token_id", 2):
+                    raise ValueError("Granite tokenizer 缺少用于 CLS pooling 的 <bos> 标记。")
                 # Counting chunks must never inherit inference truncation or padding.
                 model = ort.InferenceSession(str(model_file), providers=["CPUExecutionProvider"])
                 if "last_hidden_state" not in {item.name for item in model.get_outputs()}:
@@ -162,7 +160,7 @@ class LocalEmbedder:
                 self._tokenizer = _ChunkTokenizer(counter)
                 self._batch_tokenizer = batch_tokenizer
                 self._model = model
-                logger.info("Embedding loaded with ONNX Runtime (CPU, FP32)")
+                logger.info("Granite 311M embedding loaded with ONNX Runtime (CPU, INT8, 768 dimensions)")
         return self._model
 
     @property
@@ -174,14 +172,12 @@ class LocalEmbedder:
     def embed(self, texts: list[str], query: bool = False) -> list[list[float]]:
         if not texts:
             return []
-        if query and "bge" in self.settings.embedding_model.lower():
-            texts = ["为这个句子生成表示以用于检索相关文章：" + text for text in texts]
         with self._lock:
             import numpy as np
             model = self._load()
             vectors = []
-            for offset in range(0, len(texts), 16):
-                encoded = self._batch_tokenizer.encode_batch(texts[offset:offset + 16])
+            for offset in range(0, len(texts), 8):
+                encoded = self._batch_tokenizer.encode_batch(texts[offset:offset + 8])
                 values = {
                     "input_ids": [item.ids for item in encoded],
                     "attention_mask": [item.attention_mask for item in encoded],
@@ -194,9 +190,9 @@ class LocalEmbedder:
                     dtype = np.int64 if item.type == "tensor(int64)" else np.int32
                     inputs[item.name] = np.asarray(values[item.name], dtype=dtype)
                 hidden = model.run(["last_hidden_state"], inputs)[0]
-                if hidden.ndim != 3 or hidden.shape[0] != len(encoded) or hidden.shape[2] != 512:
-                    raise ValueError("ONNX 模型输出维度不符合 512 维 BGE 格式。")
-                # BGE Small uses the CLS token, not mean pooling over all tokens.
+                if hidden.ndim != 3 or hidden.shape[0] != len(encoded) or hidden.shape[2] != 768:
+                    raise ValueError("ONNX 模型输出维度不符合 768 维 Granite 格式。")
+                # Granite uses the leading <bos> token as CLS for both queries and documents.
                 batch = np.asarray(hidden[:, 0, :], dtype=np.float32)
                 norms = np.linalg.norm(batch, axis=1, keepdims=True)
                 batch = batch / np.maximum(norms, np.finfo(np.float32).tiny)
@@ -221,6 +217,11 @@ class RetrievalService:
         self._open_store()
         self.knowledge = KnowledgeIndex(self)
         self.reranker = None
+        self.index_compatible = True
+
+    def require_current_index(self):
+        if not self.index_compatible:
+            raise ValueError("检索模型已更换，索引需要重建，请点击“重新建立索引”。")
 
     def _open_store(self):
         import chromadb
@@ -282,6 +283,7 @@ class RetrievalService:
         return bool(getattr(self.embedder, "ready", True))
 
     def index_document(self, document: Document, blocks: list[Block], chunks: list[Chunk]):
+        self.require_current_index()
         by_id = {b.id: b for b in blocks}
         # Model downloads/inference must not hold the index lock: API mutations
         # sometimes take that lock while holding the business-data lock.
@@ -366,70 +368,12 @@ class RetrievalService:
                                   and (doc.kind == "exam" or b.chapter_id == block.chapter_id)]
         return source
 
-    def overview_queries(self, course_id: str, query: str, limit: int = 12):
-        """Discover child terms from this course's headings, never from a syllabus guess.
-
-        PPT body shapes often omit the algorithm name present in their title.
-        Find relevant documents first, then use their actual titles as separate
-        hybrid queries. Aliases here translate names; they do not supply facts.
-        """
-        limit = max(1, min(limit, 12))
-        with self.sessions() as db:
-            course = db.get(Course, course_id)
-            if course is None:
-                return []
-            notes = db.scalar(select(Outline.markdown).where(
-                Outline.course_id == course_id, Outline.status == "completed", Outline.version == course.version,
-            ).order_by(Outline.created_at.desc()).limit(1)) or ""
-            groups, _ = query_terms(query, notes)
-            if not groups:
-                return []
-            documents = list(db.scalars(select(Document).where(
-                Document.course_id == course_id, Document.status == "ready", Document.kind.in_(["lecture", "note"]),
-            ).order_by(Document.filename, Document.id)))
-            relevant = {doc.id for doc in documents if lexical_score(doc.filename, groups)}
-            # A topic need not appear in the filename. Look up literal matches
-            # through the same transactional keyword index as normal retrieval.
-            statement = select(Chunk.document_id, Chunk.text).join(Document, Chunk.document_id == Document.id).where(
-                Document.course_id == course_id, Document.status == "ready", Document.kind.in_(["lecture", "note"]),
-            )
-            candidates = candidate_chunks(db, groups)
-            if candidates is not None:
-                statement = statement.where(Chunk.id.in_(candidates))
-            for document_id, text in db.execute(statement):
-                if document_id not in relevant and lexical_score(text, groups):
-                    relevant.add(document_id)
-            if not relevant:
-                return []
-            blocks = db.scalars(select(Block).join(Document, Block.document_id == Document.id).where(
-                Block.document_id.in_(relevant),
-            ).order_by(Document.filename, Block.order, Block.id))
-            queries, seen = [], {normalize(query)}
-            for block in blocks:
-                title = (block.heading or block.text).strip()
-                if not title or len(title) > 100 or "\n" in title:
-                    continue
-                terms, _ = query_terms(title, notes)
-                # Translated subtopic names are reliable automatic query seeds.
-                # For other vocabulary retain actual topic-bearing headings;
-                # the planner can supply additional queries for arbitrary fields.
-                child = next((group for group in terms if group not in groups and len(group) > 1), None)
-                seed = child[0] if child else title if lexical_score(title, groups) else ""
-                if not seed or (child is None and terms == groups):
-                    continue
-                key = normalize(seed)
-                if key not in seen:
-                    queries.append(seed)
-                    seen.add(key)
-                    if len(queries) == limit:
-                        break
-            return queries
-
     def search(self, course_id: str, query: str, kind: str = "material", chapter_id: str | None = None,
                year: int | None = None, limit: int = 5, expand: bool = True, prefer_summary: bool = False,
                rerank: bool = True, candidate_limit: int = 60):
         if not query.strip():
             return []
+        self.require_current_index()
         limit = max(1, min(limit, 20))
         if kind == "exam":
             return self._search_chunks(course_id, query, "exam", chapter_id, year, limit, expand)
@@ -451,19 +395,18 @@ class RetrievalService:
                        limit=5, expand=True, prefer_summary=False):
         if not query.strip():
             return []
+        self.require_current_index()
         limit = max(1, min(limit, 20))
         pool_size = max(20, limit * 4)
         material_kinds = ["exam"] if kind == "exam" else ["exercise", "answer"] if kind == "supplement" else ["lecture", "note", "exercise", "answer"]
+        concepts, facets, _ = self.knowledge.vocabulary.read(course_id, [chapter_id] if chapter_id else [])
         with self.sessions() as db:
             if db.get(AppMeta, "index_repair:" + course_id):
                 raise ValueError("课程索引需要重建，请点击“重新建立索引”。")
             course = db.get(Course, course_id)
             if course is None:
                 return []
-            notes = db.scalar(select(Outline.markdown).where(
-                Outline.course_id == course_id, Outline.status == "completed", Outline.version == course.version,
-            ).order_by(Outline.created_at.desc()).limit(1)) or ""
-            groups, expanded_query = query_terms(query, notes)
+            groups, semantic_query = query_terms(query, alias_groups([*concepts, *facets]))
             statement = select(Chunk.id, Chunk.text).join(Block, Chunk.block_id == Block.id).join(Document, Chunk.document_id == Document.id).where(
                 Document.course_id == course_id, Document.status == "ready", Document.kind.in_(material_kinds),
             )
@@ -505,7 +448,7 @@ class RetrievalService:
         vector_hits = []
         if count:
             try:
-                vectors = self.embedder.embed([expanded_query], query=True)
+                vectors = self.embedder.embed([semantic_query], query=True)
             except Exception as exc:
                 if not lexical:
                     raise ValueError("本地向量模型无法加载，当前也未匹配到关键词；请检查模型是否完整下载及后端日志。") from exc

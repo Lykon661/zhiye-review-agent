@@ -7,7 +7,8 @@ from threading import RLock
 from sqlalchemy import delete, select
 
 from .lexical import lexical_score, query_terms
-from .models import AppMeta, Block, Course, Document, Outline, RetrievalPassage, RetrievalUnit
+from .course_vocabulary import CourseVocabulary, alias_groups
+from .models import AppMeta, Block, Course, Document, RetrievalUnit
 from .retrieval_lexical import ranked_unit_ids
 from .retrieval_units import UNIT_POLICY, build_units, document_signature
 
@@ -20,8 +21,11 @@ class KnowledgeIndex:
         self.build_lock = RLock()
         self.attempted = {}
         self.ensured = {}
+        self.vocabulary = CourseVocabulary(retrieval)
 
     def index_document(self, document, blocks, force=False):
+        if not getattr(self.r, "index_compatible", True):
+            raise ValueError("检索模型已更换，索引需要重建，请点击“重新建立索引”。")
         if document.kind not in ("lecture", "note") or not blocks:
             return
         signature = document_signature(blocks) + f":{document.kind}:{document.year}"
@@ -98,6 +102,8 @@ class KnowledgeIndex:
     def ensure(self, course_id):
         # Serialize automatic upgrades and ingestion. No reparsing, OCR or paid
         # generation runs here; this only derives indexes from saved Blocks.
+        if not getattr(self.r, "index_compatible", True):
+            raise ValueError("检索模型已更换，索引需要重建，请点击“重新建立索引”。")
         with self.build_lock:
             with self.r.sessions() as db:
                 course = db.get(Course, course_id)
@@ -120,15 +126,13 @@ class KnowledgeIndex:
                 raise ValueError("课程索引需要重建，请点击“重新建立索引”。")
         self.ensure(course_id)
         chapters = list(dict.fromkeys(chapter_ids or ([chapter_id] if chapter_id else [])))
+        concepts, facets, _ = self.vocabulary.read(course_id, chapters)
         limit = max(12, min(limit, 160))
         with self.r.sessions() as db:
             course = db.get(Course, course_id)
             if course is None:
                 return []
-            notes = db.scalar(select(Outline.markdown).where(Outline.course_id == course_id,
-                Outline.status == "completed", Outline.version == course.version).order_by(
-                    Outline.created_at.desc()).limit(1)) or ""
-            groups, expanded = query_terms(query, notes)
+            groups, semantic_query = query_terms(query, alias_groups([*concepts, *facets]))
             statement = select(RetrievalUnit).join(Document, RetrievalUnit.document_id == Document.id).where(
                 RetrievalUnit.course_id == course_id, Document.status == "ready", Document.kind.in_(["lecture", "note"]))
             if db.scalar(select(RetrievalUnit.id).join(Document).where(RetrievalUnit.course_id == course_id,
@@ -155,7 +159,7 @@ class KnowledgeIndex:
             clauses.append({"year": year})
         semantic = {}
         try:
-            vectors = self.r.embedder.embed([expanded], query=True)
+            vectors = self.r.embedder.embed([semantic_query], query=True)
             with self.r.lock:
                 count = self.r.knowledge_collection.count()
                 result = self.r.knowledge_collection.query(query_embeddings=vectors,
@@ -201,18 +205,6 @@ class KnowledgeIndex:
                         break
             return sources
 
-    def related_documents(self, course_id, query, chapter_ids=None):
-        groups, _ = query_terms(query)
-        with self.r.sessions() as db:
-            identities = ranked_unit_ids(db, course_id, groups, limit=2000, chapter_ids=chapter_ids)
-            statement = select(RetrievalUnit.document_id, RetrievalUnit.index_text).join(Document).where(
-                RetrievalUnit.course_id == course_id, Document.status == "ready", Document.kind.in_(["lecture", "note"]))
-            if identities is not None:
-                statement = statement.where(RetrievalUnit.id.in_(identities))
-            if chapter_ids:
-                statement = statement.where(RetrievalUnit.chapter_id.in_(chapter_ids))
-            return {identity for identity, body in db.execute(statement) if lexical_score(body, groups)}
-
     def catalog(self, course_id, document_ids=None, limit=240, chapter_ids=None):
         self.ensure(course_id)
         with self.r.sessions() as db:
@@ -225,12 +217,8 @@ class KnowledgeIndex:
                 statement = statement.where(RetrievalUnit.chapter_id.in_(chapter_ids))
             documents = OrderedDict()
             for identity, title, locator, filename, body in db.execute(statement.order_by(Document.filename, RetrievalUnit.position)):
-                # Names in the body also locate subtypes (e.g. B+ / 2-3 trees
-                # on a B-Trees slide). These hints never supply answer facts.
-                groups, _ = query_terms(body)
-                mentions = [group[0] for group in groups if len(group) > 1]
                 documents.setdefault(filename, []).append({"id": identity, "title": title, "filename": filename,
-                    "locator": locator, "mentioned_topics": mentions})
+                    "locator": locator, "text": body})
             # A long early file must not hide all titles from later lectures.
             items = [pool[offset] for offset in range(max((len(pool) for pool in documents.values()), default=0))
                      for pool in documents.values() if offset < len(pool)]

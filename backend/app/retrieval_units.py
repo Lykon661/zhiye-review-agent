@@ -87,7 +87,7 @@ def build_units(document, blocks, tokenizer=None):
         units.append(RetrievalUnit(id=identity, course_id=document.course_id, document_id=document.id,
             chapter_id=useful[0].chapter_id, unit_key=unit_key, position=position, title=title,
             text=body, index_text=prefix + body, block_ids=[b.id for b in useful], locator=locator))
-        # Leave room for the title in BGE's 512-token inference window. Titles
+        # Leave room for the title in the CPU runtime's 512-token window. Titles
         # and filenames contextualize every passage, not just the first one.
         prefix = f"标题：{title[:110]}\n资料：{document.filename[:90]}\n"
         while token_count(prefix, tokenizer) > 170:

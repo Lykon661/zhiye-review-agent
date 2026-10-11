@@ -26,7 +26,7 @@
 
 ## 向量模型
 
-默认向量模型为 [BAAI/bge-small-zh-v1.5](https://huggingface.co/BAAI/bge-small-zh-v1.5)。项目使用 [Xenova 提供的 ONNX 导出](https://huggingface.co/Xenova/bge-small-zh-v1.5)，固定快照为 `75c43b069aac4d136ba6bc1122f995fedcfd2781`，加载非量化 FP32 模型。
+默认向量模型为 [IBM Granite Embedding 311M Multilingual R2](https://huggingface.co/ibm-granite/granite-embedding-311m-multilingual-r2)。项目使用官方 `onnx/model_quint8_avx2.onnx` INT8 CPU 导出，固定快照为 `44399559930365213510b1ee2eb15ded83374f0e`，使用 768 维 CLS 向量并归一化。
 
 模型文件由运行环境下载，未放入本仓库。模型使用条件应查阅相应模型卡与许可证。
 

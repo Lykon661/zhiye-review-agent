@@ -79,7 +79,7 @@ def candidate_chunks(db, groups):
         for term in group:
             tokens = gram_tokens(term)
             if not tokens:
-                # Single-character aliases must not silently lose recall.
+                # Single-character terms must not silently lose recall.
                 return None
             # A subset is sufficient to filter; exact spelling, phrase order
             # and English word boundaries are checked by lexical_score later.
