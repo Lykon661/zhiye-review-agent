@@ -15,6 +15,7 @@ backend/tests/.parser-validation/
 frontend/node_modules/
 model-runtime/node_modules/
 frontend/dist/
+/dist/
 *.log
 
 # Local housekeeping reports; contain local data paths.
