@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import type { Block, Chapter, ChapterDraft, Document } from '../types'
-interface BlockGroup { document: Document; blocks: Block[] }
+import type { BlockReference, Chapter, ChapterDraft, Document } from '../types'
+interface BlockGroup { document: Document; blocks: BlockReference[] }
 const props = defineProps<{ chapters: Chapter[]; groups: BlockGroup[]; busy: boolean }>()
 type EditAction = 'rename' | 'merge'
 interface DragState { id: string; pointerId: number; startY: number; x: number; y: number; active: boolean; handle: HTMLElement }

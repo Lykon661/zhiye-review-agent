@@ -218,10 +218,12 @@ class MemoryService:
         for group in groups.values():
             events = group["events"]
             attempts = [e for e in events if isinstance(e.content.get("correct"), bool)]
-            latest = attempts[-1] if attempts else events[-1]
+            # Assisted successes remain recorded but cannot clear an earlier weakness.
+            assessed = [e for e in attempts if e.content.get("correct") is False or e.content.get("independent") is not False]
+            latest = assessed[-1] if assessed else events[-1]
             rows.append({"id": events[-1].id, "topic": group["topic"],
                          "status": ("needs_review" if latest.content.get("correct") is False else
-                                    "recent_correct" if latest.content.get("correct") is True else "discussed"),
+                                    "recent_correct" if latest.content.get("correct") is True and latest.content.get("independent") is not False else "discussed"),
                          "incorrect_count": sum(e.content.get("correct") is False for e in attempts),
                          "correct_count": sum(e.content.get("correct") is True for e in attempts),
                          "question_count": len({e.content.get("question_id") or e.source_key for e in attempts}),

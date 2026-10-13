@@ -1,12 +1,20 @@
 """Reuse bilingual review-note names locally; answers still require course originals."""
 from collections import OrderedDict
 from functools import lru_cache
+from hashlib import sha256
+import json
 import re
+from threading import RLock
 
 from sqlalchemy import select
+from sqlalchemy.orm import load_only
 
 from .lexical import normalize, term_pattern
-from .models import Course, Document, Outline, RetrievalUnit
+from .models import AppMeta, Course, Document, Outline, RetrievalUnit
+from .retrieval_units import UNIT_POLICY
+
+VOCABULARY_CACHE_KEY = "__course_vocabulary__"
+VOCABULARY_CACHE_POLICY = "review_note_terms_cache_v1"
 
 
 BILINGUAL = re.compile(
@@ -71,50 +79,99 @@ def chapter_notes(outline):
 class CourseVocabulary:
     def __init__(self, retrieval):
         self.r = retrieval
+        self.lock = RLock()
+
+    def _source_key(self, db, course_id):
+        # Index signatures detect lazy unit upgrades without rereading source bodies.
+        sources = [list(row) for row in db.execute(select(Document.id, AppMeta.value)
+            .outerjoin(AppMeta, AppMeta.key == "knowledge_units:" + Document.id)
+            .where(Document.course_id == course_id, Document.status == "ready",
+                   Document.kind.in_(["lecture", "note"]))
+            .order_by(Document.id))]
+        return sha256(json.dumps([UNIT_POLICY, self.r.store_name, sources],
+                                 ensure_ascii=False).encode()).hexdigest()
+
+    @staticmethod
+    def _merge(target, entries):
+        for entry in entries:
+            previous = target.setdefault(normalize(entry["name"]),
+                {"name": entry["name"], "aliases": [], "parents": [], "unit_ids": []})
+            for field in ("aliases", "unit_ids"):
+                previous[field] = list(dict.fromkeys([*previous[field], *entry[field]]))
+            self_names = {normalize(t) for t in previous["aliases"] + [previous["name"]]}
+            previous["parents"] = list(dict.fromkeys(p for p in [*previous["parents"], *entry["parents"]]
+                                                    if normalize(p) not in self_names))
+
+    def _build(self, db, outline):
+        statement = select(RetrievalUnit).join(Document).where(RetrievalUnit.course_id == outline.course_id,
+            Document.status == "ready", Document.kind.in_(["lecture", "note"]))
+        by_chapter = {}
+        for unit in db.scalars(statement.order_by(RetrievalUnit.position)):
+            by_chapter.setdefault(unit.chapter_id, []).append(unit)
+        notes, chapters = chapter_notes(outline), []
+        for chapter_id, units in by_chapter.items():
+            concepts, facets = OrderedDict(), OrderedDict()
+            originals = [(u, normalize(u.title + "\n" + u.text)) for u in units]
+            for entry in note_terms(notes.get(chapter_id, "")):
+                names = list(entry["names"])
+                # General plural variants are kept only when found in the originals.
+                variants = list(dict.fromkeys([*names, *(name + "s" for name in names)]))
+                patterns = [(t, re.compile(term_pattern(t))) for t in variants]
+                matched = [(u, text) for u, text in originals if any(p.search(text) for _, p in patterns)]
+                if not matched:
+                    continue
+                present = [t for t, pattern in patterns if any(pattern.search(text) for _, text in matched)]
+                self._merge(facets if entry["facet"] else concepts, [{"name": present[0],
+                    "aliases": list(dict.fromkeys([entry["chinese"], *names, *present])),
+                    "parents": list(entry["parents"]), "unit_ids": [u.id for u, _ in matched]}])
+            chapters.append({"chapter_id": chapter_id, "concepts": list(concepts.values()),
+                             "facets": list(facets.values()), "incomplete": int(not concepts and not facets)})
+        return chapters
+
+    def _prepare(self, db, outline):
+        key = self._source_key(db, outline.course_id)
+        cached = outline.chapter_results.get(VOCABULARY_CACHE_KEY)
+        if (isinstance(cached, dict) and cached.get("policy") == VOCABULARY_CACHE_POLICY
+                and cached.get("source_key") == key and isinstance(cached.get("chapters"), list)):
+            return cached
+        chapters = self._build(db, outline)
+        # A concurrently published index must not receive a cache of retired units.
+        if self._source_key(db, outline.course_id) != key:
+            return None
+        cached = {"policy": VOCABULARY_CACHE_POLICY, "source_key": key, "chapters": chapters}
+        outline.chapter_results = {**outline.chapter_results, VOCABULARY_CACHE_KEY: cached}
+        db.commit()
+        return cached
+
+    def prepare(self, outline_id):
+        """Persist original-checked terms before a generated note becomes completed."""
+        with self.lock, self.r.sessions() as db:
+            outline = db.get(Outline, outline_id)
+            if outline is None:
+                return
+            course = db.get(Course, outline.course_id)
+            if course is not None and course.version == outline.version:
+                self._prepare(db, outline)
 
     def read(self, course_id, chapter_ids=None):
         concepts, facets, incomplete = OrderedDict(), OrderedDict(), 0
-        with self.r.sessions() as db:
+        with self.lock, self.r.sessions() as db:
             course = db.get(Course, course_id)
             if course is None:
                 return [], [], 1
-            outline = db.scalar(select(Outline).where(Outline.course_id == course_id,
+            outline = db.scalar(select(Outline).options(load_only(Outline.id, Outline.course_id,
+                Outline.version, Outline.status, Outline.chapter_results)).where(Outline.course_id == course_id,
                 Outline.status == "completed", Outline.version == course.version)
                 .order_by(Outline.created_at.desc(), Outline.id.desc()).limit(1))
             if outline is None:
                 return [], [], 1
-            statement = select(RetrievalUnit).join(Document).where(RetrievalUnit.course_id == course_id,
-                Document.status == "ready", Document.kind.in_(["lecture", "note"]))
-            if chapter_ids:
-                statement = statement.where(RetrievalUnit.chapter_id.in_(chapter_ids))
-            by_chapter = {}
-            for unit in db.scalars(statement.order_by(RetrievalUnit.position)):
-                by_chapter.setdefault(unit.chapter_id, []).append(unit)
-            notes = chapter_notes(outline)
-            for chapter_id, units in by_chapter.items():
-                markdown = notes.get(chapter_id, "")
-                if not markdown:
-                    incomplete += 1
+            cached = self._prepare(db, outline)
+            if cached is None:
+                return [], [], 1
+            for chapter in cached["chapters"]:
+                if chapter_ids and chapter["chapter_id"] not in chapter_ids:
                     continue
-                found = False
-                originals = [(u, normalize(u.title + "\n" + u.text)) for u in units]
-                for entry in note_terms(markdown):
-                    names = list(entry["names"])
-                    # General plural variants are kept only when found in the originals.
-                    variants = list(dict.fromkeys([*names, *(name + "s" for name in names)]))
-                    patterns = [(t, re.compile(term_pattern(t))) for t in variants]
-                    matched = [(u, text) for u, text in originals if any(p.search(text) for _, p in patterns)]
-                    if not matched:
-                        continue
-                    found = True
-                    present = [t for t, pattern in patterns if any(pattern.search(text) for _, text in matched)]
-                    target = facets if entry["facet"] else concepts
-                    name = present[0]
-                    previous = target.setdefault(normalize(name), {"name": name, "aliases": [], "parents": [], "unit_ids": []})
-                    previous["aliases"] = list(dict.fromkeys([*previous["aliases"], entry["chinese"], *names, *present]))
-                    self_names = {normalize(t) for t in previous["aliases"] + [name]}
-                    previous["parents"] = list(dict.fromkeys([*previous["parents"],
-                        *(p for p in entry["parents"] if normalize(p) not in self_names)]))
-                    previous["unit_ids"] = list(dict.fromkeys([*previous["unit_ids"], *(u.id for u, _ in matched)]))
-                incomplete += int(not found)
+                self._merge(concepts, chapter["concepts"])
+                self._merge(facets, chapter["facets"])
+                incomplete += chapter["incomplete"]
         return list(concepts.values()), list(facets.values()), incomplete

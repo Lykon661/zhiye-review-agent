@@ -51,6 +51,7 @@ export interface Document {
   chapter_excluded?: boolean
 }
 export interface Block { id: string; document_id?: string; text: string; locator: Locator; chapter_id: string | null; heading: string | null; order: number }
+export interface BlockReference { id: string; document_id: string; chapter_id: string | null }
 export interface Chapter { id: string; title: string; position: number; confirmed: boolean; block_ids: string[]; block_count: number; kind?: 'knowledge' | 'support' | 'practice' }
 export interface ChapterDraft { id: string | null; title: string; position: number; block_ids: string[] }
 export interface Session { id: string; title: string; created_at: string }
@@ -161,7 +162,7 @@ export interface ReviewSpaceQuestion {
 }
 export interface ReviewSpaceStep {
   id: string; kind: 'question' | 'explanation'; topic: string; difficulty?: 'basic' | 'medium' | 'advanced'
-  reason: string; repeated?: boolean; question?: ReviewSpaceQuestion; content?: string; sources?: (Source | WebSource)[]
+  reason: string; repeated?: boolean; assisted?: boolean; question?: ReviewSpaceQuestion; content?: string; sources?: (Source | WebSource)[]
   batch_index?: number; batch_count?: number
   external_knowledge?: boolean; model_knowledge?: boolean; web_sources?: WebReference[]
   revealed?: boolean; revealed_answer?: Pick<PracticeAnswer, 'answer' | 'origin'>
@@ -179,6 +180,7 @@ export interface ReviewSpaceAttempt {
   external_knowledge?: boolean; model_knowledge?: boolean; web_sources?: WebReference[]
 }
 export interface ReviewSpaceSummary {
+  generation_progress?: { completed: number; total: number } | null
   id: string; course_id: string; goal: string; title: string; status: ReviewSpaceStatus
   revision: number; created_at: string; updated_at: string; stats: ReviewSpaceStats
   stage: string; error: string; stop_reason: string

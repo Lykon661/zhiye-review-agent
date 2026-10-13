@@ -15,14 +15,15 @@ export function createDraftPersistence<T>(options: Options<T>) {
   const latest = new Map<string, DraftSnapshot<T>>()
   const flights = new Set<Promise<boolean>>()
   let disposed = false
-  function read(scope: string): DraftSnapshot<T> | null {
+  function read(scope: string, pendingOnly = false): DraftSnapshot<T> | null {
     let stored: DraftSnapshot<T> | null = null
     try {
       const value = JSON.parse(localStorage.getItem(options.key(scope)) || 'null')
       stored = options.decode ? options.decode(value, scope) : value
       if (!stored || stored.scope !== scope || !Number.isSafeInteger(stored.revision) || stored.revision < 1 || !stored.value) stored = null
     } catch { /* Storage is optional; in-memory edits remain available. */ }
-    const memory = latest.get(scope)
+    const memory = pendingOnly ? pending.get(scope)?.snapshot : latest.get(scope)
+    if (pendingOnly && memory) return memory
     return memory && (!stored || memory.revision >= stored.revision) ? memory : stored
   }
   function forget(scope: string) {

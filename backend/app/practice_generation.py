@@ -9,7 +9,7 @@ from sqlalchemy import delete, select
 
 from .lexical import lexical_score, normalize, query_terms
 from .llm import ModelNotConfigured, StructuredOutputError, model_failure_message
-from .models import Block, Chapter, Course, Document, PracticeQuestion, PracticeSet, new_id, now
+from .models import AppMeta, Block, Chapter, Course, Document, PracticeQuestion, PracticeSet, new_id, now
 from .practice_progress import ANSWER_POLICY
 from .retrieval import source_locator
 
@@ -77,6 +77,40 @@ class PracticeGenerationService:
     def __init__(self, practice):
         self.p, self.s = practice, practice.s
 
+    def _checkpoint(self, db, document_id, request, version):
+        row = db.get(AppMeta, "practice_generation:" + document_id)
+        if row is None:
+            return None
+        try:
+            value = json.loads(row.value)
+        except ValueError:
+            return None
+        if (not isinstance(value, dict) or not isinstance(value.get("context"), dict)
+                or value.get("request") != request
+                or value.get("answer_policy") != ANSWER_POLICY
+                or value.get("context", {}).get("version") != version
+                or not isinstance(value.get("questions"), list)
+                or len(value["questions"]) > request["count"]):
+            return None
+        return value
+
+    def _save_checkpoint(self, db, document_id, request, context, questions):
+        key = "practice_generation:" + document_id
+        value = json.dumps({"request": request, "context": context, "questions": questions,
+                            "answer_policy": ANSWER_POLICY}, ensure_ascii=False)
+        row = db.get(AppMeta, key)
+        if row is None:
+            db.add(AppMeta(key=key, value=value))
+        else:
+            row.value = value
+
+    def _current_course(self, db, document_id, version):
+        doc = db.get(Document, document_id)
+        course = db.get(Course, doc.course_id) if doc else None
+        if course is None or course.version != version:
+            raise StructuredOutputError("课程资料在生题过程中已更新，请重试，以使用最新资料")
+        return course
+
     def _context(self, db, course_id, request):
         course = db.get(Course, course_id)
         if course is None:
@@ -142,7 +176,11 @@ class PracticeGenerationService:
         if not self.s.llm.configured:
             raise HTTPException(409, "请先在右上角配置模型，再使用 AI 生题")
         with self.s.lock, self.s.sessions() as db:
-            context = self._context(db, course_id, request)
+            course = db.get(Course, course_id)
+            saved = self._checkpoint(db, document_id, request, course.version) if document_id and course else None
+            # Keep the original weakness targets even if learning memory changed.
+            context = saved["context"] if saved else self._context(db, course_id, request)
+            questions = saved["questions"] if saved else []
             if db.scalar(select(PracticeSet.document_id).join(Document).where(
                     Document.course_id == course_id, Document.kind == "generated",
                     PracticeSet.status.in_(["queued", "processing"])).limit(1)):
@@ -167,7 +205,8 @@ class PracticeGenerationService:
                 if bank is None:
                     bank = PracticeSet(document_id=identity)
                     db.add(bank)
-                bank.signature, bank.status, bank.progress, bank.error = self.p._signature([]), "queued", 0, None
+                bank.signature, bank.status, bank.progress, bank.error = self.p._signature([]), "queued", len(questions) / request["count"], None
+                self._save_checkpoint(db, identity, request, context, questions)
                 # This internal request file also permits retry after a restart.
                 (self.s.upload_dir / (identity + ".json")).write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
                 db.commit()
@@ -188,7 +227,15 @@ class PracticeGenerationService:
             try:
                 request = json.loads((self.s.upload_dir / (doc.id + ".json")).read_text(encoding="utf-8"))
             except (OSError, ValueError) as exc:
-                raise HTTPException(409, "生题设置已丢失，请重新创建 AI 练习") from exc
+                # The database checkpoint also owns a copy of the settings;
+                # an interrupted request-file write must not discard saved work.
+                saved = db.get(AppMeta, "practice_generation:" + document_id)
+                try:
+                    request = json.loads(saved.value)["request"] if saved else None
+                except (ValueError, KeyError, TypeError):
+                    request = None
+                if not isinstance(request, dict):
+                    raise HTTPException(409, "生题设置已丢失，请重新创建 AI 练习") from exc
             course_id = doc.course_id
         self.start(course_id, request, tasks, document_id)
         return {"status": "queued"}
@@ -255,12 +302,16 @@ class PracticeGenerationService:
 
     def _generate(self, document_id, request, context, lock):
         try:
-            with self.s.sessions() as db:
+            with self.s.lock, self.s.sessions() as db:
+                self._current_course(db, document_id, context["version"])
+                saved = self._checkpoint(db, document_id, request, context["version"])
+                questions = saved["questions"] if saved else []
                 bank = db.get(PracticeSet, document_id)
                 bank.status = "processing"
                 db.commit()
-            questions = []
-            for index in range(request["count"]):
+            for index in range(len(questions), request["count"]):
+                with self.s.lock, self.s.sessions() as db:
+                    self._current_course(db, document_id, context["version"])
                 # A mixed set is a sequence of concrete tasks. The model never
                 # needs to guess whether "mixed" is a valid stored question type.
                 kind = QUESTION_TYPES[index % len(QUESTION_TYPES)] if request["question_type"] == "mixed" else request["question_type"]
@@ -303,22 +354,22 @@ class PracticeGenerationService:
                             used.pop()
                         while payload["previous"] and self.p._json_size(attempt_rules, payload) > self.p._budget():
                             payload["previous"].pop(0)
-                questions.append(question)
-                with self.s.sessions() as db:
+                with self.s.lock, self.s.sessions() as db:
+                    self._current_course(db, document_id, context["version"])
+                    self._save_checkpoint(db, document_id, request, context, [*questions, question])
                     bank = db.get(PracticeSet, document_id)
                     bank.progress = (index + 1) / request["count"]
                     db.commit()
+                questions.append(question)
             with self.s.lock, self.s.sessions() as db:
-                doc = db.get(Document, document_id)
-                course = db.get(Course, doc.course_id) if doc else None
-                if course is None or course.version != context["version"]:
-                    raise StructuredOutputError("课程资料在生题过程中已更新，请重试，以使用最新资料")
+                course = self._current_course(db, document_id, context["version"])
                 db.execute(delete(PracticeQuestion).where(PracticeQuestion.document_id == document_id))
                 for index, question in enumerate(questions):
                     db.add(PracticeQuestion(id=new_id(), document_id=document_id, position=index, number=str(index + 1),
                                            locator={"label": "AI 生成"}, resolution_version=course.version, **question))
                 bank = db.get(PracticeSet, document_id)
                 bank.status, bank.progress, bank.error = "ready", 1, None
+                db.execute(delete(AppMeta).where(AppMeta.key == "practice_generation:" + document_id))
                 db.commit()
         except Exception as exc:
             logger.exception("AI practice generation failed for %s", document_id)

@@ -332,6 +332,8 @@ class OutlineService:
                     db.commit()
             self._update(job_id, stage="正在汇总复习笔记", progress=98)
             markdown, coverage = self.render(snapshot, cached)
+            self._update(job_id, stage="正在准备课程术语表", progress=99)
+            self.services.retrieval.knowledge.vocabulary.prepare(outline_id)
             with self.services.lock, self.services.sessions() as db:
                 outline, job = db.get(Outline, outline_id), db.get(Job, job_id)
                 outline.markdown, outline.coverage, outline.status = markdown, coverage, "completed"
