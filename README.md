@@ -15,7 +15,11 @@
 - **错题本**：选择题作答不一致时自动收录，也可手动添加；保存题目、作答和已获取的解析。
 - **模型接入**：分别保存多个服务商连接与模型，支持 API Key 与模型订阅 OAuth 登录；按需切换模型，配置视觉与思考设置，也可接入本地免密钥服务。
 
-## 快速启动（Windows）
+## Windows 解压即用版
+
+在 [GitHub Releases](https://github.com/Lykon661/zhiye-review-agent/releases) 下载 `Zhiye-版本-windows-x64.zip`，完整解压后双击 **启动知页.cmd**。运行环境和本地识别模型包含在包内；模型问答仍需配置自己的模型服务。便携版页面地址为 `http://127.0.0.1:8000/`，用户数据保存在 `%LOCALAPPDATA%\Zhiye`。使用、升级与发布验证状态见 [便携版说明](docs/PORTABLE.md)。
+
+## 从源码启动（Windows）
 
 先安装以下工具，并确保命令可从终端调用：
 

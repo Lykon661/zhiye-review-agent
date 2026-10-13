@@ -93,7 +93,7 @@ class VisualRecognizer:
         try:
             if self.process is None or self.process.poll() is not None:
                 self.close()
-                executable = ROOT / "formula-worker" / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+                executable = Path(os.environ["FORMULA_PYTHON"]) if os.getenv("FORMULA_PYTHON") else ROOT / "formula-worker" / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
                 if not executable.is_file():
                     raise ValueError("公式识别环境未安装，请运行 scripts/setup.ps1。")
                 self.cache_dir.mkdir(parents=True, exist_ok=True)
