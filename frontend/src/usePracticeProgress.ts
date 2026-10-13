@@ -1,5 +1,5 @@
 import { ref } from 'vue'
-import { api } from './api'
+import { api, ApiError } from './api'
 import { createDraftPersistence, type DraftSnapshot } from './draftPersistence'
 import type { PracticeAnswer, PracticeQuestion } from './types'
 import { normalizePracticeAnswer } from './practiceAnswers'
@@ -32,11 +32,14 @@ export function usePracticeProgress() {
       const result = await api<{ revision: number }>(`/documents/${item.scope}/practice/progress`, {
         method: 'PUT', body: JSON.stringify(item.value), keepalive,
       })
-      if (result.revision < item.revision) throw new Error('进度尚未同步')
+      if (result.revision > item.revision) throw new ApiError('另一页面已更新作答，本地草稿已保留。修改后将保存本页作答。', 409)
+      if (result.revision !== item.revision) throw new Error('进度尚未同步')
     },
-    state(item, state) {
+    retry: reason => !(reason instanceof ApiError) || reason.status >= 500 || reason.status === 429,
+    state(item, state, reason) {
       if (documentId !== item.scope || signature !== item.value.signature || revision !== item.revision) return
-      saveStatus.value = state === 'saved' ? '进度已保存' : state === 'saving' ? '自动保存中…' : '进度尚未同步，恢复连接后自动重试'
+      saveStatus.value = state === 'saved' ? '进度已保存' : state === 'saving' ? '自动保存中…'
+        : reason instanceof ApiError && reason.status === 409 ? reason.message : '进度尚未同步，恢复连接后自动重试'
     },
   })
   function flush(keepalive = false) { return storage.flush(undefined, keepalive) }
@@ -52,8 +55,13 @@ export function usePracticeProgress() {
     if (!active()) return null
     // Include already-acknowledged edits: a delayed GET may predate their PUT.
     const local = storage.read(id)?.value
+    const pending = storage.read(id, true)?.value
     const newer = local && local.signature === saved.signature && local.revision > saved.revision ? local : null
-    const state = newer || saved.state
+    const conflicted = pending && pending.signature === saved.signature && pending.revision <= saved.revision
+      && (pending.current_question_id !== (saved.state.current_question_id ?? null)
+        || JSON.stringify(pending.selections) !== JSON.stringify(saved.state.selections || {})
+        || JSON.stringify(pending.drafts) !== JSON.stringify(saved.state.drafts || {})) ? pending : null
+    const state = conflicted || newer || saved.state
     const ids = new Set(questions.map(q => q.id))
     const selections = Object.fromEntries(Object.entries(state.selections || {}).filter(([qid]) => ids.has(qid)))
     const drafts = Object.fromEntries(Object.entries(state.drafts || {}).filter(([qid]) => ids.has(qid)))
@@ -62,7 +70,8 @@ export function usePracticeProgress() {
     documentId = id; signature = saved.signature; questionIds = questions.map(q => q.id).join('|')
     revision = Math.max(saved.revision, newer?.revision || 0)
     saveStatus.value = saved.updated_at ? '进度已保存' : '作答自动保存'
-    if (newer) { storage.stage(id, newer.revision, newer); void flush() }
+    if (conflicted) saveStatus.value = '另一页面已更新作答，本地草稿已保留。修改后将保存本页作答。'
+    else if (newer) { storage.stage(id, newer.revision, newer); void flush() }
     else storage.forget(id)
     return { selections, drafts, results, index: Math.max(0, questions.findIndex(q => q.id === state.current_question_id)) }
   }

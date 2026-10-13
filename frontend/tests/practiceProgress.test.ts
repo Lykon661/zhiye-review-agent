@@ -3,7 +3,7 @@ import { api } from '../src/api'
 import { usePracticeProgress } from '../src/usePracticeProgress'
 import type { PracticeQuestion } from '../src/types'
 
-vi.mock('../src/api', () => ({ api: vi.fn() }))
+vi.mock('../src/api', async importOriginal => ({ ...await importOriginal<typeof import('../src/api')>(), api: vi.fn() }))
 const request = vi.mocked(api)
 let values: Map<string, string>
 let progress: ReturnType<typeof usePracticeProgress>
@@ -48,4 +48,26 @@ it('restores an existing journal written by the previous implementation', async 
   const restored = await progress.restore('paper', questions, () => true)
   expect(restored?.drafts.question).toBe('legacy draft')
   expect(restored?.selections.question).toEqual(['B'])
+})
+
+it('keeps a rejected draft and does not retry a version conflict', async () => {
+  request.mockResolvedValueOnce(saved)
+  await progress.restore('paper', questions, () => true)
+  let serverRevision = 0
+  request.mockImplementation(async (_path, options) => {
+    const payload = JSON.parse(options!.body as string)
+    serverRevision = payload.revision + 1
+    return { revision: serverRevision }
+  })
+  progress.changed({ current_question_id: 'question', selections: { question: ['B'] }, drafts: { question: 'local answer' } })
+  await vi.advanceTimersByTimeAsync(350)
+  expect(values.has('review-practice-draft:paper')).toBe(true)
+  expect(progress.saveStatus.value).toContain('本地草稿已保留')
+  const calls = request.mock.calls.length
+  await vi.advanceTimersByTimeAsync(5000)
+  expect(request).toHaveBeenCalledTimes(calls)
+  request.mockResolvedValueOnce({ ...saved, revision: serverRevision })
+  const restored = await progress.restore('paper', questions, () => true)
+  expect(restored?.drafts.question).toBe('local answer')
+  expect(values.has('review-practice-draft:paper')).toBe(true)
 })

@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from threading import RLock
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, select
 
 from .chunking import split_text
 from .config import Settings
@@ -13,7 +13,7 @@ from .file_chapters import document_role, file_order, file_title
 from .llm import ModelClient
 from .model_config import ModelConfigStore
 from .memory import MemoryService
-from .models import AppMeta, Block, Chapter, ChatSession, Chunk, Course, Document, Job, Message, Outline, PracticeAnswerIndex, PracticeSet, RetrievalPassage, ReviewSpace, WrongQuestion, new_id
+from .models import AppMeta, Block, Chapter, ChatSession, Chunk, Course, Document, Job, Message, Outline, PracticeAnswerIndex, PracticeSet, ReviewSpace, WrongQuestion, new_id
 from .parsing import parse_document
 from .practice_progress import answer_policy_current
 from .retrieval import EMBEDDING_RUNTIME, RetrievalService
@@ -199,7 +199,7 @@ class Services:
                 db.execute(delete(AppMeta).where(AppMeta.key == "file_chapter_policy:" + course_id))
                 db.execute(delete(AppMeta).where(AppMeta.key == "chapter_excluded:" + course_id))
                 db.execute(delete(AppMeta).where(AppMeta.key.in_(
-                    [prefix + doc.id for doc in documents for prefix in ("practice_answer_pair:", "practice_title:", "knowledge_units:")])))
+                    [prefix + doc.id for doc in documents for prefix in ("practice_answer_pair:", "practice_title:", "knowledge_units:", "practice_generation:")])))
                 db.delete(course)
                 db.commit()
             for identity in session_ids:
@@ -329,7 +329,7 @@ class Services:
 
     def rebuild_index(self):
         """Rebuild derived vectors in a new generation; never overwrite the damaged store."""
-        with self.lock, self.retrieval.lock:
+        with self.lock, self.retrieval.knowledge.build_lock, self.retrieval.lock:
             with self.sessions() as db:
                 if db.scalar(select(Document.id).where(Document.status.in_(["queued", "processing"])).limit(1)):
                     raise ValueError("资料正在处理，请完成后再重新建立索引。")
@@ -339,6 +339,7 @@ class Services:
                     self.retrieval.settings, self.sessions, self.retrieval.embedder,
                     store_name="chroma-" + new_id(),
                 )
+                replacement.knowledge.staged = {}
                 document_count, expected = 0, 0
                 with self.sessions() as db:
                     documents = db.scalars(select(Document).where(
@@ -355,13 +356,11 @@ class Services:
                 replacement.reopen()
                 if replacement.disk_issue() or replacement.collection.count() != expected:
                     raise ValueError("新索引未能完整保存，未切换索引。请检查本地目录写入权限和后端日志。")
-                with self.sessions() as db:
-                    expected_passages = db.scalar(select(func.count()).select_from(RetrievalPassage).join(
-                        Document, RetrievalPassage.document_id == Document.id).where(
-                            Document.status == "ready", Document.kind.in_(["lecture", "note"])))
+                expected_passages = sum(len(passages) for _, passages, _ in replacement.knowledge.staged.values())
                 if replacement.knowledge_collection.count() != expected_passages:
                     raise ValueError("整页/小节知识索引未能完整保存，未切换索引。请检查向量模型和后端日志。")
                 with self.sessions() as db:
+                    replacement.knowledge.publish_staged(db)
                     marker = db.get(AppMeta, "vector_store_name")
                     if marker is None:
                         db.add(AppMeta(key="vector_store_name", value=replacement.store_name))
@@ -384,6 +383,8 @@ class Services:
                 self.retrieval.store_dir = replacement.store_dir
                 self.retrieval.store_name = replacement.store_name
                 self.retrieval.index_compatible = True
+                self.retrieval.knowledge.ensured.clear()
+                self.retrieval.knowledge.retry_after.clear()
                 replacement = None  # Ownership transferred to the live service.
                 try:
                     old_client.close()
@@ -496,7 +497,7 @@ class Services:
                 raise ValueError("正在准备这份练习的答案，请完成后再删除资料")
             if doc.kind == "generated":
                 file_path = self.upload_dir / (doc.id + ".json")
-                db.execute(delete(AppMeta).where(AppMeta.key == "practice_title:" + doc.id))
+                db.execute(delete(AppMeta).where(AppMeta.key.in_(["practice_title:" + doc.id, "practice_generation:" + doc.id])))
                 db.delete(doc)
                 db.commit()
                 self._cleanup_upload(file_path)

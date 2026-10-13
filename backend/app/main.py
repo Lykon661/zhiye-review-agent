@@ -583,6 +583,16 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
                     for doc in practice_document_rows(db, db.scalars(select(Document).where(
                         Document.course_id == course_id, Document.kind != "generated").order_by(Document.created_at)))]
 
+    @app.get("/courses/{course_id}/block-references")
+    def course_block_references(course_id: str):
+        with services.sessions() as db:
+            require(db, Course, course_id)
+            blocks = db.execute(select(Block.id, Block.document_id, Block.chapter_id).join(
+                Document, Document.id == Block.document_id).where(
+                    Document.course_id == course_id, Document.status == "ready",
+                    Document.kind != "generated").order_by(Block.document_id, Block.order, Block.id))
+            return [dict(block) for block in blocks.mappings()]
+
     @app.get("/courses/{course_id}/review-spaces")
     def review_spaces(course_id: str):
         return review_space.list(course_id)

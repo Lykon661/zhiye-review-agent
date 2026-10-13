@@ -26,6 +26,13 @@ afterEach(async () => {
 })
 
 describe('shared draft durability', () => {
+  it('keeps this page pending draft when another tab writes a newer journal', () => {
+    const drafts = make()
+    drafts.stage('paper', 1, { text: 'this page' })
+    values.set('draft:paper', JSON.stringify({ scope: 'paper', revision: 2, value: { text: 'other page' } }))
+    expect(drafts.read('paper', true)?.value.text).toBe('this page')
+    expect(drafts.read('paper')?.value.text).toBe('other page')
+  })
   it('journals the last keystroke before the debounce and reads it after recreation', () => {
     const send = vi.fn(async () => {})
     const first = make(send)

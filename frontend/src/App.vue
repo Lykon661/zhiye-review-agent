@@ -81,7 +81,7 @@ const materials = useCourseMaterials({
 })
 const { documents, groups, uploadKind, uploadYear, fileInput, uploadBusy, uploadLabel, documentBusy, dragOver,
   showDrawer, source, sourceLoading, sourceError, loadGroups, refreshDocuments, upload, drop,
-  practiceDocumentRenamed, deleteDocument, retryDocument, reparseDocument, preview } = materials
+   practiceDocumentRenamed, deleteDocument, retryDocument, reparseDocument, preview, closePreview } = materials
 let pollTimer: ReturnType<typeof setInterval> | undefined
 let pollInFlight = false
 let pollCount = 0
@@ -411,7 +411,7 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer); stopChat() })
         <footer class="page-footer"><span>知页 · 课程复习工作台</span><span>资料与学习记录保存在本机</span></footer>
       </main>
     </div>
-    <SourceDrawer v-if="showDrawer" :source="source" :loading="sourceLoading" :error="sourceError" @close="showDrawer = false; ++sourceGeneration" />
+    <SourceDrawer v-if="showDrawer" :source="source" :loading="sourceLoading" :error="sourceError" @close="closePreview" />
     <MemorySettings v-if="memoryOpen && courseId" :course-id="courseId" :course-name="course?.name || '当前课程'" :session-id="sessionId" :active="chatting" @close="memoryOpen = false" @busy="memoryBusy = $event" />
     <ModelSettings v-if="modelSettingsOpen" :active="spaceBusy || chatting || !!activeJob || practiceModelBusy" @close="modelSettingsOpen = false" @saved="refreshHealth" />
     <ManagementDialog v-if="management" :key="`${management.action}:${management.id}`" :title="management.title" :description="management.description" :initial-name="management.initialName" :confirm-text="management.confirmText" :danger="management.danger" :busy="managementBusy" :error="managementError" @close="management = null" @submit="submitManagement" />

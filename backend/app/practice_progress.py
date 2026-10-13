@@ -98,8 +98,11 @@ class PracticeProgressService:
                         or (q.question_type != "multiple_choice" and len(labels) > 1)):
                     raise HTTPException(422, "作答选项与原题不一致")
             saved = self.record(db, document_id, signature)
+            state = {"current_question_id": current, "selections": selections, "drafts": drafts}
+            if payload["revision"] == saved.revision and state != saved.state:
+                raise HTTPException(409, "另一页面已更新作答，本地草稿已保留。修改后将保存本页作答。")
             if payload["revision"] > saved.revision:
-                saved.state = {"current_question_id": current, "selections": selections, "drafts": drafts}
+                saved.state = state
                 saved.revision, saved.updated_at = payload["revision"], now()
                 db.commit()
             return {"revision": saved.revision, "updated_at": saved.updated_at}

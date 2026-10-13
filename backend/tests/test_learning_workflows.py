@@ -1,5 +1,6 @@
 """Learning state contracts with controlled model output; no quality claims."""
 from copy import deepcopy
+import json
 from threading import Lock
 
 import pytest
@@ -8,6 +9,7 @@ from fastapi import BackgroundTasks
 from app.models import Course, Document, PracticeQuestion, PracticeSet, ReviewSpace, WrongQuestion, new_id
 from app.practice import PracticeService
 from app.practice_progress import ANSWER_POLICY
+from app.review_space import ReviewSpaceService
 from test_app import upload
 
 
@@ -167,3 +169,78 @@ def test_space_answer_rejects_changed_course(client, course, app, question_space
                            json={"step_id": step_id, "selected": ["A"], "revision": 3})
     assert response.status_code == 409
     assert client.get(f"/review-spaces/{identity}").json()["attempts"] == []
+
+
+def test_assisted_success_does_not_clear_a_weak_topic(course, app, prepared_question):
+    _, question = prepared_question
+    memory = app.state.services.memory
+    with app.state.services.sessions() as db:
+        memory.record_attempt(db, course["id"], question, {"correct": False}, created_at="2026-01-01T00:00:00")
+        assisted = memory.record_attempt(db, course["id"], question, {"correct": True}, created_at="2026-01-01T00:00:01")
+        assisted.content = {**assisted.content, "independent": False}
+        db.commit()
+        row = memory._topics(db, course["id"])[0]
+        assert row["status"] == "needs_review"
+        assert row["incorrect_count"] == row["correct_count"] == 1
+        independent = memory.record_attempt(db, course["id"], question, {"correct": True}, created_at="2026-01-01T00:00:02")
+        independent.content = {**independent.content, "independent": True}
+        db.commit()
+        assert memory._topics(db, course["id"])[0]["status"] == "recent_correct"
+
+
+@pytest.mark.parametrize("feedback,preserved", [("给我一点提示", True), ("这批题先不做，继续聊刚才的知识点。", False)])
+def test_question_followup_preserves_draft_and_remaining_batch(course, app, prepared_question, question_space, monkeypatch, feedback, preserved):
+    practice, _ = prepared_question
+    review = ReviewSpaceService(practice)
+    services = app.state.services
+    identity, step_id = question_space
+    with services.sessions() as db:
+        db.add(Document(id=new_id(), course_id=course["id"], filename="lecture.txt", kind="lecture",
+                        status="ready", file_hash="hint-lecture", path="lecture.txt"))
+        value = db.get(ReviewSpace, identity)
+        next_step = {**deepcopy(value.state["step"]), "id": new_id()}
+        value.state = {**value.state, "pending_questions": [next_step],
+                       "messages": [review._step_message(value.state["step"])],
+                       "draft": {"step_id": step_id, "selected": ["B"], "own_answer": "未完成的草稿", "draft_revision": 5}}
+        db.commit()
+    monkeypatch.setattr(services.llm, "complete", lambda *args, **kwargs: json.dumps(
+        {"action": "explain", "topic": "RAG", "knowledge_source": "model"}))
+    explanations = []
+
+    def explain(messages):
+        explanations.append(json.loads(messages[-1]["content"]))
+        return "先考虑检索证据如何帮助回答，再判断各选项。"
+
+    monkeypatch.setattr(services.llm, "complete_markdown", explain, raising=False)
+    monkeypatch.setattr(review, "_course_sources", lambda *args, **kwargs: ([], {"request": feedback, "topics": ["RAG"]}))
+    tasks = BackgroundTasks()
+    review.advance(identity, {"revision": 3, "feedback": feedback}, tasks)
+    task = tasks.tasks[0]
+    task.func(*task.args, **task.kwargs)
+    value = review.get(identity)
+    if not preserved:
+        assert value["status"] == "reading"
+        with services.sessions() as db:
+            assert db.get(ReviewSpace, identity).state["pending_questions"] == []
+        return
+    assert value["status"] == "waiting_answer" and value["step"]["id"] == step_id
+    assert value["draft"]["selected"] == ["B"] and value["draft"]["own_answer"] == "未完成的草稿"
+    assert value["draft"]["used_hint"] is True
+    assert value["messages"][-1]["kind"] == "explanation"
+    assert "resolution" not in explanations[0]["active_question"]
+    result = review.answer(identity, {"revision": value["revision"], "step_id": step_id,
+        "selected": ["A"], "own_answer": "", "used_hint": False, "seen_answer": False})
+    assert result["step"]["id"] == next_step["id"] and result["status"] == "waiting_answer"
+    assert result["attempts"][-1]["used_hint"] is True
+
+
+def test_equal_revision_with_different_progress_is_a_conflict(client, prepared_question):
+    _, question = prepared_question
+    path = f"/documents/{question['document_id']}/practice/progress"
+    initial = client.get(path).json()
+    payload = {"signature": initial["signature"], "revision": 20, "current_question_id": question["id"],
+               "selections": {question["id"]: ["A"]}, "drafts": {question["id"]: "first tab"}}
+    assert client.put(path, json=payload).status_code == 200
+    assert client.put(path, json=payload).status_code == 200
+    assert client.put(path, json={**payload, "drafts": {question["id"]: "second tab"}}).status_code == 409
+    assert client.get(path).json()["state"]["drafts"] == payload["drafts"]

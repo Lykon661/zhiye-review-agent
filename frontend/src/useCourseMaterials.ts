@@ -1,6 +1,6 @@
 import { ref, type Ref } from 'vue'
 import { api } from './api'
-import type { Block, Chapter, Course, Document, DocumentKind, Outline, Source } from './types'
+import type { Block, BlockReference, Chapter, Course, Document, DocumentKind, Outline, Source } from './types'
 import { supportsUpload, uploadFormatsLabel } from './uploadFormats'
 
 interface Options {
@@ -25,22 +25,30 @@ export function useCourseMaterials(options: Options) {
   const clearFeedback = options.clearFeedback, setError = options.error
   const errorText = (reason: unknown) => reason instanceof Error ? reason.message : String(reason)
   const documents = ref<Document[]>([])
-  const groups = ref<{ document: Document; blocks: Block[] }[]>([])
+  const groups = ref<{ document: Document; blocks: BlockReference[] }[]>([])
   const uploadKind = ref<DocumentKind>('lecture'), uploadYear = ref('')
   const fileInput = ref<HTMLInputElement | null>(null)
   const uploadBusy = ref(false), uploadLabel = ref(''), documentBusy = ref<string | null>(null), dragOver = ref(false)
   const showDrawer = ref(false), source = ref<Source | null>(null), sourceLoading = ref(false), sourceError = ref('')
-  let epoch = 0, sourceGeneration = 0
+  let epoch = 0, sourceGeneration = 0, groupsGeneration = 0
   function reset() {
     ++epoch; ++sourceGeneration
     documents.value = []; groups.value = []; showDrawer.value = false
     source.value = null; sourceLoading.value = false; sourceError.value = ''
   }
   async function loadGroups(id = courseId.value) {
-    const version = epoch
+    const version = epoch, generation = ++groupsGeneration
+    if (!id) return
     const candidates = documents.value.filter(document => document.status === 'ready')
-    const result = await Promise.all(candidates.map(async document => ({ document, blocks: await api<Block[]>(`/documents/${document.id}/blocks`) })))
-    if (courseId.value === id && version === epoch) groups.value = result
+    const references = candidates.length ? await api<BlockReference[]>(`/courses/${id}/block-references`) : []
+    if (courseId.value !== id || version !== epoch || generation !== groupsGeneration) return
+    const byDocument = new Map<string, BlockReference[]>()
+    for (const block of references) {
+      const blocks = byDocument.get(block.document_id)
+      if (blocks) blocks.push(block)
+      else byDocument.set(block.document_id, [block])
+    }
+    groups.value = candidates.map(document => ({ document, blocks: byDocument.get(document.id) || [] }))
   }
   async function refreshDocuments() {
     const id = courseId.value
@@ -128,8 +136,12 @@ export function useCourseMaterials(options: Options) {
     } catch (error) { if (generation === sourceGeneration) sourceError.value = errorText(error) }
     finally { if (generation === sourceGeneration) sourceLoading.value = false }
   }
+  function closePreview() {
+    ++sourceGeneration
+    showDrawer.value = false; sourceLoading.value = false
+  }
 
   return { documents, groups, uploadKind, uploadYear, fileInput, uploadBusy, uploadLabel, documentBusy, dragOver,
     showDrawer, source, sourceLoading, sourceError, reset, loadGroups, refreshDocuments, upload, drop,
-    practiceDocumentRenamed, deleteDocument, retryDocument, reparseDocument, preview }
+    practiceDocumentRenamed, deleteDocument, retryDocument, reparseDocument, preview, closePreview }
 }

@@ -1,12 +1,14 @@
 """Controlled migration checks; no real model inference or quality measurements."""
 from dataclasses import replace
+import json
 
 import pytest
+from sqlalchemy import select
 
 from app.config import Settings
 from app.lexical import query_terms
-from app.models import AppMeta, Block, Chunk, Course, Document
-from app.retrieval import EMBEDDING_RUNTIME, LocalEmbedder
+from app.models import AppMeta, Block, Chunk, Course, Document, RetrievalUnit
+from app.retrieval import EMBEDDING_RUNTIME, LocalEmbedder, RetrievalService
 from app.store import Services
 
 
@@ -90,6 +92,8 @@ def test_migration_publishes_new_model_and_generation_together(legacy_index):
             assert db.get(AppMeta, "embedding_model").value == legacy_index.embedding_model
             assert db.get(AppMeta, "embedding_runtime").value == EMBEDDING_RUNTIME
             assert db.get(AppMeta, "vector_store_name").value == service.retrieval.store_name
+            knowledge_state = json.loads(db.get(AppMeta, "knowledge_units:document").value)
+            assert knowledge_state["store"] == service.retrieval.store_name and knowledge_state["vectors"] is True
             assert db.get(AppMeta, "index_repair:course") is None
             assert db.get(Block, "block").text == "Deadlock conditions"
             assert db.get(Chunk, "chunk").text == "Deadlock conditions"
@@ -104,3 +108,71 @@ def test_semantic_query_preserves_original_wording_and_case():
     assert groups
     assert semantic_query == question.strip()
     assert "检索术语" not in semantic_query
+
+
+@pytest.mark.parametrize("failure", ["reopen", "publish"])
+def test_failed_rebuild_keeps_live_knowledge_records_and_generation(legacy_index, monkeypatch, failure):
+    service = Services(replace(legacy_index, embedding_model="BAAI/bge-small-zh-v1.5"), embedder=FixedEmbedder(512))
+    try:
+        knowledge = service.retrieval.knowledge
+        knowledge.ensure("course")
+        with service.sessions() as db:
+            old_marker = db.get(AppMeta, "knowledge_units:document").value
+            old_units = [(u.id, u.text) for u in db.scalars(select(RetrievalUnit))]
+        old_store = service.retrieval.store_name
+
+        def fail_reopen(_self):
+            raise ValueError("Interrupted after replacement vectors were built")
+
+        if failure == "reopen":
+            monkeypatch.setattr(RetrievalService, "reopen", fail_reopen)
+        else:
+            from app.knowledge_index import KnowledgeIndex
+            publish = KnowledgeIndex.publish_staged
+
+            def fail_publish(index, db):
+                publish(index, db)
+                raise ValueError("Interrupted before SQL publication")
+
+            monkeypatch.setattr(KnowledgeIndex, "publish_staged", fail_publish)
+        with pytest.raises(ValueError, match="Interrupted"):
+            service.rebuild_index()
+        with service.sessions() as db:
+            assert db.get(AppMeta, "knowledge_units:document").value == old_marker
+            assert [(u.id, u.text) for u in db.scalars(select(RetrievalUnit))] == old_units
+        assert service.retrieval.store_name == old_store
+        assert "course" in knowledge.ensured
+    finally:
+        service.retrieval.close()
+        service.engine.dispose()
+
+
+def test_contextual_vectors_retry_after_temporary_failure(legacy_index, monkeypatch):
+    service = Services(replace(legacy_index, embedding_model="BAAI/bge-small-zh-v1.5"), embedder=FixedEmbedder(512))
+    clock, calls = [0], []
+    failing = [True]
+    monkeypatch.setattr("app.knowledge_index.monotonic", lambda: clock[0])
+
+    def embed(texts, query=False):
+        calls.append(texts)
+        if failing[0]:
+            raise RuntimeError("Temporary inference failure")
+        return FixedEmbedder(512).embed(texts, query)
+
+    monkeypatch.setattr(service.retrieval.embedder, "embed", embed)
+    try:
+        knowledge = service.retrieval.knowledge
+        with service.sessions() as db:
+            doc = db.get(Document, "document")
+            blocks = list(db.scalars(select(Block).where(Block.document_id == doc.id)))
+        assert knowledge.index_document(doc, blocks, force=True) is False
+        knowledge.ensure("course")
+        assert len(calls) == 1 and "course" not in knowledge.ensured
+        failing[0], clock[0] = False, 31
+        knowledge.ensure("course")
+        assert len(calls) == 2 and "course" in knowledge.ensured
+        with service.sessions() as db:
+            assert json.loads(db.get(AppMeta, "knowledge_units:document").value)["vectors"] is True
+    finally:
+        service.retrieval.close()
+        service.engine.dispose()

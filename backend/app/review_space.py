@@ -14,7 +14,7 @@ from .models import AppMeta, Block, Chapter, Course, Document, LearningEvent, Me
 from .file_chapters import document_role
 from .model_images import image_resolution_current
 from .practice_generation import generation_rules
-from .practice_progress import answer_policy_current, grading
+from .practice_progress import ANSWER_POLICY, answer_policy_current, grading
 from .web_search import search_web
 from .prompt_budget import InputBudget, estimate_tokens, paragraphs_excerpt
 from .token_usage import TokenUsage, collect_usage
@@ -60,6 +60,7 @@ reason 最多100字，说明做什么及依据，不输出内部推理过程。�
 """
 EXPLAIN = """[TASK:REVIEW_SPACE_EXPLAIN]
 以自然的聊天方式直接回应最新用户消息，用中文 Markdown 讲解、回答追问或梳理知识点。结合 dialogue 延续上下文，避免重复上一段。
+active_question 是仍待作答的题目。用户只要求提示时给思路，不直接揭示答案；讲解后仍可继续作答这道题。
 按需要给小例子或简短理解问题，不强制做题、不自动进入练习，不机械地输出复习任务表。
 dialogue 只用于理解用户卡点，不是事实依据；普通总结请求可整理讨论过的知识点，不声称已经掌握。
 优先依据 materials 实际提供的课程原文。knowledge_source=model 时可以用自身已有知识补充，但不能声称来自课程或已经联网；不确定时说明缺口，不编造事实、引用或链接。
@@ -181,6 +182,7 @@ class ReviewSpaceService:
                 "model_graded": sum(a["grading_basis"] == "model" for a in attempts)}
 
     def public(self, value, detail=True):
+        generation = value.state.get("generation_checkpoint")
         result = {"id": value.id, "course_id": value.course_id, "goal": value.goal,
                   "title": value.state.get("title") or value.goal[:80],
                   "status": value.status, "revision": value.revision,
@@ -188,7 +190,8 @@ class ReviewSpaceService:
                   "chapters": list(value.state.get("chapters", [])),
                   "created_at": value.created_at, "updated_at": value.updated_at, "stats": self.stats(value),
                   "stage": value.state.get("stage", ""), "error": value.state.get("error", ""),
-                  "stop_reason": value.state.get("stop_reason", "")}
+                  "stop_reason": value.state.get("stop_reason", ""),
+                  "generation_progress": {"completed": len(generation["questions"]), "total": generation["plan"].get("count", 1)} if generation else None}
         if detail:
             step = deepcopy(value.state.get("step"))
             if step and step.get("question"):
@@ -287,7 +290,8 @@ class ReviewSpaceService:
                 # for a subsequent request under a different chapter scope.
                 value.state = {**value.state, "chapter_ids": ids, "chapters": titles,
                     "sources": [], "source_topic": "", "source_report": {},
-                    "source_overview": False, "course_search_topics": [], "source_chapter_ids": ids}
+                    "source_overview": False, "course_search_topics": [], "source_chapter_ids": ids,
+                    "generation_checkpoint": None}
                 value.revision += 1
                 value.updated_at = now()
                 db.commit()
@@ -307,7 +311,9 @@ class ReviewSpaceService:
         return course
 
     def _queue(self, db, value, tasks, feedback=""):
-        self._available(db, value.course_id)
+        course = self._available(db, value.course_id)
+        if course.version != value.state["course_version"]:
+            raise HTTPException(409, "课程资料已变化，请结束本次复习并重新开始")
         chapter_ids, chapters = self._scope(db, value.course_id, value.state.get("chapter_ids", []))
         self._pause_others(db, value)
         lock = self.s.review_space_locks.setdefault(value.id, Lock())
@@ -318,9 +324,18 @@ class ReviewSpaceService:
             messages = self._dialogue(value)
             if feedback:
                 messages.append(self._message("user", feedback))
+            question_context = deepcopy(value.state.get("question_context"))
+            if value.status == "waiting_answer" or (value.status == "paused" and value.state.get("resume_status") == "waiting_answer"):
+                question_context = {"step": deepcopy(value.state.get("step")),
+                                    "draft": deepcopy(value.state.get("draft", {})),
+                                    "pending_questions": deepcopy(value.state.get("pending_questions", []))}
+            if re.search(r"这(?:批|些)题.*(?:不做|跳过|放弃)|先不做|不做题了|停止做题|结束练习", feedback):
+                question_context = None
+            generation_checkpoint = value.state.get("generation_checkpoint") if not feedback and value.status in ("failed", "paused") else None
             value.state = {**value.state, "run_token": token, "feedback": feedback,
                            "chapter_ids": chapter_ids, "chapters": chapters,
-                           "messages": messages, "pending_questions": [],
+                           "messages": messages, "pending_questions": [], "question_context": question_context,
+                           "generation_checkpoint": generation_checkpoint,
                            "error": "", "stage": "正在查阅资料并回复", "clock_started_at": None,
                            "failed_token_usage": None}
             value.status = "processing"
@@ -391,7 +406,8 @@ class ReviewSpaceService:
         messages.append(self._message("assistant", summary, kind="summary",
                                      token_usage=token_usage if token_usage is not None else TokenUsage().snapshot()))
         value.state = {**value.state, "messages": messages, "run_token": None, "stop_reason": reason,
-                       "summary": summary, "stage": "本次复习已结束"}
+                       "summary": summary, "stage": "本次复习已结束", "question_context": None, "pending_questions": [],
+                       "generation_checkpoint": None}
         value.status = "completed"
         value.revision += 1
         value.updated_at = now()
@@ -486,7 +502,7 @@ class ReviewSpaceService:
                 "correct": None, "reference_match": None, "grading_basis": None}
             attempt = {"step_id": step["id"], "question_id": q.id, "topic": step["topic"],
                        "stem": q.stem,
-                       "difficulty": step["difficulty"], "used_hint": request["used_hint"],
+                       "difficulty": step["difficulty"], "used_hint": request["used_hint"] or step.get("assisted", False),
                        "seen_answer": request["seen_answer"] or step.get("revealed", False), "repeated": step["repeated"],
                        "selected": request["selected"], "correct": assessment["correct"],
                        "own_answer": own_answer,
@@ -927,6 +943,10 @@ class ReviewSpaceService:
             "requested_topics": report.get("topics", []), "requested_facets": report.get("facets", []),
             "last_answer": payload.get("last_answer"), "knowledge_source": knowledge_source,
             "dialogue": deepcopy(payload["dialogue"][-6:]), "materials": []}
+        question = ((value.state.get("question_context") or {}).get("step") or {}).get("question")
+        if question:
+            explanation["active_question"] = {"stem": question["stem"][:2400],
+                "options": [{"key": option["key"], "text": option["text"][:400]} for option in question["options"]]}
         while self._prompt_size(EXPLAIN, explanation) > self._budget() and len(explanation["dialogue"]) > 1:
             explanation["dialogue"].pop(0)
         used = self._pack_materials(EXPLAIN, explanation, sources, report)
@@ -965,6 +985,21 @@ class ReviewSpaceService:
                 source_report = deepcopy(value.state.get("source_report", {}))
                 course = db.get(Course, value.course_id)
                 source_version = course.version
+                generation_checkpoint = deepcopy(value.state.get("generation_checkpoint"))
+                if (generation_checkpoint
+                        and generation_checkpoint.get("course_version") == source_version
+                        and generation_checkpoint.get("chapter_ids") == value.state["chapter_ids"]
+                        and generation_checkpoint.get("answer_policy") == ANSWER_POLICY
+                        and generation_checkpoint.get("source_policy") == SOURCE_POLICY):
+                    # Retry the saved batch directly, without asking the planner
+                    # to reinterpret the original topic, count or extra conditions.
+                    next_plan = generation_checkpoint["plan"]
+                    usage.calls.extend(generation_checkpoint.get("usage_calls", []))
+                else:
+                    generation_checkpoint = None
+                    if value.state.get("generation_checkpoint"):
+                        value.state = {**value.state, "generation_checkpoint": None}
+                        db.commit()
                 if (value.state.get("source_policy") != SOURCE_POLICY
                         or value.state.get("source_course_version") != source_version
                         or value.state.get("source_chapter_ids", []) != value.state.get("chapter_ids", [])):
@@ -1017,7 +1052,9 @@ class ReviewSpaceService:
                             "correct": last["correct"], "grading_basis": last["grading_basis"],
                             "question": last["question"]["stem"][:700], "options": [{"key": o["key"], "text": o["text"][:180]} for o in last["question"]["options"]],
                             "reference_analysis": last.get("answer", "")[:1000]}
-                if next_plan is not None and not self._can_explain_directly(value, next_plan["topic"], payload,
+                if generation_checkpoint:
+                    payload["feedback"] = generation_checkpoint["request"]
+                if next_plan is not None and next_plan.get("action") == "explain" and not self._can_explain_directly(value, next_plan["topic"], payload,
                         course_name, course_materials, sources, source_report):
                     next_plan = None
                 if next_plan is not None:
@@ -1159,16 +1196,37 @@ class ReviewSpaceService:
                         else:
                             if knowledge_source not in ("materials", "model"):
                                 raise StructuredOutputError("knowledge_source 应为 materials 或 model")
-                            generated = []
-                            for index in range(count):
+                            generated = deepcopy(generation_checkpoint["questions"]) if generation_checkpoint else []
+                            batch_sources = (generation_checkpoint["sources"] if generation_checkpoint else
+                                sources if normalize(source_topic) == normalize(topic) else [])
+                            generation_checkpoint = {
+                                "plan": deepcopy(plan), "request": payload["feedback"],
+                                "course_version": source_version, "chapter_ids": list(value.state["chapter_ids"]),
+                                "answer_policy": ANSWER_POLICY, "source_policy": SOURCE_POLICY,
+                                "sources": deepcopy(batch_sources), "questions": deepcopy(generated),
+                                "usage_calls": deepcopy(usage.calls)}
+                            with self.s.lock, self.s.sessions() as checkpoint:
+                                progress = self._check(checkpoint, identity, token)
+                                progress.state = {**progress.state, "generation_checkpoint": deepcopy(generation_checkpoint),
+                                    "stage": f"已保存 {len(generated)}/{count} 道题，继续生成剩余题目"}
+                                checkpoint.commit()
+                            for index in range(len(generated), count):
                                 with self.s.lock, self.s.sessions() as checkpoint:
                                     progress = self._check(checkpoint, identity, token)
                                     progress.state = {**progress.state, "stage": f"正在按你的要求准备题目（{index + 1}/{count}）"}
                                     progress.updated_at = now()
                                     checkpoint.commit()
-                                generated.append(self._generate(value, topic, difficulty,
-                                    sources if normalize(source_topic) == normalize(topic) else [], knowledge_source == "model",
-                                    kind, payload["feedback"], [q["stem"] for q in generated], count))
+                                question = self._generate(value, topic, difficulty, batch_sources, knowledge_source == "model",
+                                    kind, payload["feedback"], [q["stem"] for q in generated], count)
+                                with self.s.lock, self.s.sessions() as checkpoint:
+                                    progress = self._check(checkpoint, identity, token)
+                                    generation_checkpoint = {**generation_checkpoint,
+                                        "questions": deepcopy([*generated, question]), "usage_calls": deepcopy(usage.calls)}
+                                    progress.state = {**progress.state, "generation_checkpoint": deepcopy(generation_checkpoint),
+                                        "stage": f"已保存 {index + 1}/{count} 道题"}
+                                    progress.updated_at = now()
+                                    checkpoint.commit()
+                                generated.append(question)
                             question = None
                         step = {"id": new_id(), "kind": "question", "topic": topic, "difficulty": difficulty,
                                 "reason": reason, "question": question, "repeated": bool(question and question.get("previously_attempted"))}
@@ -1232,6 +1290,7 @@ class ReviewSpaceService:
                     result = "未完成：" + result[:300]
                     terminal, generated, step = None, None, None
                     next_plan = None
+                    generation_checkpoint = None
                 with self.s.lock, self.s.sessions() as db:
                     current = self._check(db, identity, token)
                     if db.get(Course, current.course_id).version != source_version:
@@ -1293,13 +1352,25 @@ class ReviewSpaceService:
                                      "has_model_knowledge": current.state.get("has_model_knowledge", False) or any(s.get("model_knowledge") for s in ([step] if step else []) + pending),
                                      "has_external_knowledge": current.state.get("has_external_knowledge", False) or any(s.get("external_knowledge") for s in ([step] if step else []) + pending)}
                     current.updated_at = now()
+                    if terminal:
+                        # Publishing the questions and clearing their checkpoint
+                        # share one transaction, so retries cannot append them twice.
+                        current.state = {**current.state, "generation_checkpoint": None}
                     if terminal == "completed":
                         self._finish(current, reason, usage.snapshot())
                     elif terminal:
                         messages = self._dialogue(current)
                         messages.append(self._step_message(step))
-                        current.state = {**current.state, "messages": messages, "step": step, "draft": {},
-                                         "run_token": None, "stage": result, "pending_questions": pending}
+                        draft = {}
+                        question_context = current.state.get("question_context")
+                        if terminal == "reading" and question_context and question_context.get("step"):
+                            step = deepcopy(question_context["step"])
+                            step["assisted"] = True
+                            pending = deepcopy(question_context["pending_questions"])
+                            draft = {**question_context["draft"], "used_hint": True}
+                            terminal, result = "waiting_answer", "讲解已保存，可继续作答当前题目"
+                        current.state = {**current.state, "messages": messages, "step": step, "draft": draft,
+                                         "run_token": None, "stage": result, "pending_questions": pending, "question_context": None}
                         current.status = terminal
                         current.revision += 1
                     db.commit()
@@ -1315,8 +1386,11 @@ class ReviewSpaceService:
                 value = db.get(ReviewSpace, identity)
                 if value and value.status == "processing" and value.state.get("run_token") == token:
                     self._freeze(value)
+                    saved_generation = deepcopy(value.state.get("generation_checkpoint"))
+                    if saved_generation:
+                        saved_generation["usage_calls"] = deepcopy(usage.calls)
                     value.state = {**value.state, "run_token": None, "error": error, "stage": "这轮未完成，进度已保存",
-                                   "failed_token_usage": usage.snapshot()}
+                                   "failed_token_usage": usage.snapshot(), "generation_checkpoint": saved_generation}
                     value.status, value.updated_at = "failed", now()
                     value.revision += 1
                     db.commit()
