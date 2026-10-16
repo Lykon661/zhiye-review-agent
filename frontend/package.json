@@ -6,8 +6,7 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "vue-tsc -b && vite build",
-    "preview": "vite preview --host 127.0.0.1",
-    "test": "vitest run"
+    "preview": "vite preview --host 127.0.0.1"
   },
   "dependencies": {
     "katex": "^0.19.0",

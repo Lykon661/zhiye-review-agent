@@ -86,7 +86,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-tika.ps1
 | Agent | HelloAgents 检索工具循环；复习空间根据对话选择检索与讲解，练习由用户选择；pi-ai 提供模型调用 |
 
 ```text
-backend/          后端业务与测试源码
+backend/          后端业务源码
 frontend/         复习工作台
 model-runtime/    pi-ai 模型调用桥接
 formula-worker/   独立公式识别环境的依赖声明

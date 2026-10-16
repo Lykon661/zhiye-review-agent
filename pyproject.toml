@@ -23,6 +23,3 @@ required-version = ">=0.11.7"
 # OCR imports cv2; headless provides it without desktop window support.
 exclude-dependencies = ["opencv-python"]
 
-[tool.pytest.ini_options]
-pythonpath = ["backend"]
-testpaths = ["backend/tests"]
