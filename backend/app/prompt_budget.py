@@ -1,15 +1,62 @@
-"""Model-window-aware input estimates; no provider tokenizer is assumed."""
+"""Model-window-aware input estimates, calibrated by provider-reported usage."""
+from collections import deque
 import json
 import math
 import re
+from threading import Lock
+
+CJK = re.compile(r"[\u2e80-\u9fff\uac00-\ud7ff\uf900-\ufaff]")
 
 
 def estimate_tokens(value):
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-    # CJK often uses more than one token per character; ASCII prose/code is
-    # estimated conservatively. This is an estimate, not a provider token count.
-    cjk = len(re.findall(r"[\u2e80-\u9fff\uac00-\ud7ff\uf900-\ufaff]", text))
+    # Deliberately high for unknown tokenizers (2 per CJK character, 1 per 3
+    # other characters); TokenCalibration scales the budget once a model reports usage.
+    cjk = len(CJK.findall(text))
     return math.ceil(cjk * 2 + (len(text) - cjk) / 3)
+
+
+class TokenCalibration:
+    """Per-model ratio of reported input tokens to estimate_tokens.
+
+    Most current tokenizers need well under 2 tokens per Chinese character, so
+    the raw estimate wastes context. The ratio uses the largest recent sample
+    plus a margin, and only small requests or image requests are ignored.
+    """
+    MIN_ESTIMATE = 400
+    MARGIN = 1.1
+    BOUNDS = (0.35, 1.5)
+
+    def __init__(self):
+        self._lock = Lock()
+        self._samples = {}
+
+    @staticmethod
+    def key(config):
+        get = config.get if isinstance(config, dict) else lambda name: getattr(config, name, "")
+        return get("provider"), get("api"), get("base_url"), get("model")
+
+    def record(self, config, messages, reported_input):
+        if not isinstance(reported_input, int) or reported_input <= 0:
+            return
+        if any(not isinstance(message.get("content"), str) for message in messages):
+            return  # Image parts are billed differently from their text size.
+        estimated = InputBudget.messages_size(messages)
+        if estimated < self.MIN_ESTIMATE:
+            return
+        with self._lock:
+            self._samples.setdefault(self.key(config), deque(maxlen=20)).append(reported_input / estimated)
+
+    def ratio(self, config):
+        with self._lock:
+            samples = self._samples.get(self.key(config))
+            if not samples:
+                return 1.0
+            low, high = self.BOUNDS
+            return min(high, max(low, max(samples) * self.MARGIN))
+
+
+CALIBRATION = TokenCalibration()
 
 
 class InputBudget:
@@ -17,7 +64,8 @@ class InputBudget:
         window = max(1024, int(config.context_window))
         output = max(256, int(config.max_tokens))
         framing = max(512, min(4096, window // 16))
-        self.limit = max(256, window - output - framing)
+        # The limit is in estimate units: real tokens are about ratio * estimate.
+        self.limit = max(256, int((window - output - framing) / CALIBRATION.ratio(config)))
 
     @staticmethod
     def messages_size(messages):

@@ -6,7 +6,7 @@ from hello_agents.tools.base import Tool, ToolParameter
 from hello_agents.tools.registry import ToolRegistry
 from sqlalchemy import select
 
-from .llm import model_failure_message, parse_json
+from .llm import model_failure_message, parse_json, run_parallel
 from .models import ChatSession, Course, Message
 from .chat_answers import asks_for_question_answer
 from .model_images import attach_question_images
@@ -297,19 +297,23 @@ class SearchTool(Tool):
                 ToolParameter(name="year", type="integer", description="真题年份", required=False)]
 
     def run(self, parameters: dict) -> str:
+        self.last_sources = self.search(parameters)
+        return json.dumps({"sources": self.last_sources}, ensure_ascii=False)
+
+    def search(self, parameters: dict) -> list:
+        """Stateless lookup, safe to run concurrently on one tool instance."""
         query = str(parameters.get("query", "")).strip()[:1500]
         year = parameters.get("year") if self.name == "find_past_questions" else None
         if year is not None and (not isinstance(year, int) or not 1900 <= year <= 2100):
             raise ValueError("检索年份无效。")
         if self.name == "search_materials" and self.knowledge and overview_request(query):
-            self.last_sources, _ = self.knowledge.retrieve(self.course_id, query, request=query, overview=True,
+            sources, _ = self.knowledge.retrieve(self.course_id, query, request=query, overview=True,
                 chapter_ids=[self.chapter_id] if self.chapter_id else [])
-        else:
-            self.last_sources = self.retrieval.search(
-                self.course_id, query, kind="exam" if self.name == "find_past_questions" else "material",
-                chapter_id=self.chapter_id, year=year, limit=8 if self.name == "search_materials" else 5,
-            )
-        return json.dumps({"sources": self.last_sources}, ensure_ascii=False)
+            return sources
+        return self.retrieval.search(
+            self.course_id, query, kind="exam" if self.name == "find_past_questions" else "material",
+            chapter_id=self.chapter_id, year=year, limit=8 if self.name == "search_materials" else 5,
+        )
 
 
 class ReviewAgentService:
@@ -420,9 +424,9 @@ class ReviewAgentService:
                 requested = plan.get("tools", [])
                 if not isinstance(requested, list):
                     raise ValueError("模型工具计划格式错误。")
-                executed = 0
+                pending = []
                 for request in requested:
-                    if calls >= 3:
+                    if calls + len(pending) >= 3:
                         break
                     if not isinstance(request, dict):
                         raise ValueError("模型工具参数格式错误。")
@@ -436,16 +440,23 @@ class ReviewAgentService:
                     if key in used:
                         continue
                     used.add(key)
-                    yield event("status", {"message": "正在检索往年真题" if tool.name == "find_past_questions" else "正在检索课程资料", "tool": tool.name})
-                    tool.run(parameters)
+                    pending.append((tool, parameters))
+                executed = len(pending)
+                if pending:
+                    names = {tool.name for tool, _ in pending}
+                    yield event("status", {"message": "正在检索往年真题" if names == {"find_past_questions"}
+                                           else "正在检索课程资料" if names == {"search_materials"} else "正在检索课程资料和往年真题",
+                                           "tool": pending[0][0].name if len(names) == 1 else "multiple"})
+                # The planned searches are independent; run them together, then merge in plan order.
+                for (tool, parameters), found in zip(pending, run_parallel(
+                        lambda item: item[0].search(item[1]), pending)):
                     calls += 1
-                    executed += 1
-                    for source in tool.last_sources:
+                    for source in found:
                         sources[source["source_id"]] = source
                     observations.append({"tool": tool.name, "query": parameters["query"],
                                          "sources": [{"source_id": s["source_id"], "kind": s["kind"], "text": s["text"][:800],
                                                       "truncated": len(s["text"]) > 800,
-                                                      "original_characters": len(s["text"])} for s in tool.last_sources]})
+                                                      "original_characters": len(s["text"])} for s in found]})
                 if not executed or plan.get("done"):
                     break
             verified_sources = self.answer_grounding.sources(course_id, list(sources.values()), practice_context, question) if self.answer_grounding else list(sources.values())

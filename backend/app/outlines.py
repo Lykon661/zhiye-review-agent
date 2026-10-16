@@ -2,11 +2,12 @@ import json
 import logging
 import re
 from collections import defaultdict
+from threading import Lock
 
 from sqlalchemy import select
 
 from .file_chapters import chapter_role, document_role
-from .llm import StructuredOutputError, model_failure_message
+from .llm import StructuredOutputError, model_failure_message, run_parallel
 from .models import Block, Chapter, Course, Document, Job, Outline
 
 logger = logging.getLogger(__name__)
@@ -225,18 +226,31 @@ class OutlineService:
                     raise
                 logger.warning("Invalid review notes response; retrying once for chapter %s", chapter["title"])
 
+    def _parallel_markdown(self, job_id, label, task, chapter, key, groups):
+        """Independent batches run concurrently; results keep the original order."""
+        done, lock = 0, Lock()
+        if len(groups) > 1:
+            self._update(job_id, stage=f"{label} 0/{len(groups)}")
+
+        def write(group):
+            nonlocal done
+            result = self._markdown(task, chapter, key, group)
+            if len(groups) > 1:
+                with lock:
+                    done += 1
+                    stage = f"{label} {done}/{len(groups)}"
+                self._update(job_id, stage=stage)
+            return result
+        return run_parallel(write, groups)
+
     def _chapter(self, job_id, chapter, blocks):
         batches = packet_batches(chapter, material_units(blocks))
-        drafts = []
         # A whole chapter that fits goes directly to the final editor: one call.
         if len(batches) == 1:
             result = self._markdown("CHAPTER", chapter, "materials", batches[0])
             return result
-        for number, batch in enumerate(batches, 1):
-            self._update(job_id, stage=f"{chapter['title']}：阅读资料 {number}/{len(batches)}")
-            result = self._markdown("MAP", chapter, "materials", batch)
-            if result:
-                drafts.append({"text": result})
+        drafts = [{"text": result} for result in self._parallel_markdown(
+            job_id, f"{chapter['title']}：阅读资料", "MAP", chapter, "materials", batches) if result]
         if not drafts:
             return ""
         for _ in range(4):
@@ -248,8 +262,8 @@ class OutlineService:
                     raise ValueError(f"{chapter['title']}：整章编辑返回了空内容。")
                 return result
             groups = packet_batches(chapter, drafts, task="MERGE", key="drafts")
-            drafts = [{"text": self._markdown("MERGE", chapter, "drafts", group)} for group in groups]
-            drafts = [draft for draft in drafts if draft["text"]]
+            drafts = [{"text": result} for result in self._parallel_markdown(
+                job_id, f"{chapter['title']}：合并主题", "MERGE", chapter, "drafts", groups) if result]
             if not drafts:
                 raise ValueError(f"{chapter['title']}：主题合并未返回正文。")
         raise ValueError(f"{chapter['title']}：笔记合并后仍超过输入预算，请拆分章节。")
@@ -267,12 +281,9 @@ class OutlineService:
         chapter = {"title": "课程大纲与辅助资料"}
         values = [{"filename": block["filename"], "text": block["text"]} for block in blocks]
         batches = packet_batches(chapter, values, task="GUIDANCE")
-        drafts = []
-        for number, batch in enumerate(batches, 1):
-            self._update(job_id, stage=f"正在参考大纲与辅助资料：{number}/{len(batches)}", progress=2)
-            result = self._markdown("GUIDANCE", chapter, "materials", batch)
-            if result:
-                drafts.append({"text": result})
+        self._update(job_id, progress=2)
+        drafts = [{"text": result} for result in self._parallel_markdown(
+            job_id, "正在参考大纲与辅助资料", "GUIDANCE", chapter, "materials", batches) if result]
         # Reuse the same byte-budgeted grouping for arbitrarily long support files.
         for _ in range(5):
             if not drafts:
@@ -282,8 +293,8 @@ class OutlineService:
             if len(drafts) == 1 and len(text.encode("utf-8")) <= MAX_GUIDANCE_BYTES:
                 break
             groups = packet_batches(chapter, drafts, task="GUIDANCE_MERGE", key="drafts")
-            merged = [self._markdown("GUIDANCE_MERGE", chapter, "drafts", group) for group in groups]
-            drafts = [{"text": result} for result in merged if result]
+            drafts = [{"text": result} for result in self._parallel_markdown(
+                job_id, "正在合并大纲参考", "GUIDANCE_MERGE", chapter, "drafts", groups) if result]
         else:
             text = "\n\n".join(draft["text"] for draft in drafts)
         if len(text.encode("utf-8")) > MAX_GUIDANCE_BYTES:

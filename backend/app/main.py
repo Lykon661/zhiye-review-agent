@@ -12,7 +12,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadF
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import AliasChoices, BaseModel, Field, field_validator
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from .agent import ReviewAgentService
@@ -378,16 +378,15 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
         except ModelRuntimeError as exc:
             raise HTTPException(503, model_failure_message(exc)) from exc
 
+    def ensure_model_idle(message="正在处理复习任务，请结束任务后再更改模型配置"):
+        with services.sessions() as db:
+            if services.model_busy(db):
+                raise HTTPException(409, message)
+
     @app.put("/system/model-config")
     def save_model_configuration(payload: ModelConfigInput):
-        with services.lock, services.sessions() as db:
-            if (db.scalar(select(Job.id).where(Job.status.in_(["queued", "running"])).limit(1))
-                    or any(lock.locked() for lock in services.chat_locks.values())
-                    or any(lock.locked() for lock in services.review_space_locks.values())
-                    or any(lock.locked() for lock in services.practice_locks.values())
-                    or any(lock.locked() for lock in services.explanation_locks.values())
-                    or any(lock.locked() for lock in services.answer_preparation_locks.values())):
-                raise HTTPException(409, "正在回答、生成练习解析、整理练习或生成笔记，请结束任务后再切换模型配置")
+        with services.lock:
+            ensure_model_idle("正在回答、生成练习解析、整理练习或生成笔记，请结束任务后再切换模型配置")
             try:
                 return services.model_config.save(payload.model_dump())
             except ValueError as exc:
@@ -410,14 +409,6 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
         return services.model_config.public_registry()
 
     model_oauth = ModelOAuthManager(services.model_config)
-
-    def ensure_model_idle():
-        with services.sessions() as db:
-            if (db.scalar(select(Job.id).where(Job.status.in_(["queued", "running"])).limit(1))
-                    or any(lock.locked() for locks in (services.chat_locks, services.review_space_locks,
-                        services.practice_locks, services.explanation_locks, services.answer_preparation_locks)
-                        for lock in locks.values())):
-                raise HTTPException(409, "正在处理复习任务，请结束任务后再更改模型配置")
 
     @app.post("/system/model-registry/oauth/start")
     def start_model_oauth(payload: ProviderInput):
@@ -495,12 +486,8 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
 
     @app.put("/system/model-registry")
     def save_model_registry(payload: ModelRegistryInput):
-        with services.lock, services.sessions() as db:
-            if (db.scalar(select(Job.id).where(Job.status.in_(["queued", "running"])).limit(1))
-                    or any(lock.locked() for locks in (services.chat_locks, services.review_space_locks,
-                        services.practice_locks, services.explanation_locks, services.answer_preparation_locks)
-                        for lock in locks.values())):
-                raise HTTPException(409, "正在处理复习任务，请结束任务后再保存或切换模型")
+        with services.lock:
+            ensure_model_idle("正在处理复习任务，请结束任务后再保存或切换模型")
             try:
                 return services.model_config.save_registry(payload.model_dump())
             except ValueError as exc:
@@ -602,8 +589,8 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
         return review_space.start(course_id, payload.model_dump(), tasks)
 
     @app.get("/review-spaces/{space_id}")
-    def get_review_space(space_id: str):
-        return review_space.get(space_id)
+    def get_review_space(space_id: str, known_revision: int | None = None):
+        return review_space.get(space_id, known_revision)
 
     @app.get("/review-spaces/{space_id}/retrieval-report")
     def review_space_retrieval_report(space_id: str, message_id: str | None = None):
@@ -656,9 +643,9 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
         """Reserve a document before reparsing or changing its upload metadata."""
         if doc.status in ("queued", "processing"):
             raise HTTPException(409, "文件仍在处理中，请完成后再修改或重新解析")
-        if services.practice_locks.get(doc.id) and services.practice_locks[doc.id].locked():
+        if services.busy(services.practice_locks, doc.id):
             raise HTTPException(409, "正在整理题目或回答练习，请完成后再修改或重新解析")
-        if services.answer_preparation_locks.get(doc.id) and services.answer_preparation_locks[doc.id].locked():
+        if services.busy(services.answer_preparation_locks, doc.id):
             raise HTTPException(409, "正在准备这份练习的答案，请完成后再修改或重新解析")
         if db.get(AppMeta, "index_repair:" + doc.course_id):
             raise HTTPException(409, "请先点击“重新建立索引”恢复本地索引，再修改或重新解析资料。")
@@ -666,7 +653,7 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
                 Outline.course_id == doc.course_id, Job.status.in_(["queued", "running"])).limit(1)):
             raise HTTPException(409, "本课程的复习笔记任务仍在执行，请完成后再修改或重新解析资料。")
         session_ids = db.scalars(select(ChatSession.id).where(ChatSession.course_id == doc.course_id))
-        if any(services.chat_locks.get(identity) and services.chat_locks[identity].locked() for identity in session_ids):
+        if services.busy(services.chat_locks, *session_ids):
             raise HTTPException(409, "本课程的会话正在回答，请停止或完成后再修改或重新解析资料。")
         doc.status, doc.error = "queued", None
         services.changed(db, doc.course_id)
@@ -844,7 +831,7 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
         if db.scalar(select(Job.id).join(Outline).where(Outline.course_id == course_id, Job.status.in_(["queued", "running"]))):
             raise HTTPException(409, "复习笔记正在生成，请完成后再调整章节目录")
         session_ids = db.scalars(select(ChatSession.id).where(ChatSession.course_id == course_id))
-        if any(services.chat_locks.get(identity) and services.chat_locks[identity].locked() for identity in session_ids):
+        if services.busy(services.chat_locks, *session_ids):
             raise HTTPException(409, "课程会话正在回答，请停止或完成后再调整章节目录")
 
     @app.post("/courses/{course_id}/chapters/draft")
@@ -1046,8 +1033,7 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
     def rename_session(session_id: str, payload: SessionNameInput):
         with services.lock, services.sessions() as db:
             session = require(db, ChatSession, session_id)
-            lock = services.chat_locks.get(session_id)
-            if lock and lock.locked():
+            if services.busy(services.chat_locks, session_id):
                 raise HTTPException(409, "会话正在回答，请停止或完成后再改名")
             session.title = payload.title
             db.commit()
@@ -1057,8 +1043,7 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
     def delete_session(session_id: str):
         with services.lock, services.sessions() as db:
             session = require(db, ChatSession, session_id)
-            lock = services.chat_locks.get(session_id)
-            if lock and lock.locked():
+            if services.busy(services.chat_locks, session_id):
                 raise HTTPException(409, "会话正在回答，请停止或完成后再删除")
             db.execute(delete(Message).where(Message.session_id == session_id))
             db.delete(session)
@@ -1139,17 +1124,26 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
         return StreamingResponse(generate(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
+    # Read one key inside SQLite instead of loading each multi-megabyte snapshot.
+    outline_style = func.coalesce(func.json_extract(Outline.snapshot, "$.outline_style"), "legacy")
+
+    def latest_jobs(db, outline_ids):
+        latest = {}
+        for job_id, outline_id in db.execute(select(Job.id, Job.outline_id).where(
+                Job.outline_id.in_(outline_ids)).order_by(Job.created_at)):
+            latest[outline_id] = job_id
+        return latest
+
     @app.get("/courses/{course_id}/outlines")
     def list_outlines(course_id: str):
         with services.sessions() as db:
             course = require(db, Course, course_id)
-            result = []
-            for outline in db.scalars(select(Outline).where(Outline.course_id == course_id).order_by(Outline.created_at.desc())):
-                job = db.scalar(select(Job).where(Job.outline_id == outline.id).order_by(Job.created_at.desc()))
-                result.append({"id": outline.id, "status": outline.status, "stale": course.version != outline.version,
-                               "style": outline.snapshot.get("outline_style", "legacy"),
-                               "created_at": outline.created_at, "job_id": job.id if job else None})
-            return result
+            outlines = db.execute(select(Outline.id, Outline.status, Outline.version, Outline.created_at, outline_style)
+                                  .where(Outline.course_id == course_id).order_by(Outline.created_at.desc())).all()
+            jobs = latest_jobs(db, [outline.id for outline in outlines])
+            return [{"id": identity, "status": status, "stale": course.version != version, "style": style,
+                     "created_at": created_at, "job_id": jobs.get(identity)}
+                    for identity, status, version, created_at, style in outlines]
 
     @app.post("/courses/{course_id}/outlines", status_code=202)
     def generate_outline(course_id: str, tasks: BackgroundTasks):
@@ -1216,10 +1210,9 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
         with services.sessions() as db:
             outline = require(db, Outline, outline_id)
             course = require(db, Course, outline.course_id)
-            job = db.scalar(select(Job).where(Job.outline_id == outline_id).order_by(Job.created_at.desc()))
             return {**row(outline), "stale": course.version != outline.version,
-                    "style": outline.snapshot.get("outline_style", "legacy"), "current_style": NOTES_STYLE,
-                    "job_id": job.id if job else None}
+                    "style": db.scalar(select(outline_style).where(Outline.id == outline_id)), "current_style": NOTES_STYLE,
+                    "job_id": latest_jobs(db, [outline_id]).get(outline_id)}
 
     @app.get("/outlines/{outline_id}/export")
     def export_outline(outline_id: str):

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onActivated, onDeactivated, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api, ApiError } from '../api'
-import type { Chapter, ReviewSpace, ReviewSpaceMessage, ReviewSpaceSummary } from '../types'
+import type { Chapter, ReviewSpace, ReviewSpaceMessage, ReviewSpacePoll, ReviewSpaceSummary } from '../types'
 import { useReviewSpaceDraft } from '../useReviewSpaceDraft'
 import MarkdownContent from './MarkdownContent.vue'
 import UiIcon from './UiIcon.vue'
@@ -80,14 +80,22 @@ async function refreshCurrent() {
   const id = current.value?.id, course = props.courseId, token = serial
   if ((!id && !backgroundWorking.value) || requesting.value || loading.value || disposed) { schedulePoll(); return }
   try {
+    // With a known revision the server omits an unchanged transcript and sends status fields only.
+    const known = current.value?.revision
     const [values, value] = await Promise.all([
       api<ReviewSpaceSummary[]>(`/courses/${course}/review-spaces`, { signal: readController.signal }),
-      id ? api<ReviewSpace>(`/review-spaces/${id}`, { signal: readController.signal }) : Promise.resolve(null),
+      id ? api<ReviewSpace | ReviewSpacePoll>(`/review-spaces/${id}${known === undefined ? '' : `?known_revision=${known}`}`, { signal: readController.signal }) : Promise.resolve(null),
     ])
     // A reply finishing in another conversation only updates its sidebar status.
     if (!disposed && token === serial && course === props.courseId && current.value?.id === id && !requesting.value) {
       spaces.value = values
-      if (value) apply(value)
+      if (value && 'unchanged' in value) {
+        if (current.value && current.value.revision === value.revision) {
+          const { unchanged: _, ...fields } = value
+          current.value = { ...current.value, ...fields }
+          spaces.value = [{ ...current.value }, ...spaces.value.filter(item => item.id !== value.id)]
+        }
+      } else if (value) apply(value)
       pollError.value = ''
     }
   } catch (reason) { if (!disposed && token === serial && (reason as Error).name !== 'AbortError') pollError.value = message(reason) }

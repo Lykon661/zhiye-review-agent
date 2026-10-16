@@ -3,6 +3,8 @@ import queue
 import re
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import asdict
 from functools import lru_cache
 from threading import Thread
@@ -13,7 +15,33 @@ from urllib.request import Request, build_opener, HTTPRedirectHandler
 from .config import ROOT, Settings
 from .model_config import ModelConfig, ModelConfigStore
 from .model_registry import ENV_KEYS
+from .prompt_budget import CALIBRATION
 from .token_usage import call_stage, record_usage
+
+# timeout_seconds limits waiting for the first output and each later pause;
+# this cap only stops a stream that never ends. Keep in sync with bridge.mjs.
+MAX_TOTAL_SECONDS = 30 * 60
+# Independent calls of one task run together; a small bound avoids provider rate limits.
+MODEL_CONCURRENCY = 3
+
+
+def run_parallel(function, items, workers=MODEL_CONCURRENCY):
+    """Map items concurrently in input order; the first failure in order is raised.
+
+    Each call runs in a copy of the caller's context, so per-reply token usage
+    is still recorded on the caller's counter.
+    """
+    items = list(items)
+    if len(items) <= 1 or workers <= 1:
+        return [function(item) for item in items]
+    with ThreadPoolExecutor(max_workers=min(workers, len(items))) as pool:
+        futures = [pool.submit(copy_context().run, function, item) for item in items]
+        try:
+            return [future.result() for future in futures]
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
 
 
 class ModelNotConfigured(ValueError):
@@ -58,7 +86,7 @@ def model_failure_message(error: Exception) -> str:
         if status == 429:
             return "模型服务限流或额度受限（HTTP 429）。请检查服务商额度，稍后重试。"
         if getattr(current, "timed_out", False) or type(current).__name__ == "APITimeoutError":
-            return "模型请求超时。请稍后重试，或在“模型配置”中增加请求超时。"
+            return "模型长时间没有返回新内容，请求已超时。请稍后重试，或在“模型配置”中增加请求超时。"
         if isinstance(current, ModelRuntimeError):
             return str(current)
         if type(current).__name__ == "APIConnectionError":
@@ -99,22 +127,29 @@ class ModelClient:
 
         reader = Thread(target=read, daemon=True)
         reader.start()
-        deadline = monotonic() + timeout + 10  # Include local SDK import overhead.
+        # The bridge enforces the same idle limit; the margin covers process
+        # start and SDK import before its first event.
+        started = monotonic()
+        deadline = started + timeout + 10
         terminal = False
         try:
             process.stdin.write(json.dumps(request, ensure_ascii=False))
             process.stdin.close()
             while True:
+                limit = min(deadline, started + MAX_TOTAL_SECONDS + 30)
                 try:
-                    line = events.get(timeout=max(0.01, deadline - monotonic()))
+                    line = events.get(timeout=max(0.01, limit - monotonic()))
                 except queue.Empty as exc:
                     raise ModelRuntimeError("模型请求超时。", timed_out=True) from exc
                 if line is None:
                     break
+                deadline = monotonic() + timeout + 10
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError as exc:
                     raise ModelRuntimeError("模型运行进程返回了无效数据，请检查运行依赖。") from exc
+                if event.get("type") == "progress":
+                    continue
                 if event.get("type") == "error":
                     if event.get("code") == "image_not_supported":
                         raise ModelImageNotSupported("当前模型不支持图片输入。请在“模型配置”中选择支持图片的视觉模型；自定义接口需确认模型支持图片并启用该选项。")
@@ -209,6 +244,7 @@ class ModelClient:
             for event in self._events(request, timeout):
                 if event.get("type") == "usage":
                     record_usage(event.get("usage"), stage)
+                    CALIBRATION.record(request["config"], request["messages"], (event.get("usage") or {}).get("input_tokens"))
                     reported = True
                 elif event.get("type") == "done" and not reported:
                     # Keep adapters that attach usage to done compatible. An
