@@ -4,9 +4,10 @@ import json
 import logging
 import re
 from threading import Lock
+from types import SimpleNamespace
 
 from fastapi import HTTPException
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select, update
 
 from .lexical import lexical_score, normalize, overview_request, query_terms, retrieval_topic
 from .llm import StructuredOutputError, model_failure_message, parse_json
@@ -181,37 +182,80 @@ class ReviewSpaceService:
                 "verified_matched": sum(a["correct"] is True and a["grading_basis"] in ("uploaded", "embedded") for a in independent),
                 "model_graded": sum(a["grading_basis"] == "model" for a in attempts)}
 
+    def _summary(self, value, state, generation_progress):
+        return {"id": value.id, "course_id": value.course_id, "goal": value.goal,
+                "title": state.get("title") or value.goal[:80],
+                "status": value.status, "revision": value.revision,
+                "chapter_ids": list(state.get("chapter_ids") or []),
+                "chapters": list(state.get("chapters") or []),
+                "created_at": value.created_at, "updated_at": value.updated_at,
+                "stats": self.stats(SimpleNamespace(state={"attempts": state.get("attempts") or []})),
+                "stage": state.get("stage") or "", "error": state.get("error") or "",
+                "stop_reason": state.get("stop_reason") or "",
+                "generation_progress": generation_progress}
+
     def public(self, value, detail=True):
         generation = value.state.get("generation_checkpoint")
-        result = {"id": value.id, "course_id": value.course_id, "goal": value.goal,
-                  "title": value.state.get("title") or value.goal[:80],
-                  "status": value.status, "revision": value.revision,
-                  "chapter_ids": list(value.state.get("chapter_ids", [])),
-                  "chapters": list(value.state.get("chapters", [])),
-                  "created_at": value.created_at, "updated_at": value.updated_at, "stats": self.stats(value),
-                  "stage": value.state.get("stage", ""), "error": value.state.get("error", ""),
-                  "stop_reason": value.state.get("stop_reason", ""),
-                  "generation_progress": {"completed": len(generation["questions"]), "total": generation["plan"].get("count", 1)} if generation else None}
+        result = self._summary(value, value.state, {"completed": len(generation["questions"]),
+            "total": generation["plan"].get("count", 1)} if generation else None)
         if detail:
             step = deepcopy(value.state.get("step"))
-            if step and step.get("question"):
-                # A saved solution is private until this step has been submitted/revealed.
-                step["question"].pop("resolution", None)
+            if step:
+                # The page reads explanation evidence from the message; reports have their own endpoint.
+                step.pop("sources", None)
+                step.pop("retrieval_report", None)
+                if step.get("question"):
+                    # A saved solution is private until this step has been submitted/revealed.
+                    step["question"].pop("resolution", None)
+            messages = self._dialogue(value)
+            for message in messages:
+                (message.get("step") or {}).pop("retrieval_report", None)
             result.update(step=step, draft=value.state.get("draft", {}),
                           last_result=value.state.get("last_result"), attempts=value.state.get("attempts", []),
-                          trace=value.state.get("trace", []), summary=value.state.get("summary", ""), messages=self._dialogue(value),
+                          trace=value.state.get("trace", []), summary=value.state.get("summary", ""), messages=messages,
                           failed_token_usage=value.state.get("failed_token_usage"))
+        return result
+
+    def _summaries(self, db, condition, extra=()):
+        """Summary fields read inside SQLite; the transcript and sources stay unparsed."""
+        keys = ("title", "chapter_ids", "chapters", "stage", "error", "stop_reason", "attempts", *extra)
+        state = ReviewSpace.state
+        rows = db.execute(select(
+            ReviewSpace.id, ReviewSpace.course_id, ReviewSpace.goal, ReviewSpace.status, ReviewSpace.revision,
+            ReviewSpace.created_at, ReviewSpace.updated_at,
+            *(func.json_extract(state, "$." + key) for key in keys),
+            *(func.json_type(state, "$." + key) for key in keys),
+            func.json_type(state, "$.generation_checkpoint"),
+            func.json_array_length(state, "$.generation_checkpoint.questions"),
+            func.json_extract(state, "$.generation_checkpoint.plan.count"),
+        ).where(condition).order_by(ReviewSpace.updated_at.desc()).limit(80)).all()
+        result = []
+        for row in rows:
+            values, types = row[7:7 + len(keys)], row[7 + len(keys):7 + 2 * len(keys)]
+            # json_extract returns objects and arrays as JSON text, scalars as SQL values.
+            partial = {key: json.loads(value) if kind in ("object", "array") else value
+                       for key, value, kind in zip(keys, values, types)}
+            checkpoint, completed, total = row[7 + 2 * len(keys):]
+            result.append({**self._summary(row, partial, {"completed": completed or 0, "total": total or 1}
+                                           if checkpoint == "object" else None),
+                           **{key: partial[key] for key in extra}})
         return result
 
     def list(self, course_id):
         with self.s.sessions() as db:
             if db.get(Course, course_id) is None:
                 raise HTTPException(404, "课程不存在")
-            return [self.public(value, False) for value in db.scalars(select(ReviewSpace).where(
-                ReviewSpace.course_id == course_id).order_by(ReviewSpace.updated_at.desc()).limit(80))]
+            return self._summaries(db, ReviewSpace.course_id == course_id)
 
-    def get(self, identity):
+    def get(self, identity, known_revision=None):
         with self.s.sessions() as db:
+            if known_revision is not None and db.scalar(
+                    select(ReviewSpace.revision).where(ReviewSpace.id == identity)) == known_revision:
+                # Polling while a reply is prepared: messages change only with the revision,
+                # so send the stage and action log without the transcript.
+                summary = self._summaries(db, ReviewSpace.id == identity, ("trace",))
+                if summary:
+                    return {**summary[0], "trace": summary[0]["trace"] or [], "unchanged": True}
             return self.public(self._require(db, identity))
 
     def retrieval_report(self, identity, message_id=None):
@@ -456,18 +500,26 @@ class ReviewSpaceService:
         return step
 
     def draft(self, identity, request):
+        # Drafts save while typing: read and replace only the step and draft
+        # keys inside SQLite rather than round-tripping the whole transcript.
         with self.s.lock, self.s.sessions() as db:
-            value = self._require(db, identity)
-            step = self._question_step(value, request["step_id"])
-            if value.status != "waiting_answer":
+            found = db.execute(select(ReviewSpace.status, func.json_extract(ReviewSpace.state, "$.step"),
+                                      func.json_extract(ReviewSpace.state, "$.draft")).where(ReviewSpace.id == identity)).first()
+            if found is None:
+                self._require(db, identity)
+            status, step, saved = found
+            step = self._question_step(SimpleNamespace(state={"step": json.loads(step) if step else None}), request["step_id"])
+            if status != "waiting_answer":
                 raise HTTPException(409, "当前题目不在作答阶段")
             self._labels(step["question"], request["selected"], allow_empty=True)
-            saved = value.state.get("draft", {})
+            saved = json.loads(saved) if saved else {}
             if request["draft_revision"] > saved.get("draft_revision", 0):
-                value.state = {**value.state, "draft": request}
-                value.updated_at = now()
+                db.execute(update(ReviewSpace).where(ReviewSpace.id == identity).values(
+                    state=func.json_set(ReviewSpace.state, "$.draft", func.json(json.dumps(request, ensure_ascii=False))),
+                    updated_at=now()))
                 db.commit()
-            return {"draft": value.state.get("draft", {})}
+                saved = request
+            return {"draft": saved}
 
     @staticmethod
     def _labels(question, selected, allow_empty=False):
@@ -1369,7 +1421,10 @@ class ReviewSpaceService:
                             pending = deepcopy(question_context["pending_questions"])
                             draft = {**question_context["draft"], "used_hint": True}
                             terminal, result = "waiting_answer", "讲解已保存，可继续作答当前题目"
-                        current.state = {**current.state, "messages": messages, "step": step, "draft": draft,
+                        # The transcript keeps the explanation's evidence; the current-step
+                        # pointer does not need another copy of it.
+                        stored = {k: v for k, v in step.items() if k not in ("sources", "retrieval_report")}
+                        current.state = {**current.state, "messages": messages, "step": stored, "draft": draft,
                                          "run_token": None, "stage": result, "pending_questions": pending, "question_context": None}
                         current.status = terminal
                         current.revision += 1

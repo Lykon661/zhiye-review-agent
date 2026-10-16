@@ -125,11 +125,12 @@ class Outline(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True, default=new_id)
     course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
     version: Mapped[int] = mapped_column(Integer)
-    snapshot: Mapped[dict] = mapped_column(JSON)
+    # The snapshot holds the course's full source text (megabytes); load it only when read.
+    snapshot: Mapped[dict] = mapped_column(JSON, deferred=True)
     status: Mapped[str] = mapped_column(String, default="queued")
     markdown: Mapped[str] = mapped_column(Text, default="")
     coverage: Mapped[dict] = mapped_column(JSON, default=dict)
-    chapter_results: Mapped[dict] = mapped_column(JSON, default=dict)
+    chapter_results: Mapped[dict] = mapped_column(JSON, default=dict, deferred=True)
     created_at: Mapped[str] = mapped_column(String, default=now)
 
 

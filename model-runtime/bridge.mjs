@@ -2,6 +2,8 @@
 
 import { profileCredentials } from './credential-store.mjs';
 const send = value => process.stdout.write(`${JSON.stringify(value)}\n`);
+// Safety cap for a stream that never stops; keep in sync with MAX_TOTAL_SECONDS in llm.py.
+const MAX_TOTAL_MS = 30 * 60 * 1000;
 const allowedProviders = new Set([
   'openai', 'anthropic', 'google', 'deepseek', 'openrouter', 'groq', 'xai',
   'mistral', 'moonshotai', 'moonshotai-cn', 'zai', 'zai-coding-cn',
@@ -118,15 +120,33 @@ async function main() {
     auth: { apiKey: { name: model.provider, resolve: async () => ({ auth: config.api_key
       ? { apiKey: config.api_key } : {} }) } },
   }));
+  // timeout_seconds bounds the wait for the first output and each later pause,
+  // not total generation time; long answers keep streaming while events arrive.
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), config.timeout_seconds * 1000);
+  const idleMs = config.timeout_seconds * 1000;
+  let timer;
+  const touch = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => controller.abort(), idleMs);
+  };
+  const totalTimer = setTimeout(() => controller.abort(), MAX_TOTAL_MS);
+  let lastProgress = 0;
+  // Complete calls and reasoning emit no text deltas; tell Python the request is alive.
+  const progress = () => {
+    const now = Date.now();
+    if (now - lastProgress >= 1000) {
+      lastProgress = now;
+      send({ type: 'progress' });
+    }
+  };
   let status;
   let includeUsage = true;
   let usageReported = false;
   let emittedText = false;
   const options = {
     ...(!subscription ? { apiKey: config.api_key || (api.startsWith('openai-') ? 'local-no-key' : undefined) } : {}),
-    signal: controller.signal, timeoutMs: config.timeout_seconds * 1000, maxRetries: 0,
+    // Some adapters apply timeoutMs to the whole stream; the idle timer above is the real limit.
+    signal: controller.signal, timeoutMs: MAX_TOTAL_MS, maxRetries: 0,
     maxTokens: Math.min(request.max_tokens || config.max_tokens, config.max_tokens),
     ...(config.temperature != null ? { temperature: config.temperature } : !config.reasoning ? { temperature: 0.15 } : {}),
     ...(config.reasoning && thinking !== 'default' && thinking !== 'off' ? { reasoning: thinking } : {}),
@@ -150,18 +170,18 @@ async function main() {
     let response;
     for (;;) {
       usageReported = false;
-      if (request.action === 'stream') {
-        const stream = thinking === 'default' ? models.stream(model, input, options) : models.streamSimple(model, input, options);
-        for await (const event of stream) {
-          if (event.type === 'text_delta') {
-            if (event.delta) emittedText = true;
-            send({ type: 'delta', text: event.delta });
-          }
-        }
-        response = await stream.result();
-      } else {
-        response = thinking === 'default' ? await models.complete(model, input, options) : await models.completeSimple(model, input, options);
+      touch();
+      // complete() is stream().result() in pi-ai; streaming both lets every event reset the idle timer.
+      const stream = thinking === 'default' ? models.stream(model, input, options) : models.streamSimple(model, input, options);
+      for await (const event of stream) {
+        touch();
+        if (event.type === 'text_delta' && event.delta) emittedText = true;
+        if (request.action === 'stream' && event.type === 'text_delta') {
+          lastProgress = Date.now();
+          send({ type: 'delta', text: event.delta });
+        } else progress();
       }
+      response = await stream.result();
       send({ type: 'usage', usage: tokenUsage(response.usage) });
       usageReported = true;
       if (api === 'openai-completions' && response.stopReason === 'error' && !emittedText
@@ -190,7 +210,7 @@ async function main() {
     if (!usageReported) send({ type: 'usage', usage: null });
     send({ type: 'error', code: imageErrorCode(error.message), status: error.status || status, timeout: controller.signal.aborted,
       message: subscription ? '订阅模型调用失败，请确认账号权限并尝试重新登录。' : error.message || '模型请求失败。' });
-  } finally { clearTimeout(timer); }
+  } finally { clearTimeout(timer); clearTimeout(totalTimer); }
 }
 
 main().catch(error => send({ type: 'error', message: error.message || '模型接入失败。' }));

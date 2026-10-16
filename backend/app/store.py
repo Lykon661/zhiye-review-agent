@@ -116,6 +116,20 @@ class Services:
             except ValueError:
                 logger.warning("File chapters saved; index metadata needs repair for %s", course_id, exc_info=True)
 
+    @staticmethod
+    def busy(locks, *identities):
+        """Whether a task lock for any of these records is held."""
+        return any((lock := locks.get(identity)) is not None and lock.locked() for identity in identities)
+
+    def model_busy(self, db):
+        """Queued notes or any held task lock; switching models then would mix configurations."""
+        if db.scalar(select(Job.id).where(Job.status.in_(["queued", "running"])).limit(1)):
+            return True
+        # Copy the values: request threads add locks while this check runs.
+        return any(lock.locked() for locks in (self.chat_locks, self.review_space_locks, self.practice_locks,
+                                               self.explanation_locks, self.answer_preparation_locks)
+                   for lock in list(locks.values()))
+
     def changed(self, db, course_id: str, unconfirm: bool = True):
         course = db.get(Course, course_id)
         course.version += 1
@@ -157,7 +171,7 @@ class Services:
 
     def _require_chat_idle(self, db, course_id):
         ids = db.scalars(select(ChatSession.id).where(ChatSession.course_id == course_id))
-        if any(self.chat_locks.get(identity) and self.chat_locks[identity].locked() for identity in ids):
+        if self.busy(self.chat_locks, *ids):
             raise ValueError("课程会话正在回答，请停止或完成后再删除")
 
     def remove_course(self, course_id: str):
@@ -168,13 +182,12 @@ class Services:
             documents = db.scalars(select(Document).where(Document.course_id == course_id)).all()
             session_ids = list(db.scalars(select(ChatSession.id).where(ChatSession.course_id == course_id)))
             space_ids = list(db.scalars(select(ReviewSpace.id).where(ReviewSpace.course_id == course_id)))
-            if any(self.review_space_locks.get(identity) and self.review_space_locks[identity].locked() for identity in space_ids):
+            if self.busy(self.review_space_locks, *space_ids):
                 raise ValueError("复习空间正在安排下一步，请等待完成或暂停后再删除课程")
             if any(doc.status in ("queued", "processing") for doc in documents):
                 raise ValueError("课程资料正在处理，请完成后再删除课程")
-            if any((self.practice_locks.get(doc.id) and self.practice_locks[doc.id].locked())
-                   or (self.answer_preparation_locks.get(doc.id) and self.answer_preparation_locks[doc.id].locked())
-                   for doc in documents):
+            doc_ids = [doc.id for doc in documents]
+            if self.busy(self.practice_locks, *doc_ids) or self.busy(self.answer_preparation_locks, *doc_ids):
                 raise ValueError("正在整理题目或回答练习，请完成后再删除课程")
             if db.scalar(select(Job.id).join(Outline).where(Outline.course_id == course_id, Job.status.in_(["queued", "running"]))):
                 raise ValueError("课程笔记正在生成，请完成后再删除课程")
@@ -491,9 +504,9 @@ class Services:
             self._require_chat_idle(db, doc.course_id)
             if doc.status in ("queued", "processing"):
                 raise ValueError("资料正在处理，请完成后再删除资料")
-            if self.practice_locks.get(doc.id) and self.practice_locks[doc.id].locked():
+            if self.busy(self.practice_locks, doc.id):
                 raise ValueError("正在整理题目或回答练习，请完成后再删除资料")
-            if self.answer_preparation_locks.get(doc.id) and self.answer_preparation_locks[doc.id].locked():
+            if self.busy(self.answer_preparation_locks, doc.id):
                 raise ValueError("正在准备这份练习的答案，请完成后再删除资料")
             if doc.kind == "generated":
                 file_path = self.upload_dir / (doc.id + ".json")

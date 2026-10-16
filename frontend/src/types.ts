@@ -186,6 +186,10 @@ export interface ReviewSpaceSummary {
   stage: string; error: string; stop_reason: string
   chapter_ids?: string[]; chapters?: string[]
 }
+/** Poll reply when the client's revision is current: status fields without the transcript. */
+export interface ReviewSpacePoll extends ReviewSpaceSummary {
+  unchanged: true; trace: ReviewSpace['trace']
+}
 export interface ReviewSpaceMessage {
   id: string; role: 'user' | 'assistant'; kind: 'message' | 'question' | 'explanation' | 'result' | 'summary'
   content: string; created_at: string; step?: ReviewSpaceStep; result?: ReviewSpaceAnswer

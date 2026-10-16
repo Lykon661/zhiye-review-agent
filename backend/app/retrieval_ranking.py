@@ -8,7 +8,7 @@ import logging
 from threading import RLock
 
 from .lexical import query_terms
-from .llm import StructuredOutputError, parse_json
+from .llm import StructuredOutputError, parse_json, run_parallel
 from .prompt_budget import InputBudget, paragraphs_excerpt
 
 logger = logging.getLogger(__name__)
@@ -64,8 +64,10 @@ class KnowledgeReranker:
         room = max(0, budget.limit - budget.size(RANK_RULES, empty))
         batch_size = max(1, min(24, room // 700))
         results, reports = [], []
-        for offset in range(0, min(len(sources), 96), batch_size):
-            ranked, report = self._rank_batch(query, sources[offset:offset + batch_size], topics, facets, context=context)
+        # Batches are independent model calls; a failed batch falls back on its own.
+        batches = [sources[offset:offset + batch_size] for offset in range(0, min(len(sources), 96), batch_size)]
+        for ranked, report in run_parallel(
+                lambda batch: self._rank_batch(query, batch, topics, facets, context=context), batches):
             results.extend({**s, "rerank_assessed": s.get("rerank_assessed", bool(report.get("assessed")))} for s in ranked)
             reports.append(report)
         results.extend({**s, "rerank_assessed": False} for s in sources[96:])
