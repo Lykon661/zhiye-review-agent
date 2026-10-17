@@ -10,7 +10,6 @@ $env:PYTHONUTF8 = '1'
 $env:PYTHONNOUSERSITE = '1'
 $env:PYTHONDONTWRITEBYTECODE = '1'
 Remove-Item Env:PYTHONHOME,Env:PYTHONPATH -ErrorAction SilentlyContinue
-$env:FORMULA_PYTHON = Join-Path $bundleRoot '.runtime\formula-python\python.exe'
 $env:TIKA_JAVA = Join-Path $bundleRoot '.runtime\java\bin\java.exe'
 $env:TIKA_APP_JAR = Join-Path $bundleRoot '.runtime\tika\tika-app-3.3.2.jar'
 $env:PATH = (Join-Path $bundleRoot '.runtime\node') + ';' + $env:PATH

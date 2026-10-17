@@ -2,8 +2,6 @@ import json
 import logging
 import re
 
-from hello_agents.tools.base import Tool, ToolParameter
-from hello_agents.tools.registry import ToolRegistry
 from sqlalchemy import select
 
 from .llm import model_failure_message, parse_json, run_parallel
@@ -285,16 +283,12 @@ def answer_messages(question, history, sources, practice_context=None, note_cont
     return budget.finish(), budget.payload["sources"], allowed
 
 
-class SearchTool(Tool):
+class SearchTool:
     def __init__(self, name, retrieval, course_id, chapter_id=None, knowledge=None):
-        super().__init__(name, "查找本课程真题" if name == "find_past_questions" else "查找本课程课件、笔记、练习题和已有答案")
+        self.name = name
         self.retrieval, self.course_id, self.chapter_id = retrieval, course_id, chapter_id
         self.last_sources = []
         self.knowledge = knowledge
-
-    def get_parameters(self):
-        return [ToolParameter(name="query", type="string", description="独立检索问题"),
-                ToolParameter(name="year", type="integer", description="真题年份", required=False)]
 
     def run(self, parameters: dict) -> str:
         self.last_sources = self.search(parameters)
@@ -383,9 +377,8 @@ class ReviewAgentService:
                     yield event("done", {"message_id": result.id, "content": content, "citations": [], "token_usage": result.token_usage})
                 return
             yield event("status", {"message": "正在理解问题并选择检索工具"})
-            registry = ToolRegistry()
-            for name in ("search_materials", "find_past_questions"):
-                registry.register_tool(SearchTool(name, self.services.retrieval, course_id, knowledge=self.services.knowledge))
+            tools = {name: SearchTool(name, self.services.retrieval, course_id, knowledge=self.services.knowledge)
+                     for name in ("search_materials", "find_past_questions")}
             sources, observations, used = {}, [], set()
             query = question
             calls = 0
@@ -404,7 +397,7 @@ class ReviewAgentService:
                 elif memory.get("topic"):
                     baseline_query = memory["topic"] + "；追问：" + question
             baseline_name = "find_past_questions" if re.search(r"真题|试卷|往年|历年", question) else "search_materials"
-            baseline_tool = registry.get_tool(baseline_name)
+            baseline_tool = tools[baseline_name]
             yield event("status", {"message": "正在匹配原问题的术语与课程资料"})
             baseline_parameters = {"query": baseline_query[:1500]}
             baseline_tool.run(baseline_parameters)
@@ -430,7 +423,7 @@ class ReviewAgentService:
                         break
                     if not isinstance(request, dict):
                         raise ValueError("模型工具参数格式错误。")
-                    tool = registry.get_tool(request.get("name", ""))
+                    tool = tools.get(request.get("name", ""))
                     if tool is None:
                         raise ValueError("模型请求了不允许的工具。")
                     parameters = {"query": str(request.get("query", query))[:1500]}
