@@ -25,7 +25,7 @@
 
 | 工具 | 要求 | 用途 |
 | --- | --- | --- |
-| Python | 3.11 | 后端与独立公式识别环境 |
+| Python | 3.11 | 后端与公式识别 |
 | uv | 0.11.7+，可使用 `uv` 命令 | 按锁文件安装 Python 依赖 |
 | Node.js | 22.19+，包含 npm | 前端和 pi-ai 模型调用桥接 |
 | JDK | 11+，完整 JDK | 默认安装 Tika，并解析 DOC/PPT/RTF；仅使用现代格式时可跳过 |
@@ -37,7 +37,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1
 .\run.cmd
 ```
 
-安装脚本按锁文件安装主环境、公式识别环境、前端与模型桥接依赖；默认从 Apache 官方下载 Tika 3.3.2 并校验 SHA-512。安装和首次下载模型需要联网。
+安装脚本按锁文件安装 Python 环境、前端与模型桥接依赖；默认从 Apache 官方下载 Tika 3.3.2 并校验 SHA-512。安装和首次下载模型需要联网。
 
 只使用 PDF、DOCX、PPTX、文本、Markdown 或图片时，可以先跳过 Tika，无需安装 JDK：
 
@@ -83,13 +83,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-tika.ps1
 | 后端 | FastAPI、SQLAlchemy、SQLite |
 | 检索 | 本地 Granite 311M 多语言 INT8 ONNX 向量化、Chroma、关键词检索 |
 | 解析 | PDF / Office 解析器、RapidOCR、独立公式识别进程、Apache Tika |
-| Agent | HelloAgents 检索工具循环；复习空间根据对话选择检索与讲解，练习由用户选择；pi-ai 提供模型调用 |
+| Agent | 自建检索工具循环；复习空间根据对话选择检索与讲解，练习由用户选择；pi-ai 提供模型调用 |
 
 ```text
 backend/          后端业务源码
 frontend/         复习工作台
 model-runtime/    pi-ai 模型调用桥接
-formula-worker/   独立公式识别环境的依赖声明
 scripts/          安装、启动与评估脚本
 docs/             使用说明与致谢
 ```

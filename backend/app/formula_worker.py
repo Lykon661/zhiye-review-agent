@@ -1,4 +1,4 @@
-"""JSON-lines worker; run with formula-worker/.venv, never the Agent's NumPy."""
+"""JSON-lines worker, run as a child process of the server's own Python."""
 import contextlib
 import json
 import os

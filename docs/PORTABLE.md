@@ -27,7 +27,7 @@
 
 ## 开发者重新打包
 
-在源码目录继续开发，安装依赖使用现有 `scripts/setup.ps1`。打包前准备可再分发的 Temurin 完整 JDK，以及 `.cache/packaging/formula` 下四个公开公式模型、`.cache/packaging/notices` 下许可声明。向量模型使用项目固定的 Granite 快照，文字模型位于已安装 RapidOCR 的 `models` 目录。
+在源码目录继续开发，安装依赖使用现有 `scripts/setup.ps1`。打包前准备可再分发的 Temurin 完整 JDK（脚本用 jlink 只打包 Tika 用到的模块，并预编译 DOC 辅助类），以及 `.cache/packaging/formula` 下四个公开公式模型、`.cache/packaging/notices` 下许可声明。向量模型使用项目固定的 Granite 快照，文字模型位于已安装 RapidOCR 的 `models` 目录。
 
 ```powershell
 .\.venv\Scripts\python.exe .\scripts\build-portable.py --version 0.1.0-portable.1 --java-home "可再分发的Temurin-JDK目录"

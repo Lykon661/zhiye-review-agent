@@ -22,8 +22,6 @@ if (-not $SkipTika) {
 }
 uv sync --python 3.11 --frozen --group dev
 if ($LASTEXITCODE -ne 0) { throw 'Python dependency setup failed.' }
-uv sync --project formula-worker --python 3.11 --frozen
-if ($LASTEXITCODE -ne 0) { throw 'Formula worker dependency setup failed.' }
 if (-not $SkipTika) {
     & (Join-Path $PSScriptRoot 'setup-tika.ps1')
 } else {

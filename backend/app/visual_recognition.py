@@ -9,6 +9,7 @@ from pathlib import Path
 from queue import Queue
 import re
 import subprocess
+import sys
 from threading import RLock, Thread
 
 from .config import ROOT
@@ -93,9 +94,8 @@ class VisualRecognizer:
         try:
             if self.process is None or self.process.poll() is not None:
                 self.close()
-                executable = Path(os.environ["FORMULA_PYTHON"]) if os.getenv("FORMULA_PYTHON") else ROOT / "formula-worker" / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-                if not executable.is_file():
-                    raise ValueError("公式识别环境未安装，请运行 scripts/setup.ps1。")
+                # A separate process keeps formula model memory out of the server.
+                executable = Path(sys.executable)
                 self.cache_dir.mkdir(parents=True, exist_ok=True)
                 self.log_stream = (self.cache_dir / "formula-worker.log").open("a", encoding="utf-8")
                 self.process = subprocess.Popen(

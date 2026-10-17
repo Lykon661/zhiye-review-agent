@@ -43,7 +43,12 @@ def _run(java: str, jar: Path, args: list[str], workspace: Path, output: Path, *
     try:
         # stdout goes to disk so large extracted files do not fill Python's memory.
         with output.open("wb") as stdout, log.open("wb") as stderr:
-            entry = ["-cp", str(jar), str(source)] if source is not None else ["-jar", str(jar)]
+            entry = ["-jar", str(jar)]
+            if source is not None:
+                # Releases ship the helper precompiled for a compiler-free Java runtime.
+                classes = jar.parent / "classes"
+                entry = (["-cp", f"{jar}{os.pathsep}{classes}", source.stem]
+                         if (classes / f"{source.stem}.class").is_file() else ["-cp", str(jar), str(source)])
             subprocess.run(
                 [java, "-Xmx512m", "-Dfile.encoding=UTF-8", "-Djava.awt.headless=true",
                  *entry, *args],
