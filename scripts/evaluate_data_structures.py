@@ -340,8 +340,17 @@ def run_case(services, review, course_id, case, row):
         # It must not count as the new answer or its supplied evidence.
         step = (view.get("step") or {}) if view["status"] in {"reading", "waiting_answer"} else {}
         usage = view.get("failed_token_usage") if view["status"] == "failed" else step.get("token_usage")
-        report = deepcopy(step.get("retrieval_report") or {})
-        sources = deepcopy(step.get("sources") or [])
+        # The public view drops evidence, and an explanation keeps its evidence
+        # only on its transcript message; read whichever stored copy has it.
+        stored = {}
+        if step:
+            with services.sessions() as db:
+                state = db.get(ReviewSpace, view["id"]).state
+            copies = [state.get("step") or {}, *((m.get("step") or {}) for m in reversed(state.get("messages", [])))]
+            stored = next((s for s in copies if s.get("id") == step.get("id")
+                           and ("sources" in s or "retrieval_report" in s)), {})
+        report = deepcopy(stored.get("retrieval_report") or {})
+        sources = deepcopy(stored.get("sources") or [])
         questions = []
         if step.get("question"):
             with services.sessions() as db:
