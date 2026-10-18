@@ -27,3 +27,6 @@ exclude-dependencies = ["opencv-python", "kubernetes"]
 # NumPy 2.4 makes its int(array) conversion an error, so stay below it.
 override-dependencies = ["numpy>=2,<2.4"]
 
+[tool.pytest.ini_options]
+pythonpath = ["backend"]
+testpaths = ["backend/tests"]
