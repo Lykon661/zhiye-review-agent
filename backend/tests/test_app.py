@@ -10,7 +10,7 @@ import sqlite3
 
 from fastapi.testclient import TestClient
 import pytest
-from app.models import Message
+from app.models import Chapter, Message
 
 from conftest import make_docx, make_pdf, make_pptx
 
@@ -156,10 +156,14 @@ def test_outline_requires_confirmed_chapters(client, course):
     assert response.status_code == 409, response.text
 
 
-def test_outline_traverses_all_blocks_and_marks_missing_chapter(client, course, llm):
+def test_outline_traverses_all_blocks_and_marks_missing_chapter(client, course, llm, app):
     long_text = " ".join(f"unique_tail_{index} RAG evidence." for index in range(200))
     document = upload(client, course["id"], content=make_docx([long_text, "END_OF_COURSE_MATERIAL_9127"], include_table=False))
-    confirm_chapters(client, course["id"], {"title": "第二章 尚缺资料", "position": 99, "block_ids": []})
+    confirm_chapters(client, course["id"])
+    # The API rejects new empty chapters; a saved chapter whose file later failed has no material.
+    with app.state.services.sessions() as db:
+        db.add(Chapter(course_id=course["id"], title="第二章 尚缺资料", position=99, confirmed=True))
+        db.commit()
     job, outline = start_outline(client, course["id"])
     assert job["status"] == "completed", job
     assert "END_OF_COURSE_MATERIAL_9127" in outline["markdown"]
@@ -263,7 +267,10 @@ def test_past_question_preserves_neighboring_page_and_missing_answer(client, cou
     events = chat(client, session_id, "RAG 真题")
     sources = stored_evidence(app, event_payload(events, "done")["message_id"])
     assert any(source["document_id"] == exam["id"] and source.get("year") == 2024 for source in sources)
-    answer_prompt = "\n".join(message["content"] for message in llm.stream_calls[-1])
+    # Question figures turn the user message into text and image content blocks.
+    answer_prompt = "\n".join(message["content"] if isinstance(message["content"], str) else
+                              "\n".join(part.get("text", "") for part in message["content"])
+                              for message in llm.stream_calls[-1])
     assert "CONTINUED_QUESTION_CONTEXT" in answer_prompt
     done = event_payload(events, "done")
     answer = done.get("answer", done.get("content", ""))

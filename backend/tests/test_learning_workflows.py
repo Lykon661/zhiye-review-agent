@@ -10,6 +10,7 @@ from app.models import Course, Document, PracticeQuestion, PracticeSet, ReviewSp
 from app.practice import PracticeService
 from app.practice_progress import ANSWER_POLICY
 from app.review_space import ReviewSpaceService
+from conftest import make_docx
 from test_app import upload
 
 
@@ -53,7 +54,8 @@ def test_progress_rejects_stale_signature_and_foreign_question(client, prepared_
     _, question = prepared_question
     path = f"/documents/{question['document_id']}/practice/progress"
     initial = client.get(path).json()
-    payload = {"signature": "outdated", "revision": 1, "current_question_id": question["id"],
+    # Well-formed but stale; a malformed signature is rejected earlier as invalid input.
+    payload = {"signature": "0" * 64, "revision": 1, "current_question_id": question["id"],
                "selections": {}, "drafts": {}}
     assert client.put(path, json=payload).status_code == 409
     payload.update(signature=initial["signature"], current_question_id="other-paper-question")
@@ -63,7 +65,8 @@ def test_progress_rejects_stale_signature_and_foreign_question(client, prepared_
 
 def test_answer_reassociation_invalidates_reference_but_keeps_wrong_attempt(client, course, app, prepared_question):
     practice, snapshot = prepared_question
-    answer = upload(client, course["id"], "answers.docx", kind="answer")
+    # Identical bytes would reclassify the paper itself as the answer file.
+    answer = upload(client, course["id"], "answers.docx", make_docx(["1. A"], include_table=False), kind="answer")
     with app.state.services.sessions() as db:
         q = db.get(PracticeQuestion, snapshot["id"])
         wrong = practice.wrong_questions.save_practice(db, q, db.get(Document, q.document_id),

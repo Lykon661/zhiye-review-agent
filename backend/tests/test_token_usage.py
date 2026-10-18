@@ -151,7 +151,7 @@ def test_chat_sse_usage_matches_reloaded_message_and_keeps_evidence_separate(cli
     from test_app import chat, event_payload, session, upload
     upload(client, course["id"])
     services = app.state.services
-    monkeypatch.setattr(services.model_config, "value", ModelConfig(
+    monkeypatch.setattr(services.model_config, "snapshot", lambda: ModelConfig(
         base_url="https://example.com/v1", api_key="k", model="m"))
     model = ModelClient(services.settings, services.model_config)
     def events(request, timeout):
@@ -188,7 +188,7 @@ def test_review_reply_persists_usage_for_planning_retrieval_and_explanation(cour
     from test_retrieval_token_savings import REQUEST, complete_report, material
 
     services = app.state.services
-    monkeypatch.setattr(services.model_config, "value", ModelConfig(
+    monkeypatch.setattr(services.model_config, "snapshot", lambda: ModelConfig(
         base_url="https://example.com/v1", api_key="k", model="m"))
     model = ModelClient(services.settings, services.model_config)
     def events(request, timeout):

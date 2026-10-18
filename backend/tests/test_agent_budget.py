@@ -58,9 +58,9 @@ def test_both_phases_budget_large_history_and_deduplicate_context():
 
 def test_complete_question_is_never_silently_truncated():
     question = "问题" * INPUT_BYTE_BUDGET
-    with pytest.raises(ValueError, match="问题过长"):
+    with pytest.raises(ValueError, match="问题或当前题目过长"):
         plan_messages(question, [], [])
-    with pytest.raises(ValueError, match="问题过长"):
+    with pytest.raises(ValueError, match="问题或当前题目过长"):
         answer_messages(question, [], [])
 
 

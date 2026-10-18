@@ -32,6 +32,8 @@ def test_embedding_cache_is_explicit_and_resolved_from_project_root(home, tmp_pa
         monkeypatch.setenv("HF_HOME", home)
         expected_home = ROOT / home
 
+    # The project cache may already hold the real snapshot; this checks where downloads go.
+    monkeypatch.setattr(LocalEmbedder, "_cached_snapshot", lambda self, cache_folder: None)
     # Model configuration must not depend on the shell's current directory.
     monkeypatch.chdir(tmp_path)
     embedder = LocalEmbedder(Settings(embedding_local_files_only=True))

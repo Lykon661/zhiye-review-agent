@@ -214,9 +214,10 @@ def test_review_run_skips_one_planner_call_only_when_evidence_is_complete(tmp_pa
             assert value.status == "reading" and value.state["run_token"] is None
             assert [t["action"] for t in value.state["trace"]] == ["search_materials", "explain"]
             assert value.state["action_count"] == 2
-            diagnostics = value.state["step"]["retrieval_report"]["planner"]
-            assert diagnostics["model_calls"] == (2 if has_gap else 1)
-            assert diagnostics["skipped_calls"] == (0 if has_gap else 1)
+        # Diagnostics are stored with the reply message and read through the report endpoint.
+        diagnostics = review.retrieval_report("r")["report"]["planner"]
+        assert diagnostics["model_calls"] == (2 if has_gap else 1)
+        assert diagnostics["skipped_calls"] == (0 if has_gap else 1)
         assert len(model.plans) == (2 if has_gap else 1) and len(model.explanations) == 1
         assert model.explanations[0]["materials"][0]["text"] == evidence["text"]
         assert bool(model.explanations[0]["coverage_gaps"]) is has_gap
