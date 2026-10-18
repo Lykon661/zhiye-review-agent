@@ -358,7 +358,10 @@ class RetrievalService:
         if context:
             # Each neighbor retains its own locator. Never attach its text to the primary page label.
             unit_key = next((key for key in ("slide", "page", "paragraph", "table") if key in block.locator), None)
-            position = (Block.locator[unit_key].as_integer() == block.locator[unit_key]) if unit_key else (
+            # Exam questions often continue across a page break, so papers also read adjoining pages.
+            span = 1 if doc.kind == "exam" and unit_key in ("page", "slide") else 0
+            position = Block.locator[unit_key].as_integer().between(
+                block.locator[unit_key] - span, block.locator[unit_key] + span) if unit_key else (
                 (Block.order >= max(0, block.order - 1)) & (Block.order <= block.order + 1))
             neighbors = db.scalars(select(Block).where(Block.document_id == doc.id, position).order_by(Block.order)).all()
             source["context"] = [{"block_id": b.id, "source_id": "S" + b.id,
