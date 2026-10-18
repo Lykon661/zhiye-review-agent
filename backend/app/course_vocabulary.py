@@ -14,7 +14,7 @@ from .models import AppMeta, Course, Document, Outline, RetrievalUnit
 from .retrieval_units import UNIT_POLICY
 
 VOCABULARY_CACHE_KEY = "__course_vocabulary__"
-VOCABULARY_CACHE_POLICY = "review_note_terms_cache_v1"
+VOCABULARY_CACHE_POLICY = "review_note_terms_cache_v2"
 
 
 BILINGUAL = re.compile(
@@ -46,16 +46,19 @@ def note_terms(markdown):
         if heading:
             level = len(heading[1])
             headings = [(depth, name) for depth, name in headings if depth < level]
-        pairs = list(BILINGUAL.finditer(line))
+        # Heading, quote and list markers are not part of a term such as "B+ 树".
+        text = re.sub(r"^\s*(?:#{1,6}\s+|>\s*|[-+*]\s+|\d+[.)]\s+)*", "", line)
+        pairs = list(BILINGUAL.finditer(text))
         table_header = ("|" in line and index + 1 < len(lines)
                         and bool(re.fullmatch(r"\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*", lines[index + 1])))
         for pair in pairs:
             chinese = pair[1].strip()
             names = tuple(dict.fromkeys(t.strip() for t in re.split(r"[,;/]", pair[2]) if t.strip()))
             if names:
+                # Any column after the first (row-label) column names a comparison dimension.
                 entries.append({"names": names, "chinese": chinese,
                                 "parents": tuple(name for _, name in headings),
-                                "facet": table_header and "|" in line[:pair.start()].strip().strip("|")})
+                                "facet": table_header and "|" in text[:pair.start()].strip().lstrip("|")})
         if heading:
             title = pairs[0][2].split(",")[0].strip() if pairs else heading[2].strip("* ")
             headings.append((len(heading[1]), title))
