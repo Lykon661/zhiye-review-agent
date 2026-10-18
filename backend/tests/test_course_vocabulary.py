@@ -152,8 +152,7 @@ def test_terms_inside_sentences_start_after_the_leading_clause():
 def test_names_written_across_most_chapters_are_marked_as_ordinary(vocabulary_store):
     with vocabulary_store.sessions() as db:
         outline = db.get(Outline, "notes")
-        outline.chapter_results = {"one": {"markdown": NOTES + "查找（Find）先比较键。
-"},
+        outline.chapter_results = {"one": {"markdown": NOTES + "查找（Find）先比较键。\n"},
                                    "two": {"markdown": "顺序查找要逐项比较。"}, "three": {"markdown": "二分查找。"}}
         db.get(RetrievalUnit, "u").text += " Find compares keys."
         db.commit()
