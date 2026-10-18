@@ -50,8 +50,10 @@ class ControlledLLM:
 
     def __init__(self):
         self.complete_calls: list[list[dict]] = []
+        self.markdown_calls: list[list[dict]] = []
         self.stream_calls: list[list[dict]] = []
         self.complete_responses = deque()
+        self.markdown_responses = deque()
         self.stream_responses = deque()
         self.fail_complete = False
         self.fail_stream = False
@@ -67,9 +69,6 @@ class ControlledLLM:
         if "[TASK:KNOWLEDGE_RERANK]" in prompt:
             return json.dumps({"rankings": [{"id": c["id"], "score": 70,
                 "topics": payload["requested_topics"]} for c in payload["candidates"]], "coverage": []}, ensure_ascii=False)
-        if "[TASK:KNOWLEDGE_SCOPE]" in prompt:
-            return json.dumps({"topics": [{"name": payload["topic"], "queries": [payload["topic"]],
-                "unit_ids": [c["id"] for c in payload["catalog"][:1]]}], "facets": []}, ensure_ascii=False)
         if self.complete_responses:
             value = self.complete_responses.popleft()
             if isinstance(value, Exception):
@@ -83,16 +82,23 @@ class ControlledLLM:
             # Resolve a simple pronoun using history so the application can be checked.
             query = "RAG" if "它" in question else question
             return json.dumps({"query": query, "tools": [{"name": tool, "query": query}]}, ensure_ascii=False)
-        if "[TASK:OUTLINE_MAP]" in prompt:
-            points = [{"text": block["text"], "source_ids": [block["source_id"]]} for block in payload["blocks"] if block["text"].strip()]
-            return json.dumps({"core_points": points, "definitions": [], "confusions": [], "past_questions": []}, ensure_ascii=False)
-        if "[TASK:OUTLINE_MERGE]" in prompt:
-            result = {key: [] for key in ("core_points", "definitions", "confusions", "past_questions")}
-            for partial in payload["partials"]:
-                for key in result:
-                    result[key].extend(partial.get(key, []))
-            return json.dumps(result, ensure_ascii=False)
         raise AssertionError(f"Unknown LLM task: {prompt[:200]}")
+
+    def complete_markdown(self, messages: list[dict]) -> str:
+        self.markdown_calls.append(messages)
+        if self.fail_complete:
+            raise RuntimeError("Controlled LLM timeout")
+        if self.markdown_responses:
+            value = self.markdown_responses.popleft()
+            if isinstance(value, Exception):
+                raise value
+            return value
+        if not re.match(r"\[TASK:REVIEW_NOTES_(?:MAP|MERGE|CHAPTER|GUIDANCE|GUIDANCE_MERGE)\]", messages[0]["content"]):
+            raise AssertionError(f"Unknown Markdown task: {messages[0]['content'][:200]}")
+        # Echo every input text so offline notes keep the material they were given.
+        payload = json.loads(messages[-1]["content"])
+        body = "\n\n".join(value["text"] for value in payload.get("materials") or payload.get("drafts") or [])
+        return f"### 复习要点\n\n{body}"
 
     def stream(self, messages: list[dict]):
         self.stream_calls.append(messages)

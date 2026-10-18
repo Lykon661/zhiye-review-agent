@@ -163,12 +163,12 @@ def test_outline_traverses_all_blocks_and_marks_missing_chapter(client, course, 
     job, outline = start_outline(client, course["id"])
     assert job["status"] == "completed", job
     assert "END_OF_COURSE_MATERIAL_9127" in outline["markdown"]
-    assert "第二章 尚缺资料" in outline["markdown"]
-    assert "缺" in outline["markdown"] or "未提供" in outline["markdown"]
-    map_calls = [json.loads(messages[-1]["content"]) for messages in llm.complete_calls if "[TASK:OUTLINE_MAP]" in messages[0]["content"]]
-    seen_ids = {block["source_id"] for payload in map_calls for block in payload["blocks"]}
-    expected_ids = {block["id"] for block in blocks(client, document["id"]) if block["text"].strip()}
-    assert seen_ids == expected_ids
+    missing = next(chapter for chapter in outline["coverage"]["chapters"] if chapter["title"] == "第二章 尚缺资料")
+    assert missing["missing_material"] is True and missing["processed"] is False
+    sent = "\n".join(value["text"] for messages in llm.markdown_calls if "[TASK:REVIEW_NOTES_" in messages[0]["content"]
+                     for value in json.loads(messages[-1]["content"]).get("materials", []))
+    expected = [block["text"] for block in blocks(client, document["id"]) if block["text"].strip()]
+    assert expected and all(text in sent for text in expected)
     exported = client.get(f"/outlines/{outline['id']}/export")
     assert exported.status_code == 200
     assert exported.text == outline["markdown"]

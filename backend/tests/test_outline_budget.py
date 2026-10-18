@@ -1,22 +1,43 @@
-"""Final prompt byte budgets preserve original map inputs and oversized merge points."""
+"""Review-note prompts stay within byte budgets and MAP→MERGE→CHAPTER keeps every topic."""
 import json
-
-import pytest
+import re
 
 from app.models import Job, Outline
-from app.outlines import FIELDS, MAX_PROMPT_BYTES, OutlineService
+from app.outlines import (BATCH_PROMPT_BYTES, MAX_PROMPT_BYTES, OutlineService, material_units,
+                          outline_messages, packet_batches, prompt_bytes)
+
+MARKER = re.compile(r"POINT_\d\d")
+CHAPTER = {"id": "chapter", "title": "第一章 中文资料", "position": 0}
 
 
-def run_snapshot(app, course_id, texts, metadata_chars=500):
-    chapter = {"id": "chapter", "title": "第一章 中文资料", "position": 0}
-    source_blocks = [
-        {"source_id": f"{number:032x}", "document_id": "document", "chapter_id": chapter["id"],
-         "text": text, "locator": {"label": "定位" * metadata_chars + '"\\' * 50},
-         "kind": "lecture", "filename": "中文文件" * 50 + ".docx", "year": None}
-        for number, text in enumerate(texts, 1)
-    ]
-    snapshot = {"course_name": "中文课程", "version": 0, "documents": [],
-                "blocks": source_blocks, "chapters": [chapter]}
+def long_texts():
+    # Each ordinary paragraph needs a MAP batch of its own; the last one is larger than any batch.
+    return [f"POINT_{number:02d} " + "原文资料" * 600 for number in range(8)] + ["POINT_08 " + "超长原文" * 2500]
+
+
+def source_blocks(texts):
+    return [{"source_id": f"block-{number}", "document_id": "document", "chapter_id": CHAPTER["id"],
+             "text": text, "locator": {"paragraph": number}, "kind": "lecture",
+             "filename": "lecture.docx", "year": None} for number, text in enumerate(texts)]
+
+
+def run_notes(app, course_id, llm, monkeypatch, texts, chapter=CHAPTER):
+    calls = []
+
+    def complete_markdown(messages):
+        task = re.match(r"\[TASK:REVIEW_NOTES_(\w+)\]", messages[0]["content"])[1]
+        payload = json.loads(messages[-1]["content"])
+        calls.append((task, payload, prompt_bytes(messages)))
+        markers = " ".join(sorted({marker for value in payload.get("materials") or payload["drafts"]
+                                   for marker in MARKER.findall(value["text"])}))
+        # MAP drafts are long enough that the final edit needs a MERGE round first.
+        padding = "\n\n" + "阶段整理" * 330 if task == "MAP" else ""
+        return f"### 中文资料要点\n\n要点 {markers}{padding}"
+
+    monkeypatch.setattr(llm, "complete_markdown", complete_markdown)
+    snapshot = {"course_name": "中文课程", "version": 0,
+                "documents": [{"id": "document", "filename": "lecture.docx", "kind": "lecture"}],
+                "blocks": source_blocks(texts), "chapters": [chapter]}
     services = app.state.services
     with services.sessions() as db:
         outline = Outline(course_id=course_id, version=0, snapshot=snapshot)
@@ -30,62 +51,45 @@ def run_snapshot(app, course_id, texts, metadata_chars=500):
     OutlineService(services).run(job_id)
     with services.sessions() as db:
         job, outline = db.get(Job, job_id), db.get(Outline, outline_id)
-        return source_blocks, job.status, job.error, outline.chapter_results, outline.markdown
+        return job.status, job.error, outline.markdown, calls
 
 
-@pytest.mark.parametrize("metadata_chars", [500, 5000], ids=["all-long-chinese-inputs", "metadata-too-large"])
-def test_map_budget_preserves_full_chinese_text_and_metadata(app, course, llm, metadata_chars):
-    texts = ["中文知识点资料" * 1700 + "FIRST_FINAL_POINT", "另一个知识点" * 1500 + "SECOND_FINAL_POINT"]
-    original, status, error, _, markdown = run_snapshot(app, course["id"], texts, metadata_chars)
+def test_packet_batches_split_only_oversized_text_and_keep_every_character():
+    values = material_units(source_blocks(long_texts()))
+    batches = packet_batches(CHAPTER, values)
 
-    if metadata_chars == 5000:
-        assert status == "failed"
-        assert "元数据" in error and "预算" in error
-        assert not llm.complete_calls, "Oversized metadata must fail explicitly before sending any prompt."
-        assert not markdown
-        return
-
-    assert status == "completed", error
-    reconstructed = {block["source_id"]: [] for block in original}
-    metadata = {block["source_id"]: {key: value for key, value in block.items() if key != "text"} for block in original}
-    for messages in llm.complete_calls:
-        assert len(json.dumps(messages, ensure_ascii=False).encode("utf-8")) <= MAX_PROMPT_BYTES
-        if "[TASK:OUTLINE_MAP]" not in messages[0]["content"]:
-            continue
-        for part in json.loads(messages[-1]["content"])["blocks"]:
-            reconstructed[part["source_id"]].append(part["text"])
-            assert {key: value for key, value in part.items() if key != "text"} == metadata[part["source_id"]]
-    assert {source_id: "".join(parts) for source_id, parts in reconstructed.items()} == {
-        block["source_id"]: block["text"] for block in original
-    }
-    assert "FIRST_FINAL_POINT" in markdown and "SECOND_FINAL_POINT" in markdown
+    assert all(prompt_bytes(outline_messages("MAP", CHAPTER, "materials", batch)) <= BATCH_PROMPT_BYTES
+               for batch in batches)
+    pieces = [piece for batch in batches for piece in batch]
+    assert "".join(piece["text"] for piece in pieces) == "".join(value["text"] for value in values)
+    assert [piece["text"] for piece in pieces[:8]] == [value["text"] for value in values[:8]], \
+        "A paragraph that fits one batch must not be split."
+    assert len(pieces) > len(values), "The oversized paragraph must be split across batches."
+    assert all(set(piece) == {"kind", "text"} for piece in pieces), "Prompts carry no IDs, filenames or locators."
 
 
-def test_oversized_partials_merge_locally_without_losing_points_or_sources(app, course, llm, monkeypatch):
-    expected_points = []
-
-    def oversized_map(messages, json_mode=False):
-        llm.complete_calls.append(messages)
-        assert len(json.dumps(messages, ensure_ascii=False).encode("utf-8")) <= MAX_PROMPT_BYTES
-        assert "[TASK:OUTLINE_MAP]" in messages[0]["content"], "Oversized partials must never be sent for LLM merging."
-        source_ids = list(dict.fromkeys(block["source_id"] for block in json.loads(messages[-1]["content"])["blocks"]))
-        unique = {"text": "长知识点" * 1000 + f"FINAL_POINT_{len(expected_points)}", "source_ids": source_ids}
-        expected_points.append(unique)
-        shared = {"text": "共同知识点", "source_ids": source_ids}
-        result = {field: [] for field in FIELDS}
-        result["core_points"] = [shared, unique]
-        result["definitions"] = [shared]
-        return json.dumps(result, ensure_ascii=False)
-
-    monkeypatch.setattr(llm, "complete", oversized_map)
-    original, status, error, results, markdown = run_snapshot(app, course["id"], ["原文资料" * 2000 for _ in range(4)])
+def test_map_merge_chapter_reduction_keeps_every_topic_within_budget(app, course, llm, monkeypatch):
+    texts = long_texts()
+    status, error, markdown, calls = run_notes(app, course["id"], llm, monkeypatch, texts)
 
     assert status == "completed", error
-    assert len(expected_points) > 3, "Exercise more than one hierarchy level."
-    result = results["chapter"]
-    assert result["core_points"][1:] == expected_points
-    all_sources = [block["source_id"] for block in original]
-    assert result["core_points"][0] == {"text": "共同知识点", "source_ids": all_sources}
-    assert result["definitions"] == [{"text": "共同知识点", "source_ids": all_sources}]
-    assert expected_points[-1]["text"] in markdown
-    assert all(f"[S{source_id}]" in markdown for source_id in expected_points[-1]["source_ids"])
+    assert all(size <= MAX_PROMPT_BYTES for _, _, size in calls)
+    tasks = [task for task, _, _ in calls]
+    assert set(tasks) == {"MAP", "MERGE", "CHAPTER"}
+    assert tasks.count("CHAPTER") == 1 and tasks[-1] == "CHAPTER"
+    assert any(len(payload["drafts"]) > 1 for task, payload, _ in calls if task == "MERGE"), \
+        "MERGE must combine drafts instead of passing them through one by one."
+    pieces = [value["text"] for task, payload, _ in calls if task == "MAP" for value in payload["materials"]]
+    assert sum(map(len, pieces)) == sum(map(len, texts)), "MAP reads every character exactly once."
+    for number in range(9):
+        assert f"POINT_{number:02d}" in markdown
+
+
+def test_oversized_chapter_title_fails_before_any_model_call(app, course, llm, monkeypatch):
+    chapter = {**CHAPTER, "title": "很长的章节名称" * 1000}
+    status, error, markdown, calls = run_notes(app, course["id"], llm, monkeypatch, ["POINT_00 原文"], chapter)
+
+    assert status == "failed"
+    assert "章节名称" in error and "预算" in error
+    assert not calls, "An oversized prompt must fail explicitly before sending any request."
+    assert not markdown

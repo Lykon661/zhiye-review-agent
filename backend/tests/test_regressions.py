@@ -5,29 +5,31 @@ remain real. These tests do not claim real-course retrieval or answer quality.
 """
 from __future__ import annotations
 
-from copy import deepcopy
-
 import pytest
 from sqlalchemy import select
 
+from app.llm import StructuredOutputError
 from app.models import Chunk
-from app.outlines import FIELDS, OutlineService, validate_result
+from app.outlines import NO_CONTENT, clean_markdown
 from conftest import make_docx
 from test_app import blocks, chat, confirm_chapters, session, start_outline, upload
 
 
-@pytest.mark.parametrize("empty_result", [{}, {field: [] for field in FIELDS}], ids=["missing-fields", "empty-fields"])
-def test_nonempty_material_cannot_silently_complete_an_empty_outline(
-    client, course, llm, empty_result,
-):
-    upload(client, course["id"], content=make_docx(["RAG material must appear in the outline."], include_table=False))
+@pytest.mark.parametrize("reply,reason", [
+    ('{"core_points": []}', "JSON"),
+    ("### 只有标题\n\n#### 也没有正文", "仅返回标题"),
+], ids=["json", "heading-only"])
+def test_nonempty_material_cannot_silently_complete_empty_notes(client, course, llm, reply, reason):
+    upload(client, course["id"], content=make_docx(["RAG material must appear in the notes."], include_table=False))
     confirm_chapters(client, course["id"])
-    llm.complete_responses.append(deepcopy(empty_result))
+    # One unusable reply is retried once; both attempts are rejected.
+    llm.markdown_responses.extend([reply, reply])
 
     job, outline = start_outline(client, course["id"])
 
-    assert job["status"] == "failed", "An empty map response must not report the real chapter as processed."
-    assert job["error"]
+    assert job["status"] == "failed", "Unusable Markdown must not report the real chapter as processed."
+    assert reason in job["error"]
+    assert len(llm.markdown_calls) == 2
     assert outline["status"] == "failed"
     assert client.get(f"/outlines/{outline['id']}/export").status_code == 409
 
@@ -37,9 +39,35 @@ def test_nonempty_material_cannot_silently_complete_an_empty_outline(
     assert "RAG material must appear" in client.get(f"/outlines/{outline['id']}").json()["markdown"]
 
 
-def test_empty_missing_chapter_result_is_still_legal_without_sources():
-    result = {field: [] for field in FIELDS}
-    assert validate_result(result, set()) == result
+def test_knowledge_material_declared_empty_fails_instead_of_completing(client, course, llm):
+    upload(client, course["id"], content=make_docx(["RAG material must appear in the notes."], include_table=False))
+    confirm_chapters(client, course["id"])
+    llm.markdown_responses.append(NO_CONTENT)
+
+    job, outline = start_outline(client, course["id"])
+
+    assert job["status"] == "failed"
+    assert "没有可整理的知识正文" in job["error"]
+    assert client.get(f"/outlines/{outline['id']}/export").status_code == 409
+
+
+@pytest.mark.parametrize("text", [
+    '{"core_points": [{"text": "RAG"}]}',
+    '[{"text": "RAG"}]',
+    '```markdown\n{"core_points": []}\n```',
+    "### 只有标题\n\n#### 子标题",
+    "<think>先列提纲</think>\n## 第一章 RAG\n### 检索增强生成（RAG）",
+    "### 资料来源\n- lecture.docx",
+], ids=["json-object", "json-array", "fenced-json", "headings", "chapter-title-only", "forbidden-section-only"])
+def test_clean_markdown_rejects_json_and_heading_only_output(text):
+    with pytest.raises(StructuredOutputError):
+        clean_markdown(text, "第一章 RAG")
+
+
+def test_clean_markdown_keeps_topic_body_and_drops_wrappers():
+    raw = "```markdown\n## 第一章 RAG\n## 检索增强生成（RAG）\nRAG 先检索再生成。[S" + "a" * 32 + "]\n```"
+    assert clean_markdown(raw, "第一章 RAG") == "### 检索增强生成（RAG）\nRAG 先检索再生成。"
+    assert clean_markdown(NO_CONTENT, "第一章 RAG") == ""
 
 
 def test_long_question_current_block_contains_its_final_condition(client, course, app, llm):
@@ -140,35 +168,3 @@ def test_partial_chapter_index_failure_blocks_search_until_repair(client, course
     assert sources
     assert {source["document_id"] for source in sources} == {first["id"], second["id"]}
     assert all(source["chapter_id"] == current["id"] for source in sources)
-
-
-def test_snapshot_exam_associations_survive_live_deletion_and_new_upload(client, course, app, monkeypatch):
-    lecture = upload(client, course["id"], "rag.docx", make_docx(["RAG retrieval source evidence generation."], include_table=False))
-    exam = upload(client, course["id"], "past2024.docx", make_docx(["RAG retrieval question: explain source evidence."], include_table=False), kind="exam", year=2024)
-    confirm_chapters(client, course["id"])
-    service = OutlineService(app.state.services)
-    with app.state.services.sessions() as db:
-        snapshot = service.snapshot(db, course["id"])
-    results = {
-        chapter["id"]: {"core_points": [{"text": "RAG retrieval source evidence generation", "source_ids": []}]}
-        for chapter in snapshot["chapters"]
-    }
-
-    def forbid_live_search(*args, **kwargs):
-        raise AssertionError("Snapshot associations must not query the mutable live index.")
-
-    monkeypatch.setattr(app.state.services.retrieval, "search", forbid_live_search)
-    baseline = service._associate_exams(snapshot, results)
-    associated = [source for values in baseline.values() for source in values]
-    original_exam_blocks = {block["id"] for block in blocks(client, exam["id"])}
-    assert associated
-    assert {source["block_id"] for source in associated}.issubset(original_exam_blocks)
-
-    assert client.delete(f"/documents/{exam['id']}").status_code == 204
-    assert client.delete(f"/documents/{lecture['id']}").status_code == 204
-    new_exam = upload(client, course["id"], "past2025.docx", make_docx(["RAG retrieval NEW_QUESTION_NOT_IN_SNAPSHOT"], include_table=False), kind="exam", year=2025)
-    after_changes = service._associate_exams(snapshot, results)
-
-    assert after_changes == baseline
-    new_blocks = {block["id"] for block in blocks(client, new_exam["id"])}
-    assert not any(source["block_id"] in new_blocks for values in after_changes.values() for source in values)
