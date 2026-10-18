@@ -1,115 +1,166 @@
 # 知页 · 期末复习 Agent
 
-把课程资料整理成自己的复习工作台：上传课件与笔记，生成中文复习笔记，围绕资料提问，再用试卷练习和错题本巩固。
+![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.142-009688?logo=fastapi&logoColor=white)
+![Vue](https://img.shields.io/badge/Vue-3.5-4FC08D?logo=vuedotjs&logoColor=white)
+![SQLite](https://img.shields.io/badge/SQLite-FTS5-003B57?logo=sqlite&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-blue)
 
-项目面向 Windows 本机单用户使用，是学习 Hello-Agents 后围绕期末复习需求实现的个人项目。课程资料、会话与练习进度保存在本机；模型生成所需的文字和题图会发送到你配置的模型服务。
+一个**依据课程原文作答**的本地复习 Agent：上传课件、笔记和往年试卷，它会生成中文复习笔记、围绕原文讲解和追问、按要求出题，并记录错题和学习情况。
 
-## 能做什么
+重点解决两个问题：**用中文提问也能找到英文课件里的原文**；**“列举 / 对比”类综合问题不只召回少数几页**，覆盖不到的地方明确告诉用户。
 
-- **资料库**：支持 PDF、Word、PPT、文本、Markdown 和图片；本地 OCR 识别文字与公式，保存原文位置供预览。
-- **复习笔记**：按文件建立目录，支持排序、改名、合并；分批阅读资料生成中文 Markdown 笔记，保留中英文关键术语。
-- **复习问答**：在当前课程中结合关键词与向量检索，多轮解释知识点或查找往年题目。
-- **复习空间**：通过聊天讲解、追问和梳理知识点，想做题时直接说明主题、题型、数量和难度；优先课程资料，可用模型已有知识补充，联网搜索作为兜底并保留来源；聊天记录自动保存，支持重命名和删除。
-- **在线练习**：整理上传试卷，关联答案；按章节、知识点或薄弱点 AI 生题，支持练习改名与进度保存，英文题目可翻译。
-- **学习记忆**：保存讲解偏好、课程学习记录与会话摘要，可查看、修改或忘记；记忆用于安排复习，不作为知识依据。
-- **错题本**：选择题作答不一致时自动收录，也可手动添加；保存题目、作答和已获取的解析。
-- **模型接入**：分别保存多个服务商连接与模型，支持 API Key 与模型订阅 OAuth 登录；按需切换模型，配置视觉与思考设置，也可接入本地免密钥服务。
+![复习空间：依据课件页码讲解知识点](docs/images/review-space.png)
 
-## Windows 解压即用版
+## 为什么做这个
 
-在 [GitHub Releases](https://github.com/Lykon661/zhiye-review-agent/releases) 下载 `Zhiye-版本-windows-x64.zip`，完整解压后双击 **启动知页.cmd**。运行环境和本地识别模型包含在包内；模型问答仍需配置自己的模型服务。便携版页面地址为 `http://127.0.0.1:8000/`，用户数据保存在 `%LOCALAPPDATA%\Zhiye`。使用、升级与发布验证状态见 [便携版说明](docs/PORTABLE.md)。
+复习时课件是英文 PPT，笔记、真题和答案散在不同文件里。直接问通用聊天模型，得到的往往是教材式答案，不一定符合老师课件的口径，也无法回到原文核对。所以我把“上传资料 → 整理笔记 → 依据原文问答 → 练习 → 错题”做成一个完整流程，并让每次回答都能追溯到具体页码。
 
-## 从源码启动（Windows）
+项目面向 Windows 本机单用户：课程资料、数据库和索引都在本地，只有生成所需的文字和题图会发送到用户自己配置的模型服务。
 
-先安装以下工具，并确保命令可从终端调用：
+## 功能
 
-| 工具 | 要求 | 用途 |
+| 模块 | 说明 |
+| --- | --- |
+| 资料库 | PDF、Word、PPT、文本、Markdown、图片；本地 OCR 与公式识别，保存原文位置供预览 |
+| 复习笔记 | 按章节分批读取原文生成中文 Markdown 笔记，保留“中文（English）”术语对照，KaTeX 渲染公式 |
+| 复习空间 | 对话式讲解与追问；Agent 自主决定检索、讲解、找题或出题；可限定章节范围 |
+| 在线练习 | 整理上传的试卷并关联答案；按章节、知识点或薄弱点 AI 生题；英文题可翻译 |
+| 错题本 / 学习记忆 | 答错自动收录；保存讲解偏好与学习记录，用于安排复习，不作为知识依据 |
+| 模型接入 | 多服务商、多模型切换，支持 API Key、订阅 OAuth 登录和 Ollama 等本地服务 |
+
+| 原文缺口提示与本次 Tokens | 复习笔记（KaTeX 公式） |
+| --- | --- |
+| ![回答下方的依据、Token 用量与原文缺口提示](docs/images/review-evidence.png) | ![复习笔记](docs/images/notes.png) |
+| **试卷练习（原题定位、翻译、进度保存）** | **资料库** |
+| ![在线练习](docs/images/practice.png) | ![资料库](docs/images/library.png) |
+
+## 架构
+
+```mermaid
+flowchart LR
+    UI["Vue 3 工作台<br/>SSE 流式"] -->|HTTP / SSE| API["FastAPI"]
+    API --> Parse["解析管线<br/>PDF/Office/Tika<br/>RapidOCR · 公式识别子进程"]
+    Parse --> DB[("SQLite (WAL)<br/>Block · Chunk · 会话 · 练习")]
+    Parse --> Idx["索引<br/>FTS5 BM25 + Chroma 向量<br/>Granite INT8 ONNX"]
+    API --> Agent["Agent 循环<br/>结构化计划 · 工具白名单 · 次数上限"]
+    Agent --> Ret["混合检索<br/>RRF 融合 · LLM 重排 · 引用校验"]
+    Ret --> Idx
+    Ret --> DB
+    Agent --> LLM["pi-ai 桥接<br/>Node 子进程"]
+    LLM --> Provider["用户配置的模型服务"]
+```
+
+一次“列举并比较课件里的各种搜索树”的请求大致经过：
+
+```text
+识别请求类型（列举 / 对比 / 仅限原文）
+  → 从当前有效笔记读取双语术语与标题层级，展开子主题和比较维度
+  → 每个子主题分别做 BM25 + 向量召回，RRF 合并，按原文单元去重
+  → 模型重排并给出逐字引用，程序校验引用确实存在于原文
+  → 按输入预算放入整页或段落，裁剪后再次检查引用和覆盖缺口
+  → 缺项补搜一次；仍缺则在回答中说明
+  → 生成回答，保存实际证据、检索诊断、行动轨迹和 Token 用量
+```
+
+## 技术要点
+
+**1. 页 / 小节级上下文单元**
+PPT/PDF 按页、Word/文本按小节组织成检索单元，再切成约 300 token 的向量片段（每片段带本页标题）。用短片段召回、读回整页原文，避免只拿到标题而丢掉正文和代码。见 [`retrieval_units.py`](backend/app/retrieval_units.py)、[`knowledge_index.py`](backend/app/knowledge_index.py)。
+
+**2. 跨语言混合检索**
+SQLite FTS5 BM25 负责精确术语和代码名，本地 Granite 311M 多语言模型（INT8 ONNX，CPU）负责语义匹配，两路用 RRF（k=60）融合，不直接比较两种分数。中文问题的关键词扩展复用笔记里已有的“中文（English）”对照，且英文原词必须真实出现在当前章节原文中——不额外调用模型翻译，也不维护固定词表。见 [`retrieval.py`](backend/app/retrieval.py)、[`course_vocabulary.py`](backend/app/course_vocabulary.py)。
+
+**3. 综合问题的证据覆盖**
+普通 top-k 容易集中在少数主题。对列举/对比问题，按子主题和比较维度分别召回；重排模型必须返回候选正文中的逐字引用，程序校验引用存在（缓存命中也会对当前原文重新校验）；上下文按模型窗口裁剪后，再检查引用是否还留在最终提示里。见 [`retrieval_ranking.py`](backend/app/retrieval_ranking.py)、[`prompt_budget.py`](backend/app/prompt_budget.py)。
+
+**4. 有边界、可诊断的 Agent 循环**
+模型每步输出一个 JSON 计划，程序校验工具名、参数与章节范围后再执行：普通问答最多 3 次检索调用，复习空间每轮最多 6 次行动，联网兜底每轮最多 2 次。每轮保存行动轨迹、实际进入提示的证据、检索诊断和分阶段 Token 用量，失败可以定位到规划、检索、打包或生成阶段；用户要求“仅依据课程资料”时，服务端禁止模型补充和联网。见 [`agent.py`](backend/app/agent.py)、[`review_space.py`](backend/app/review_space.py)。
+
+**5. 工程细节**
+- 公式 OCR 跑在独立子进程，超时可回收；旧版 DOC 中 Tika 不输出的上下标，用 Tika 自带的 POI 补读（[`LegacyWordScripts.java`](backend/app/LegacyWordScripts.java)）。
+- 模型调用经 Node 子进程桥接 [pi-ai](https://github.com/earendil-works/pi/tree/main/packages/ai)，统一多家服务商的流式输出、用量和 OAuth 凭据（带文件锁的凭据存储）。
+- 重排结果按来源缓存，证据齐全时跳过一次规划调用；回答下方显示本次 Token 与调用次数。
+- 生成任务分批写检查点，后端重启后可恢复；前端用请求代次丢弃切换课程/会话后返回的过期响应。
+- Windows 便携版：合并 Python 环境、jlink 裁剪 JRE，解压即用（[Releases](https://github.com/Lykon661/zhiye-review-agent/releases)）。
+
+## 评测
+
+自建数据结构课程 30 例诊断集（[`data_structures.jsonl`](scripts/evaluation/data_structures.jsonl)），覆盖知识问答、中文问英文资料、代码解释、综合比较、资料外问题和多轮复习流程。评测脚本从数据库一致性副本重建索引，走真实的复习空间服务，不影响本地数据。
+
+一次完整运行（2026-10-10，模型 deepseek-flash）的结果：
+
+| 指标 | 结果 | 口径 |
 | --- | --- | --- |
-| Python | 3.11 | 后端与公式识别 |
-| uv | 0.11.7+，可使用 `uv` 命令 | 按锁文件安装 Python 依赖 |
-| Node.js | 22.19+，包含 npm | 前端和 pi-ai 模型调用桥接 |
-| JDK | 11+，完整 JDK | 默认安装 Tika，并解析 DOC/PPT/RTF；仅使用现代格式时可跳过 |
+| 动作完成率 | 28/30（93.3%） | 状态、动作类型、题数、范围符合请求；不等于答案正确 |
+| 核心回答通过率 | 25/30（83.3%） | AI 逐题复核，非真人评审 |
+| 严格任务通过率 | 21/30（70.0%） | 同时要求遵守“仅依据课件”等明确限制 |
+| 中文问英文资料 | 5/5 严格通过 | 跨语言子集 |
+| 标注原文进入最终提示 | 32/48（66.7%） | 按标注片段计，标注不穷举等价证据，不是 Recall@K |
+| 单轮服务耗时 | 中位数 22.8 s，P95 44.6 s | 含规划、检索、生成；29 个成功轮次 |
 
-下载或克隆仓库，在项目根目录打开 PowerShell，然后执行：
+暴露的主要问题：综合列举漏项（如“各种排序算法”只覆盖少数几种）、资料外问题在“仅依据课件”限制下仍补充模型知识（严格通过 2/5）、个别生题失败。之后针对范围遵循、证据不足处理和生题引用映射做了修复，**修复后的效果尚未重新评测**。方法、指标定义与复现方式见 [评测说明](docs/EVALUATION.md)。
+
+## 快速开始
+
+### Windows 便携版
+
+在 [Releases](https://github.com/Lykon661/zhiye-review-agent/releases) 下载 `Zhiye-版本-windows-x64.zip`，完整解压后双击 **启动知页.cmd**，浏览器打开 `http://127.0.0.1:8000/`。运行环境和本地识别模型都在包内，问答仍需配置自己的模型服务。详见 [便携版说明](docs/PORTABLE.md)。
+
+### 从源码运行
+
+需要 Python 3.11、[uv](https://docs.astral.sh/uv/) 0.11.7+、Node.js 22.19+；解析 DOC/PPT/RTF 另需 JDK 11+（只用 PDF/DOCX/PPTX/图片时可加 `-SkipTika` 跳过）。
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1
 .\run.cmd
 ```
 
-安装脚本按锁文件安装 Python 环境、前端与模型桥接依赖；默认从 Apache 官方下载 Tika 3.3.2 并校验 SHA-512。安装和首次下载模型需要联网。
+打开 [复习工作台](http://127.0.0.1:5173/)（API 文档在 `http://127.0.0.1:8000/docs`），在右上角 **模型配置** 添加服务商与模型并保存，然后创建课程、上传资料。完整步骤见 [使用说明](docs/USAGE.md) 和 [模型配置](docs/MODEL_CONFIG.md)。
 
-只使用 PDF、DOCX、PPTX、文本、Markdown 或图片时，可以先跳过 Tika，无需安装 JDK：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -SkipTika
-.\run.cmd
-```
-
-以后需要 DOC/PPT/RTF 时，安装 JDK 11+，再执行：
+### 测试
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-tika.ps1
+uv run pytest
+npm --prefix frontend test
 ```
 
-页面地址：[复习工作台](http://127.0.0.1:5173/) · [API 文档](http://127.0.0.1:8000/docs)
+后端测试覆盖解析、分块、混合检索与术语扩展、输入预算、Token 统计、生成检查点与重启恢复、删除生命周期等；前端测试覆盖 SSE 解析、草稿持久化和练习进度。
 
-进入页面后，打开右上角 **模型配置**，先添加服务商并填写接口地址和 API Key，再从目录添加模型或手动填写模型 ID。点击“选择用于复习”，最后点击“保存配置”。可以保存多个服务商与模型，切换编辑对象不会覆盖其他连接；原有配置会自动载入。
-
-“检查所选模型”会发送一次文字请求，可能产生 API 费用；保存本身不调用模型。OpenAI 兼容服务可以点击“获取服务模型列表”；带图题需要服务实际支持图片输入。思考强度和兼容参数见 [模型配置说明](docs/MODEL_CONFIG.md)。
-
-接入模型订阅时，在“添加连接”的“模型订阅登录”分组中选择服务商，按页面显示的授权链接、登录方式或验证码完成登录，再添加模型并保存。删除服务商、移除模型会在固定底栏确认后直接生效。
-
-没有配置聊天模型时，仍可上传、解析资料和整理目录；生成笔记、模型问答与题目整理需要完成模型配置。首次解析可能下载 OCR 或向量模型，请等待处理完成。
-
-`run.cmd` 会重启本项目后端，请在没有上传、问答或笔记生成任务时运行。后台日志保存在 `.cache/run/`；手动启动和停止方式见 [使用说明](docs/USAGE.md#启动与模型配置)。
-
-## 一次复习流程
-
-1. 创建课程，上传课件或笔记；真题填写年份，题目与答案可以分别上传。
-2. 等待资料可用，通过原文预览查看提取内容。
-3. 调整并确认目录，生成复习笔记，按需下载 Markdown。
-4. 新建对话，提问知识点或查找往年题目。
-5. 进入在线练习，整理题目，关联对应答案，作答并查看解析。
-6. 在错题本复习自动收录或手动添加的题目。
-
-详细操作见 [使用说明](docs/USAGE.md)。
-
-## 技术结构
-
-| 部分 | 实现 |
-| --- | --- |
-| 页面 | Vue 3、TypeScript、Vite；Markdown 与 KaTeX 渲染 |
-| 后端 | FastAPI、SQLAlchemy、SQLite |
-| 检索 | 本地 Granite 311M 多语言 INT8 ONNX 向量化、Chroma、关键词检索 |
-| 解析 | PDF / Office 解析器、RapidOCR、独立公式识别进程、Apache Tika |
-| Agent | 自建检索工具循环；复习空间根据对话选择检索与讲解，练习由用户选择；pi-ai 提供模型调用 |
+## 项目结构
 
 ```text
-backend/          后端业务源码
-frontend/         复习工作台
-model-runtime/    pi-ai 模型调用桥接
-scripts/          安装、启动与评估脚本
-docs/             使用说明与致谢
+backend/app/
+  main.py                    FastAPI 路由与 SSE
+  parsing.py, tika.py        文档解析；ocr / 公式识别见 visual_recognition.py、formula_worker.py
+  retrieval*.py              向量 + BM25 混合召回、RRF、重排与引用校验
+  knowledge_*.py             页/小节级知识索引与检索
+  course_vocabulary.py       从笔记提取并核验双语术语
+  agent.py                   复习对话的检索工具循环
+  review_space.py            复习空间：规划 → 检索/讲解/出题 的多步 Agent
+  practice*.py               试卷整理、AI 生题、判题与进度
+  memory.py                  学习记忆与会话摘要
+  llm.py, model_*.py         模型调用、配置与 OAuth
+backend/tests/               后端测试
+frontend/src/                Vue 3 + TypeScript 工作台
+model-runtime/               pi-ai 模型调用桥接（Node）
+scripts/                     安装、启动、评测、便携版打包
+docs/                        使用、模型配置、检索设计、评测说明
 ```
 
-问答检索相关片段；复习笔记按固定资料快照分批读取原文。
+## 局限
 
-## 数据与使用边界
-
-- API Key 保存在本机 `.env` 或 `data/model-config.json`，后者含明文凭据。课程原文件、数据库、题图和索引保存在 `data/`；这些目录与模型缓存均已设置 Git 忽略规则。
-- 模型问答、笔记生成、题目整理、翻译及参考解答会向所配置的服务发送必要内容。使用前确认课程资料适合交给该服务处理。
-- 单文件上限 50 MB。复杂图形、布局、部分旧 Office 公式及低置信度 OCR 内容可能被跳过；解析成功不代表所有内容都已完整识别。
-- 选择题按原文答案或模型参考答案判题，并标明判题依据；与模型参考答案不一致也会记为错误。模型答案可能错误，其他题型由用户对照答案自行判断。
-- 删除课程会清除关联资料、会话、笔记和错题；重要数据请自行备份。
-- 当前版本面向本机单用户，没有账号体系或公网部署方案，也不提供考试预测或未经核验的考频统计。
+- 面向本机单用户，没有账号体系和公网部署方案；后台任务用 FastAPI BackgroundTasks 在进程内执行，不是分布式队列。
+- 复杂图形、版式、部分旧 Office 公式和低置信度 OCR 内容可能被跳过。
+- 综合列举依赖笔记里的术语和标题，清单可能不完整；系统会标记缺项，但不能保证全覆盖。
+- 选择题可能按模型参考答案判题，界面会标明判题依据；模型答案可能有误。
+- 评测只有一门课程、单次运行和 AI 复核，还需要真人复核、未参与调参的独立题集和修复前后的对照。
 
 ## 文档
 
-- [使用说明](docs/USAGE.md)：模型设置、资料管理、笔记与练习。
-- [数据结构课程评测](docs/EVALUATION.md)：固定题集、真实复习流程、证据覆盖与人工复核。
-- [致谢](docs/ACKNOWLEDGEMENTS.md)：学习资料、核心依赖与模型来源。
+- [使用说明](docs/USAGE.md) · [模型配置](docs/MODEL_CONFIG.md) · [课程知识检索设计](docs/RETRIEVAL.md) · [评测说明](docs/EVALUATION.md) · [便携版](docs/PORTABLE.md)
+- [致谢与第三方来源](docs/ACKNOWLEDGEMENTS.md)：项目起步于学习 [Datawhale Hello-Agents](https://github.com/datawhalechina/hello-agents)。
 
 ## 许可证
 
-暂未选择项目许可证，之后再决定。本仓库当前不声明采用 MIT 或 Apache-2.0 等开源许可证；第三方组件和模型仍遵循各自的许可。
+[MIT](LICENSE)。第三方组件和模型遵循各自的许可证。

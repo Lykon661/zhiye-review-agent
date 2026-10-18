@@ -18,7 +18,8 @@ frontend/dist/
 /dist/
 *.log
 
-# Local housekeeping reports; contain local data paths.
+# Private notes and local housekeeping reports; never published.
+/private/
 /docs/清理记录.md
 /docs/文件空间明细.csv
 
