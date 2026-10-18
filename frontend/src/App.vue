@@ -211,10 +211,7 @@ async function loadCourse(id: string) {
     if (generation !== courseGeneration) return
     sessionId.value = sessions.value[0]?.id || ''
     if (sessionId.value) await selectSession(sessionId.value)
-    let lastOutline = ''
-    try { lastOutline = localStorage.getItem(`review-note-outline:${id}`) || '' } catch { /* Optional reading history. */ }
-    selectedOutlineId.value = outlines.value.find(item => item.id === lastOutline)?.id || outlines.value[0]?.id || ''
-    if (selectedOutlineId.value) await selectOutline(selectedOutlineId.value)
+    await outlineTasks.restoreSelection()
   } catch (error) { if (generation === courseGeneration) setError(error) }
   finally { if (generation === courseGeneration) courseLoading.value = false }
 }

@@ -35,6 +35,29 @@ it('keeps a failed new task visible while reading an old completed note and retr
   expect(tasks.selectedOutlineId.value).toBe('new-note')
 })
 
+it('opens a note generated after the remembered one, but keeps a deliberate older choice', async () => {
+  const store = new Map<string, string>()
+  vi.stubGlobal('localStorage', { getItem: (key: string) => store.get(key) ?? null,
+    setItem: (key: string, value: string) => { store.set(key, value) } })
+  const { tasks } = workspace()
+  const note = (id: string) => ({ id, status: 'completed', job_id: `${id}-job` }) as Outline
+  request.mockImplementation(async (path: string) => path.startsWith('/jobs/')
+    ? { id: path.slice(6), status: 'completed' } : note(path.slice(10)))
+  // A plain id saved before this change opens the newest note.
+  store.set('review-note-outline:course', 'old-note')
+  tasks.outlines.value = [note('new-note'), note('old-note')]
+  await tasks.restoreSelection()
+  expect(tasks.outline.value?.id).toBe('new-note')
+  // An older note chosen on purpose survives a reload while nothing newer exists.
+  await tasks.selectOutline('old-note')
+  await tasks.restoreSelection()
+  expect(tasks.outline.value?.id).toBe('old-note')
+  // A note generated afterwards takes precedence over the remembered older one.
+  tasks.outlines.value = [note('newest-note'), note('new-note'), note('old-note')]
+  await tasks.restoreSelection()
+  expect(tasks.outline.value?.id).toBe('newest-note')
+})
+
 it('ignores a late task response after switching courses', async () => {
   const { tasks, courseId } = workspace()
   let complete!: (value: Job) => void

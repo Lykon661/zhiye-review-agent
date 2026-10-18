@@ -39,9 +39,18 @@ export function useOutlineTasks(options: Options) {
       const resultJob = await api<Job>(`/jobs/${result.job_id}`)
       if (!valid() || token !== selection) return
       outline.value = result; job.value = resultJob
-      try { localStorage.setItem(`review-note-outline:${options.courseId.value}`, id) } catch { /* optional history */ }
+      // Also note the newest note, so one generated later is not hidden behind this choice.
+      try { localStorage.setItem(`review-note-outline:${options.courseId.value}`, JSON.stringify({ id, newest: outlines.value[0]?.id ?? id })) } catch { /* optional history */ }
     } catch (reason) { if (valid() && token === selection) options.error(reason) }
     finally { if (valid() && token === selection) outlineLoading.value = false }
+  }
+  async function restoreSelection() {
+    let saved: { id?: string; newest?: string } | null = null
+    try { saved = JSON.parse(localStorage.getItem(`review-note-outline:${options.courseId.value}`) || 'null') } catch { /* Legacy or unavailable history opens the newest note. */ }
+    const newest = outlines.value[0]?.id || ''
+    const kept = saved?.newest === newest && outlines.value.some(item => item.id === saved?.id)
+    selectedOutlineId.value = kept && saved?.id ? saved.id : newest
+    if (selectedOutlineId.value) await selectOutline(selectedOutlineId.value)
   }
   async function loadLatestJob() {
     const latest = outlines.value.find(item => active(item.status)) || outlines.value[0]
@@ -98,5 +107,5 @@ export function useOutlineTasks(options: Options) {
     if (outline.value) { try { await downloadOutline(outline.value.id) } catch (reason) { options.error(reason) } }
   }
   return { outlines, outline, selectedOutlineId, job, runningJob, outlineLoading, outlineBusy, activeJob, displayedJob,
-    reset, selectOutline, loadLatestJob, createOutline: () => start(false), retryOutline: () => start(true), removeOutline, pollTasks, exportOutline }
+    reset, selectOutline, restoreSelection, loadLatestJob, createOutline: () => start(false), retryOutline: () => start(true), removeOutline, pollTasks, exportOutline }
 }
