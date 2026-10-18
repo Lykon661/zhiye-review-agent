@@ -14,7 +14,7 @@ from .models import AppMeta, Course, Document, Outline, RetrievalUnit
 from .retrieval_units import UNIT_POLICY
 
 VOCABULARY_CACHE_KEY = "__course_vocabulary__"
-VOCABULARY_CACHE_POLICY = "review_note_terms_cache_v2"
+VOCABULARY_CACHE_POLICY = "review_note_terms_cache_v3"
 
 
 BILINGUAL = re.compile(
@@ -22,8 +22,26 @@ BILINGUAL = re.compile(
     r"([A-Za-z][A-Za-z0-9 +#./_,;’':-]{0,119}?)(?:\*\*)?[）)]")
 
 
+# Inside a sentence the Chinese run before "（English）" starts at the clause, not the
+# term: "但容易形成主聚集" names 主聚集. Cut after the last connective or verb that
+# introduces it; words like 双向/并查集 keep their characters because 向/并 are not cut.
+CLAUSE = re.compile(r"以及|及其|要么|或者|并且|而且|但是|即使|因此|所以|从而|可以|能够|容易|形成|称为|叫做"
+                    r"|包括|包含|采用|利用|通过|进行|具有|属于|导致|产生|消除|避免|缓解|存在|使用|构成|维护"
+                    r"|设置|进入|执行|连接|记为|遵循|支持|需要|依赖|取决于|决定|访问|研究|关注"
+                    r"|[与和及或是为由在将把被从使但而且即则也都仍]")
+LEADING = re.compile(r"^(?:[#>-]+\s+|的|以|该|此|一种|一个|每个|对于|关于)+")
+
+
 def alias_groups(concepts):
     return [tuple(dict.fromkeys(normalize(t) for t in [c["name"], *c["aliases"]])) for c in concepts]
+
+
+def term_start(chinese, clause=True):
+    """Drop the clause words before a term; a term ending in such a word stays whole."""
+    if clause:
+        cuts = [m.end() for m in CLAUSE.finditer(chinese) if chinese[m.end():].strip()]
+        chinese = chinese[cuts[-1]:] if cuts else chinese
+    return LEADING.sub("", chinese).strip() or chinese.strip()
 
 
 @lru_cache(maxsize=128)
@@ -52,7 +70,8 @@ def note_terms(markdown):
         table_header = ("|" in line and index + 1 < len(lines)
                         and bool(re.fullmatch(r"\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*", lines[index + 1])))
         for pair in pairs:
-            chinese = pair[1].strip()
+            # A heading names its subject; a sentence may lead into the term.
+            chinese = term_start(pair[1], clause=not (heading and pair is pairs[0]))
             names = tuple(dict.fromkeys(t.strip() for t in re.split(r"[,;/]", pair[2]) if t.strip()))
             if names:
                 # Any column after the first (row-label) column names a comparison dimension.
@@ -98,9 +117,9 @@ class CourseVocabulary:
     def _merge(target, entries):
         for entry in entries:
             previous = target.setdefault(normalize(entry["name"]),
-                {"name": entry["name"], "aliases": [], "parents": [], "unit_ids": []})
-            for field in ("aliases", "unit_ids"):
-                previous[field] = list(dict.fromkeys([*previous[field], *entry[field]]))
+                {"name": entry["name"], "aliases": [], "parents": [], "unit_ids": [], "common": []})
+            for field in ("aliases", "unit_ids", "common"):
+                previous[field] = list(dict.fromkeys([*previous.get(field, []), *entry.get(field, [])]))
             self_names = {normalize(t) for t in previous["aliases"] + [previous["name"]]}
             previous["parents"] = list(dict.fromkeys(p for p in [*previous["parents"], *entry["parents"]]
                                                     if normalize(p) not in self_names))
@@ -112,6 +131,10 @@ class CourseVocabulary:
         for unit in db.scalars(statement.order_by(RetrievalUnit.position)):
             by_chapter.setdefault(unit.chapter_id, []).append(unit)
         notes, chapters = chapter_notes(outline), []
+        # A name written in the notes of most chapters (查找, 记录, 树) is everyday
+        # course wording; scope planning lets it select a concept only as a last resort.
+        texts = [normalize(text) for text in notes.values() if text.strip()]
+        spread = max(3, -(-len(texts) // 2))
         for chapter_id, units in by_chapter.items():
             concepts, facets = OrderedDict(), OrderedDict()
             originals = [(u, normalize(u.title + "\n" + u.text)) for u in units]
@@ -124,9 +147,10 @@ class CourseVocabulary:
                 if not matched:
                     continue
                 present = [t for t, pattern in patterns if any(pattern.search(text) for _, text in matched)]
-                self._merge(facets if entry["facet"] else concepts, [{"name": present[0],
-                    "aliases": list(dict.fromkeys([entry["chinese"], *names, *present])),
-                    "parents": list(entry["parents"]), "unit_ids": [u.id for u, _ in matched]}])
+                aliases = list(dict.fromkeys([entry["chinese"], *names, *present]))
+                common = [t for t in aliases if sum(normalize(t) in text for text in texts) >= spread]
+                self._merge(facets if entry["facet"] else concepts, [{"name": present[0], "aliases": aliases,
+                    "parents": list(entry["parents"]), "unit_ids": [u.id for u, _ in matched], "common": common}])
             chapters.append({"chapter_id": chapter_id, "concepts": list(concepts.values()),
                              "facets": list(facets.values()), "incomplete": int(not concepts and not facets)})
         return chapters

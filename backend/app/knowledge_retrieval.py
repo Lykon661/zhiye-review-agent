@@ -3,12 +3,38 @@ from collections import OrderedDict
 import logging
 import re
 
-from .lexical import lexical_score, normalize, query_terms
+from .lexical import lexical_score, normalize, query_terms, retrieval_topic, term_pattern
 from .course_vocabulary import alias_groups
 from .models import Course
 
 logger = logging.getLogger(__name__)
-SCOPE_POLICY = "review_note_terms_v6"
+SCOPE_POLICY = "review_note_terms_v7"
+CJK = re.compile(r"[\u4e00-\u9fff]")
+# Characters that may sit next to a one-character name such as 树 or 根 without
+# joining it into another word (搜索树, 根据).
+PARTICLES = set("的和与及或是在中里内等为之对把被从")
+INVENTORY = re.compile(r"各种|各类|各个|每种|所有|全部|汇总|总览|列举|哪些|哪几|几种|类型|种类|分类"
+                       r"|all types|kinds|types|every|overview|summarize", re.I)
+
+
+def _mentions(text, owners):
+    """Concepts named in text, one entry per span; longer names win overlapping spans."""
+    text = normalize(text)
+    found = []
+    for name, keys in owners.items():
+        for match in re.finditer(term_pattern(name), text):
+            start, end = match.span()
+            if len(name) == 1 and CJK.match(name) and any(
+                    0 <= i < len(text) and CJK.match(text[i]) and text[i] not in PARTICLES for i in (start - 1, end)):
+                continue
+            found.append((start, end, keys))
+    found.sort(key=lambda item: item[1] - item[0], reverse=True)
+    covered, spans = [], []
+    for start, end, keys in found:
+        if not any(start < right and end > left for left, right in covered):
+            covered.append((start, end))
+            spans.append(keys)
+    return spans
 
 
 def _combine(pools, limit=96):
@@ -36,23 +62,51 @@ class KnowledgeRetrieval:
 
     def _scope(self, course_id, query, request, sources, explicit, chapter_ids):
         concepts, dimensions, incomplete = self.r.knowledge.vocabulary.read(course_id, chapter_ids)
-        groups = alias_groups(concepts)
         by_name = {normalize(c["name"]): c for c in concepts}
+        owners = {}
+        for concept, group in zip(concepts, alias_groups(concepts)):
+            common = {normalize(t) for t in concept.get("common", [])}
+            for name in group:
+                owners.setdefault(name, {})[group[0]] = name in common
         words = request or query
 
-        def matched(text):
-            return {g[0] for g in query_terms(text, groups, limit=None)[0] if g[0] in by_name}
+        def matched(text, ordinary=True):
+            spans = _mentions(text, owners)
+            # A name shared by several concepts, or written across most of the
+            # notes (查找, 记录), is ordinary wording unless nothing specific is named.
+            specific = {key for keys in spans if len(keys) == 1 and not any(keys.values()) for key in keys}
+            if specific or not ordinary:
+                return specific
+            return {key for keys in spans for key in keys}
 
         selected = matched(words)
-        excluded = set()
-        for text in re.findall(r"(?:除了|不包括|不含|排除|exclude|except)\s*(.*?)(?:之外|以外|除外|[，,。;；]|$)", words, re.I):
+        excluded, clauses = set(), re.findall(
+            r"(?:除了|不包括|不含|排除|exclude|except)\s*(.*?)(?:之外|以外|除外|[，,。;；]|$)", words, re.I)
+        for text in clauses:
             excluded.update(matched(text))
-        selected -= excluded
         broad = bool(re.search(r"各种|各类|各个|每种|所有|全部|汇总|总览|all types|every|overview|summarize", words, re.I))
+        # The planner names the compared subjects, including course wording the notes
+        # never use (链地址法 for 分离链接). Its topic list must be grounded in the
+        # request; extra child queries are trusted only when asking for an inventory.
+        parts = [p.strip() for p in re.split(r"[、，,；;：:/]|以及|及其|[和与及]|\s+(?:and|or|vs|versus)\s+",
+                                             retrieval_topic(query)) if len(p.strip()) >= 2]
+        said = normalize(words)
+        inventory = bool(INVENTORY.search(words))
+        planned = [*(q for q in explicit if inventory or normalize(q) in said),
+                   *(p for p in (parts if len(parts) >= 2 else []) if normalize(p) in said)]
+        literal = []
+        for seed in dict.fromkeys(planned):
+            # "哈希查找" is more specific than the everyday 查找 inside it.
+            found = matched(seed, ordinary=normalize(seed) in owners)
+            if found:
+                selected |= found
+            elif not any(normalize(seed) in normalize(text) for text in clauses):
+                literal.append(seed)
+        selected -= excluded
         children = {}
         for concept in concepts:
             for parent in concept["parents"]:
-                for key in matched(parent):
+                for key in ({normalize(parent)} if normalize(parent) in by_name else matched(parent)):
                     children.setdefault(key, set()).add(normalize(concept["name"]))
         pending = list(excluded)
         while pending:
@@ -69,14 +123,16 @@ class KnowledgeRetrieval:
                 for child in children.get(parent, set()) - selected - excluded:
                     selected.add(child)
                     pending.append(child)
-        if not selected:
+        if not selected and not literal:
             # A semantic-only fallback locates evidence but cannot prove a complete inventory.
             ids = {s.get("retrieval_unit_id", s.get("chunk_id")) for s in sources[:12]}
             selected = {key for key, c in by_name.items() if ids.intersection(c["unit_ids"])} - excluded
             incomplete = max(1, incomplete)
         ordered = [c for c in concepts if normalize(c["name"]) in selected]
-        topics = [{"name": c["name"], "queries": [c["name"]], "unit_ids": c["unit_ids"][:8]} for c in ordered[:24]]
-        incomplete += max(0, len(ordered) - 24)
+        topics = [*({"name": c["name"], "queries": [c["name"]], "unit_ids": c["unit_ids"][:8]} for c in ordered),
+                  *({"name": seed, "queries": [seed], "unit_ids": []} for seed in literal)]
+        incomplete += max(0, len(topics) - 24)
+        topics = topics[:24]
         if not topics:
             topics = [{"name": query, "queries": [query], "unit_ids": []}]
             incomplete = max(1, incomplete)

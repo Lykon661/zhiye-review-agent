@@ -198,8 +198,9 @@ def scope_service(concepts, facets=(), incomplete=0):
     return KnowledgeRetrieval(SimpleNamespace(retrieval=SimpleNamespace(knowledge=SimpleNamespace(vocabulary=vocabulary))))
 
 
-def concept(name, aliases, parents=(), identity="p1"):
-    return {"name": name, "aliases": aliases, "parents": list(parents), "unit_ids": [identity]}
+def concept(name, aliases, parents=(), identity="p1", common=()):
+    return {"name": name, "aliases": aliases, "parents": list(parents), "unit_ids": [identity],
+            "common": list(common)}
 
 
 def test_named_comparison_uses_course_aliases_without_model_or_unrelated_seeds():
@@ -256,6 +257,45 @@ def test_scope_does_not_infer_taxonomy_from_shared_words():
 def test_missing_vocabulary_preserves_query_and_discloses_incomplete_inventory():
     topics, _, omitted = scope_service([], incomplete=1)._scope("c", "树", "列举所有树类型", [], [], ["one"])
     assert topics == [{"name": "树", "queries": ["树"], "unit_ids": []}] and omitted > 0
+
+
+HASHING = [concept("Separate Chaining", ["分离链接"], ["Collision Resolution"]),
+           concept("Open Addressing", ["开放寻址"], ["Collision Resolution"]),
+           concept("Linear Probing", ["线性探测"], ["Probing"]),
+           concept("Clustering", ["聚集"]),
+           concept("find", ["查找"], ["List"], common=["查找"]),
+           concept("record", ["记录"], ["Sorting"], common=["记录"])]
+
+
+def test_planner_subjects_keep_course_wording_the_notes_do_not_use():
+    request = "对比链地址法、开放定址法以及线性探测的问题。说明记录放在哪里、查找怎样进行、聚集如何产生。"
+    service = scope_service(HASHING)
+    # Only the planner's topic names 链地址法; the notes call it 分离链接.
+    topics, _, _ = service._scope("c", "链地址法、开放定址法与线性探测", request, [], [], [])
+    assert [t["name"] for t in topics] == ["Linear Probing", "Clustering", "链地址法", "开放定址法"]
+    assert topics[2] == {"name": "链地址法", "queries": ["链地址法"], "unit_ids": []}
+    # Child queries count for an inventory; a narrow comparison keeps the user's subjects.
+    topics, _, _ = service._scope("c", "冲突处理方法", "列举课程里的冲突处理方法",
+                                  [], ["分离链接", "开放寻址", "哈希查找"], [])
+    assert [t["name"] for t in topics] == ["Separate Chaining", "Open Addressing", "哈希查找"]
+    topics, _, _ = service._scope("c", "线性探测", "只比较线性探测和聚集", [], ["分离链接"], [])
+    assert [t["name"] for t in topics] == ["Linear Probing", "Clustering"]
+
+
+def test_everyday_and_single_character_names_do_not_replace_specific_subjects():
+    concepts = [concept("Tree", ["树"], common=["树"]), concept("root", ["根"]),
+                concept("Binary Search Tree", ["二叉搜索树"]), concept("Searching", ["查找"]), *HASHING]
+    service = scope_service(concepts)
+    # 树 inside 搜索树 and 根 inside 根据 are parts of other words.
+    topics, _, omitted = service._scope("c", "搜索树类型", "只根据所选课件，列举搜索树类型", [], [], [])
+    assert topics == [{"name": "搜索树类型", "queries": ["搜索树类型"], "unit_ids": []}] and omitted > 0
+    topics, _, _ = service._scope("c", "根", "树的根是什么", [], [], [])
+    assert {t["name"] for t in topics} == {"root"}
+    # A longer, specific name wins; ordinary 查找 is used only when nothing else is named.
+    topics, _, _ = service._scope("c", "二叉搜索树", "二叉搜索树的查找怎样进行", [], [], [])
+    assert [t["name"] for t in topics] == ["Binary Search Tree"]
+    topics, _, _ = service._scope("c", "查找", "比较几种查找", [], [], [])
+    assert {t["name"] for t in topics} == {"Searching", "find"}
 
 
 def test_failed_scope_is_disclosed_to_the_explanation():

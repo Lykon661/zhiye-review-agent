@@ -135,6 +135,34 @@ AVL 树（AVL Tree）及二叉搜索树（Binary Search Tree, BST）。
     assert all(e["names"] not in (("CodeName",), ("IgnoredTerm",)) for e in entries)
 
 
+def test_terms_inside_sentences_start_after_the_leading_clause():
+    entries = note_terms("""### 动态等价问题与不相交集（Disjoint Sets）
+### 各类探测（Probing）方法与聚集（Clustering）
+树要么为空，要么由根（root）构成；边连接父节点（parent）和子节点（child）。
+实现简单，但容易形成主聚集（Primary Clustering）。双向链表（doubly linked list）可计算前缀和（prefix sum）。
+""")
+    chinese = {e["names"][0]: e["chinese"] for e in entries}
+    assert chinese["Clustering"] == "聚集" and chinese["Primary Clustering"] == "主聚集"
+    assert chinese["root"] == "根" and chinese["parent"] == "父节点" and chinese["child"] == "子节点"
+    # A heading names its subject, and words that merely contain 向 or end in 和 stay whole.
+    assert chinese["Disjoint Sets"] == "动态等价问题与不相交集" and chinese["Probing"] == "各类探测"
+    assert chinese["doubly linked list"] == "双向链表" and chinese["prefix sum"] == "可计算前缀和"
+
+
+def test_names_written_across_most_chapters_are_marked_as_ordinary(vocabulary_store):
+    with vocabulary_store.sessions() as db:
+        outline = db.get(Outline, "notes")
+        outline.chapter_results = {"one": {"markdown": NOTES + "查找（Find）先比较键。
+"},
+                                   "two": {"markdown": "顺序查找要逐项比较。"}, "three": {"markdown": "二分查找。"}}
+        db.get(RetrievalUnit, "u").text += " Find compares keys."
+        db.commit()
+    concepts, _, _ = CourseVocabulary(vocabulary_store).read("c")
+    find = next(c for c in concepts if c["name"] == "Find")
+    heap = next(c for c in concepts if c["name"] == "Heap Sort")
+    assert "查找" in find["aliases"] and find["common"] == ["查找"] and heap["common"] == []
+
+
 def test_legacy_rendered_notes_require_unambiguous_chapter_titles():
     outline = SimpleNamespace(chapter_results={}, markdown="# Notes\n## Trees\n### 树（Trees）\n",
                               snapshot={"chapters": [{"id": "one", "title": "Trees"}]})
