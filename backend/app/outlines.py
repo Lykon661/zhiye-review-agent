@@ -6,13 +6,13 @@ from threading import Lock
 
 from sqlalchemy import select
 
-from .file_chapters import chapter_role, document_role
+from .file_chapters import chapter_role, document_role, file_order, file_title
 from .llm import StructuredOutputError, model_failure_message, run_parallel
 from .models import Block, Chapter, Course, Document, Job, Outline
 
 logger = logging.getLogger(__name__)
 NOTES_STYLE = "review_notes_v4_math"
-CHAPTER_POLICY = "file_sources_with_guidance_v2"
+CHAPTER_POLICY = "file_sources_with_guidance_v3"
 GUIDANCE_STYLE = "course_guidance_v2"
 MAX_GUIDANCE_BYTES = 3000
 MAX_PROMPT_BYTES = 16000
@@ -37,6 +37,8 @@ NOTES_RULES = """你是课程复习笔记的编辑，依据输入资料编写学
 例如形式为“### 进程（Process）”，先给简明定义，再说明进程与程序的区别；或
 “### 调度算法”，用表格比较规则、适用场景和局限。这些只是写作形式，不能给其他课程补入这些知识。
 按已保存的章节目录整理；一个章节可以包含多份合并后的文件，章节名称不保证资料属于知识点正文。
+合并章节中每份文件的知识正文都属于本章，不能因章节名称只对应其中一份文件，就把其他文件当作背景回顾简略带过。
+part 表示本次只整理合并章节中的这一份文件：完整整理它的主题，不另写整章导论。
 课程大纲、目录、教学计划、考核说明、进度安排等内容仅提供课程范围与结构，不要把其中列出的主题扩写成知识。
 course_guidance是从上传的大纲及辅助资料提炼的课程参考：用它指导主题安排、学习目标、范围和详略。
 只采用与当前章节知识正文有关的目标或重点，不把其他章节主题移入本章；大纲没有明确标注的重点或考核要求不能自行推测。
@@ -78,7 +80,7 @@ def outline_messages(task, chapter, key, values):
         "GUIDANCE": "提炼这一批辅助原文对课程笔记的指导信息，合并重复要求，保留主题和对应的范围、目标与重点。",
         "GUIDANCE_MERGE": "合并这些辅助资料摘要，形成课程共用的简洁写作参考。保留各主题及其要求，去掉重复，控制在450字以内。",
     }[task]
-    payload = {"chapter": chapter["title"], key: values}
+    payload = {"chapter": chapter["title"], **({"part": chapter["part"]} if chapter.get("part") else {}), key: values}
     if chapter.get("course_guidance"):
         payload["course_guidance"] = chapter["course_guidance"]
     rules = GUIDANCE_RULES if task in ("GUIDANCE", "GUIDANCE_MERGE") else NOTES_RULES
@@ -104,6 +106,14 @@ def material_units(blocks):
             units.append({"kind": block["kind"], "text": block["text"]})
         previous = unit_key
     return units
+
+
+def file_parts(blocks):
+    """Split a merged chapter by source file, ordered like default file chapters."""
+    parts = {}
+    for block in blocks:
+        parts.setdefault(block["document_id"], []).append(block)
+    return sorted(parts.values(), key=lambda part: file_order(part[0]["filename"]))
 
 
 def packet_batches(chapter, values, task="MAP", key="materials"):
@@ -249,24 +259,30 @@ class OutlineService:
         if len(batches) == 1:
             result = self._markdown("CHAPTER", chapter, "materials", batches[0])
             return result
+        parts = file_parts(blocks)
+        if len(parts) > 1:
+            # One final edit holds about one lecture; merged files each keep a full note budget.
+            notes = [self._chapter(job_id, {**chapter, "part": file_title(part[0]["filename"])}, part) for part in parts]
+            return "\n\n".join(note for note in notes if note)
+        name = f"{chapter['title']}·{chapter['part']}" if chapter.get("part") else chapter["title"]
         drafts = [{"text": result} for result in self._parallel_markdown(
-            job_id, f"{chapter['title']}：阅读资料", "MAP", chapter, "materials", batches) if result]
+            job_id, f"{name}：阅读资料", "MAP", chapter, "materials", batches) if result]
         if not drafts:
             return ""
         for _ in range(4):
             final_messages = outline_messages("CHAPTER", chapter, "drafts", drafts)
             if prompt_bytes(final_messages) <= MAX_PROMPT_BYTES:
-                self._update(job_id, stage=f"{chapter['title']}：合并主题、整理公式与比较表格")
+                self._update(job_id, stage=f"{name}：合并主题、整理公式与比较表格")
                 result = self._markdown("CHAPTER", chapter, "drafts", drafts)
                 if not result:
-                    raise ValueError(f"{chapter['title']}：整章编辑返回了空内容。")
+                    raise ValueError(f"{name}：整章编辑返回了空内容。")
                 return result
             groups = packet_batches(chapter, drafts, task="MERGE", key="drafts")
             drafts = [{"text": result} for result in self._parallel_markdown(
-                job_id, f"{chapter['title']}：合并主题", "MERGE", chapter, "drafts", groups) if result]
+                job_id, f"{name}：合并主题", "MERGE", chapter, "drafts", groups) if result]
             if not drafts:
-                raise ValueError(f"{chapter['title']}：主题合并未返回正文。")
-        raise ValueError(f"{chapter['title']}：笔记合并后仍超过输入预算，请拆分章节。")
+                raise ValueError(f"{name}：主题合并未返回正文。")
+        raise ValueError(f"{name}：笔记合并后仍超过输入预算，请拆分章节。")
 
     def _guidance(self, job_id, snapshot):
         """Read all support text in bounded batches, then share a compact reference."""
