@@ -322,7 +322,7 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
                 pass
     settings = settings or Settings.from_env()
     services = Services(settings, embedder, llm)
-    agent, outline_service = ReviewAgentService(services), OutlineService(services)
+    agent, outline_service = ReviewAgentService(services), OutlineService(services, services.knowledge_points)
     practice = PracticeService(services)
     review_space = ReviewSpaceService(practice)
     agent.answer_grounding = ChatAnswerGrounding(practice)
@@ -1133,6 +1133,17 @@ def create_app(settings: Settings | None = None, embedder=None, llm=None):
                 Job.outline_id.in_(outline_ids)).order_by(Job.created_at)):
             latest[outline_id] = job_id
         return latest
+
+    @app.get("/courses/{course_id}/knowledge-points")
+    def get_knowledge_points(course_id: str):
+        with services.sessions() as db:
+            require(db, Course, course_id)
+        try:
+            return services.knowledge_points.read(course_id)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(503, str(exc)) from exc
 
     @app.get("/courses/{course_id}/outlines")
     def list_outlines(course_id: str):

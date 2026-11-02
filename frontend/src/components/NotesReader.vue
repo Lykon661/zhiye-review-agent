@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import type { NoteChatContext } from '../types'
+import type { KnowledgeNoteJumpTarget, NoteChatContext } from '../types'
 import MarkdownContent from './MarkdownContent.vue'
 
-const props = defineProps<{ courseId: string; outlineId: string; content: string; discussionBusy: boolean }>()
-const emit = defineEmits<{ explain: [context: NoteChatContext] }>()
+const props = defineProps<{ courseId: string; outlineId: string; content: string; discussionBusy: boolean; jumpTarget?: KnowledgeNoteJumpTarget | null }>()
+const emit = defineEmits<{ explain: [context: NoteChatContext]; jumped: [] }>()
 const body = ref<HTMLElement | null>(null)
 const headings = ref<{ title: string; level: number; element: HTMLElement }[]>([])
 interface TocEntry { index: number; title: string; level: number; depth: number; ancestors: number[]; hasChildren: boolean }
@@ -41,6 +41,10 @@ function chapterActive(entry: TocEntry) {
 }
 const selected = ref<NoteChatContext | null>(null)
 const selectionError = ref('')
+const jumpNotice = ref('')
+let scrolledByUser = false
+let programmaticScrolling = false
+let programmaticTimer: ReturnType<typeof setTimeout> | undefined
 interface ReadingPosition { heading: number; title: string; offset: number }
 const previous = ref<ReadingPosition | null>(null)
 const storageKey = () => `review-note-position:${props.courseId}:${props.outlineId}`
@@ -48,6 +52,22 @@ let timer: ReturnType<typeof setTimeout> | undefined
 let mounted = false
 let layoutFrame: number | undefined
 let layoutObserver: ResizeObserver | undefined
+function endProgrammaticScroll() {
+  programmaticScrolling = false
+  if (programmaticTimer) { clearTimeout(programmaticTimer); programmaticTimer = undefined }
+  window.removeEventListener('scrollend', onScrollEnd)
+}
+function onScrollEnd() {
+  if (programmaticTimer) clearTimeout(programmaticTimer)
+  programmaticTimer = setTimeout(endProgrammaticScroll, 50)
+}
+function startProgrammaticScroll(behavior: ScrollBehavior) {
+  programmaticScrolling = true
+  if (programmaticTimer) clearTimeout(programmaticTimer)
+  window.removeEventListener('scrollend', onScrollEnd)
+  window.addEventListener('scrollend', onScrollEnd, { once: true })
+  programmaticTimer = setTimeout(endProgrammaticScroll, behavior === 'smooth' ? 800 : 120)
+}
 function placeToc() {
   if (!mounted || !body.value) return
   const panel = body.value.closest('.outline-content-panel') as HTMLElement | null
@@ -89,14 +109,77 @@ async function prepare() {
     if (main) layoutObserver.observe(main)
   }
   await nextTick()
-  if (mounted && previous.value && headings.value.length) {
-    jump(previous.value.heading, previous.value.offset, 'auto')
+  if (mounted && headings.value.length) {
+    if (props.jumpTarget && resolveAndJump(props.jumpTarget)) return
+    if (previous.value) jump(previous.value.heading, previous.value.offset, 'auto')
   }
 }
+function normHeading(text: string) {
+  return text.replace(/[`*_~\s（）()]/g, '').toLowerCase()
+}
+function persistReadingPosition(headingIndex: number, title: string, offset: number) {
+  try { localStorage.setItem(storageKey(), JSON.stringify({ heading: headingIndex, title, offset })) } catch { /* Reading stays available without browser storage. */ }
+}
+function resolveAndJump(target: KnowledgeNoteJumpTarget): boolean {
+  if (!headings.value.length || target.outlineId !== props.outlineId) return false
+  jumpNotice.value = ''
+  let idx = -1
+  if (target.noteLine !== null && Number.isInteger(target.noteLine)) {
+    const lineMatches = headings.value
+      .map((item, i) => ({ item, i }))
+      .filter(({ item }) => Number(item.element.dataset.noteStart) === target.noteLine)
+    if (lineMatches.length === 1) idx = lineMatches[0].i
+  }
+  if (idx < 0) {
+    const chapterNorm = normHeading(target.chapterTitle)
+    const chapterMatches = headings.value
+      .map((item, i) => ({ item, i }))
+      .filter(({ item }) => item.level === 2 && normHeading(item.title) === chapterNorm)
+    if (chapterMatches.length === 1) {
+      const cStart = chapterMatches[0].i + 1
+      let cEnd = headings.value.length
+      for (let i = cStart; i < headings.value.length; i++) {
+        if (headings.value[i].level <= 2) { cEnd = i; break }
+      }
+      const titleNorm = normHeading(target.title)
+      const exactMatches: number[] = []
+      for (let i = cStart; i < cEnd; i++) {
+        const h = headings.value[i]
+        if (h.level === target.level && normHeading(h.title) === titleNorm) exactMatches.push(i)
+      }
+      if (exactMatches.length === 1) {
+        idx = exactMatches[0]
+      } else if (exactMatches.length === 0) {
+        const zhNorm = normHeading(target.nameZh)
+        const enNorm = target.nameEn ? normHeading(target.nameEn) : ''
+        const fuzzyMatches: number[] = []
+        for (let i = cStart; i < cEnd; i++) {
+          const h = headings.value[i], hn = normHeading(h.title)
+          if (h.level === target.level && zhNorm && hn.includes(zhNorm) && (!enNorm || hn.includes(enNorm))) fuzzyMatches.push(i)
+        }
+        if (fuzzyMatches.length === 1) idx = fuzzyMatches[0]
+      }
+    }
+  }
+  emit('jumped')
+  if (idx < 0) {
+    jumpNotice.value = '无法唯一定位到笔记标题，已保持当前阅读位置。'
+    return false
+  }
+  jump(idx, 0, 'smooth')
+  return true
+}
 function savePosition() {
-  if (previous.value) return
+  if (previous.value || programmaticScrolling || !scrolledByUser) return
   const root = body.value
-  if (!root || !headings.value.length || root.getBoundingClientRect().top > 160 || root.getBoundingClientRect().bottom < 80) return
+  if (!root || !headings.value.length || root.getBoundingClientRect().bottom < 80) return
+  if (root.getBoundingClientRect().top > 160) {
+    if (headings.value[0]) {
+      activeHeading.value = 0
+      persistReadingPosition(0, headings.value[0].title, 0)
+    }
+    return
+  }
   let index = 0
   for (let i = 0; i < headings.value.length; i++) {
     if (headings.value[i].element.getBoundingClientRect().top <= 160) index = i
@@ -104,18 +187,20 @@ function savePosition() {
   }
   const heading = headings.value[index]
   activeHeading.value = index
-  const value = { heading: index, title: heading.title, offset: Math.max(0, -heading.element.getBoundingClientRect().top) }
-  try { localStorage.setItem(storageKey(), JSON.stringify(value)) } catch { /* Reading stays available without browser storage. */ }
+  persistReadingPosition(index, heading.title, Math.max(0, -heading.element.getBoundingClientRect().top))
 }
 function scroll() {
   scheduleTocLayout()
+  if (programmaticScrolling) return
+  scrolledByUser = true
   if (timer) clearTimeout(timer)
   timer = setTimeout(savePosition, 300)
 }
-function jump(index: number, offset = 0, behavior: ScrollBehavior = 'smooth') {
+function jump(index: number, offset = 0, behavior: ScrollBehavior = 'smooth', clearNotice = false) {
   const targetIndex = Math.min(Math.max(0, index), headings.value.length - 1)
   const heading = headings.value[targetIndex]
   if (!heading) return
+  if (clearNotice) jumpNotice.value = ''
   const target = tocEntries.value.find(entry => entry.index === targetIndex)
   if (target) expanded.value = new Set([...expanded.value, ...target.ancestors])
   activeHeading.value = targetIndex
@@ -123,9 +208,13 @@ function jump(index: number, offset = 0, behavior: ScrollBehavior = 'smooth') {
   const span = next ? next.element.getBoundingClientRect().top - heading.element.getBoundingClientRect().top
     : (body.value?.getBoundingClientRect().bottom || 0) - heading.element.getBoundingClientRect().top
   const bounded = Math.min(Math.max(0, offset), Math.max(0, span - 60))
-  window.scrollTo({ top: Math.max(0, window.scrollY + heading.element.getBoundingClientRect().top + bounded - 24), behavior })
   previous.value = null
   tocOpen.value = false
+  scrolledByUser = false
+  if (timer) { clearTimeout(timer); timer = undefined }
+  startProgrammaticScroll(behavior)
+  persistReadingPosition(targetIndex, heading.title, bounded)
+  window.scrollTo({ top: Math.max(0, window.scrollY + heading.element.getBoundingClientRect().top + bounded - 24), behavior })
 }
 function sourceElement(node: Node, offset: number, end: boolean) {
   let element = node.nodeType === Node.ELEMENT_NODE ? node as HTMLElement : node.parentElement
@@ -159,7 +248,8 @@ function explain() {
   emit('explain', { ...selected.value })
   selected.value = null
 }
-watch(() => props.content, () => { selected.value = null; void prepare() })
+watch(() => props.content, () => { selected.value = null; jumpNotice.value = ''; void prepare() })
+watch(() => props.jumpTarget, target => { if (target && mounted && headings.value.length) resolveAndJump(target) })
 onMounted(() => {
   mounted = true
   try {
@@ -173,8 +263,10 @@ onMounted(() => {
   document.addEventListener('selectionchange', selectionChanged)
 })
 onBeforeUnmount(() => {
-  savePosition(); mounted = false
+  if (!programmaticScrolling && scrolledByUser) savePosition()
+  mounted = false
   if (timer) clearTimeout(timer)
+  endProgrammaticScroll()
   if (layoutFrame !== undefined) cancelAnimationFrame(layoutFrame)
   layoutObserver?.disconnect()
   window.removeEventListener('scroll', scroll)
@@ -194,7 +286,7 @@ onBeforeUnmount(() => {
           <li v-for="entry in visibleEntries" :key="entry.index" :class="['notes-toc-entry', { root: entry.depth === 0, active: chapterActive(entry) }]" :style="{ paddingLeft: `${entry.depth * 14}px` }">
             <button v-if="entry.hasChildren" type="button" class="notes-toc-toggle" :aria-expanded="expanded.has(entry.index)" :aria-label="`${expanded.has(entry.index) ? '收起' : '展开'}${entry.title}的小章节`" @click="toggleChapter(entry.index)"><span :class="{ expanded: expanded.has(entry.index) }" aria-hidden="true">▸</span></button>
             <span v-else class="notes-toc-spacer" aria-hidden="true"></span>
-            <button type="button" class="notes-toc-title" :aria-current="entry.index === activeHeading ? 'location' : undefined" :title="entry.title" @click="jump(entry.index)">{{ entry.title }}</button>
+            <button type="button" class="notes-toc-title" :aria-current="entry.index === activeHeading ? 'location' : undefined" :title="entry.title" @click="jump(entry.index, 0, 'smooth', true)">{{ entry.title }}</button>
           </li>
         </ul>
       </nav>
@@ -204,6 +296,10 @@ onBeforeUnmount(() => {
       <div class="notes-reading-tools">
         <button v-if="tocEntries.length && !tocDocked" type="button" class="text-button" :aria-expanded="tocOpen" @click="tocOpen = !tocOpen">章节目录</button>
         <span class="muted">自动继续上次阅读 · 阅读位置自动保存 · 选中文字可解释这段</span>
+      </div>
+      <div v-if="jumpNotice" class="notice info feedback notes-jump-notice" role="status">
+        <span>{{ jumpNotice }}</span>
+        <button type="button" class="icon-button small" aria-label="关闭定位提示" @click="jumpNotice = ''">×</button>
       </div>
       <div v-if="selected || selectionError" class="notes-selection" role="status">
         <template v-if="selected"><span>已选择：{{ selected.selected_text.slice(0, 90) }}{{ selected.selected_text.length > 90 ? '…' : '' }}</span><button type="button" class="button subtle" :disabled="discussionBusy" @mousedown.prevent @click="explain">解释这段</button></template>
@@ -237,6 +333,7 @@ onBeforeUnmount(() => {
 .notes-reading-tools { display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap; border-bottom: 1px solid var(--line); padding: 0 0 16px; margin-bottom: 24px; font-size: 12px; }
 .notes-reading-tools > .text-button { white-space: normal; text-align: left; }
 .notes-reading-tools > .muted { flex-basis: 100%; font-size: 12px; }
+.notes-jump-notice { position: sticky; top: 12px; z-index: 5; margin-bottom: 20px; box-shadow: 0 4px 16px #1d2d4d0d; }
 .notes-selection { position: sticky; top: 12px; z-index: 5; display: flex; gap: 14px; align-items: center; justify-content: space-between; padding: 14px 16px; border: 1px solid var(--accent-line); border-radius: 9px; background: #edf2ff; box-shadow: 0 4px 16px #1d2d4d0d; font-size: 13px; margin-bottom: 20px; }
 .notes-selection span { min-width: 0; overflow-wrap: anywhere; color: #435b92; }
 .notes-selection button { flex-shrink: 0; }

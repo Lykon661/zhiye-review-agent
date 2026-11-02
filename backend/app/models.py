@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import JSON, Boolean, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -132,6 +132,49 @@ class Outline(Base):
     coverage: Mapped[dict] = mapped_column(JSON, default=dict)
     chapter_results: Mapped[dict] = mapped_column(JSON, default=dict, deferred=True)
     created_at: Mapped[str] = mapped_column(String, default=now)
+
+
+class KnowledgePoint(Base):
+    __tablename__ = "knowledge_points"
+    __table_args__ = (
+        Index("ix_knowledge_points_tree", "course_id", "retired", "chapter_id", "position"),
+        Index("ix_knowledge_points_english", "course_id", "chapter_id", "normalized_en"),
+        Index("ix_knowledge_points_chinese", "course_id", "chapter_id", "normalized_zh"),
+    )
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=new_id)
+    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id", ondelete="CASCADE"), index=True)
+    chapter_id: Mapped[str] = mapped_column(String)
+    chapter_title: Mapped[str] = mapped_column(String)
+    parent_id: Mapped[str | None] = mapped_column(
+        ForeignKey("knowledge_points.id", ondelete="SET NULL"), nullable=True)
+    title: Mapped[str] = mapped_column(Text)
+    name_zh: Mapped[str] = mapped_column(String)
+    name_en: Mapped[str | None] = mapped_column(String, nullable=True)
+    aliases: Mapped[list] = mapped_column(JSON, default=list)
+    normalized_zh: Mapped[str] = mapped_column(String)
+    normalized_en: Mapped[str] = mapped_column(String, default="")
+    level: Mapped[int] = mapped_column(Integer)
+    position: Mapped[int] = mapped_column(Integer)
+    note_line: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    unit_ids: Mapped[list] = mapped_column(JSON, default=list)
+    last_outline_id: Mapped[str] = mapped_column(String)
+    retired: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[str] = mapped_column(String, default=now)
+    updated_at: Mapped[str] = mapped_column(String, default=now)
+
+
+class KnowledgePointState(Base):
+    __tablename__ = "knowledge_point_states"
+    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id", ondelete="CASCADE"), primary_key=True)
+    outline_id: Mapped[str] = mapped_column(String)
+    course_version: Mapped[int] = mapped_column(Integer)
+    notes_key: Mapped[str] = mapped_column(String)
+    vocabulary_source_key: Mapped[str] = mapped_column(String)
+    vocabulary_policy: Mapped[str] = mapped_column(String)
+    policy: Mapped[str] = mapped_column(String)
+    input_key: Mapped[str] = mapped_column(String)
+    warnings: Mapped[list] = mapped_column(JSON, default=list)
+    updated_at: Mapped[str] = mapped_column(String, default=now)
 
 
 class Job(Base):

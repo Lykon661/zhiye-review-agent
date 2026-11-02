@@ -209,7 +209,12 @@ a { color: var(--accent); text-underline-offset: 3px; }
 .progress-track span { display: block; height: 100%; background: var(--accent); transition: width .35s; }
 .inline-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .inline-actions select { font-size: 12px; padding: 8px 10px; max-width: 260px; }
-.outline-content-panel .section-top { padding-bottom: 18px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.outline-content-panel .section-top { padding-bottom: 18px; border-bottom: 1px solid var(--line); flex-wrap: wrap; align-items: center; }
+.outline-heading-group { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.outline-view-tabs { display: inline-flex; padding: 3px; background: var(--surface-alt); border: 1px solid var(--line); border-radius: 9px; gap: 4px; }
+.view-tab { border: 0; background: transparent; color: #53617b; font-size: 13px; font-weight: 600; padding: 6px 14px; border-radius: 6px; min-height: 32px; }
+.view-tab.active { background: var(--surface); color: var(--accent-dark); box-shadow: 0 1px 3px #1d2d4d14; }
+.view-tab:not(.active):hover { color: var(--ink); }
 .outline-content-panel > .markdown-content { padding: 16px 0 24px; max-width: none; margin: 0; }
 .outline-empty { padding: 52px 16px 64px; }
 .outline-empty h3 { font-size: 18px; margin: 10px 0; }

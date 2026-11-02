@@ -192,8 +192,9 @@ def clean_markdown(text, chapter_title, guidance=False):
 
 
 class OutlineService:
-    def __init__(self, services):
+    def __init__(self, services, knowledge_points=None):
         self.services = services
+        self.knowledge_points = knowledge_points
 
     def snapshot(self, db, course_id):
         course = db.get(Course, course_id)
@@ -366,6 +367,11 @@ class OutlineService:
                 outline.markdown, outline.coverage, outline.status = markdown, coverage, "completed"
                 job.status, job.progress, job.stage = "completed", 100, "复习笔记已生成"
                 db.commit()
+            if self.knowledge_points is not None:
+                try:
+                    self.knowledge_points.prepare(outline.course_id)
+                except Exception:
+                    logger.exception("Knowledge point preparation failed: %s", outline_id)
         except Exception as exc:
             logger.exception("Review notes task failed: %s", job_id)
             with self.services.lock, self.services.sessions() as db:

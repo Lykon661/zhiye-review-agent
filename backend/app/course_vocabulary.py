@@ -98,6 +98,15 @@ def chapter_notes(outline):
     return results
 
 
+def note_content_key(outline):
+    notes = {identity: value["markdown"] for identity, value in outline.chapter_results.items()
+             if isinstance(value, dict) and isinstance(value.get("markdown"), str)}
+    content = notes if notes else {"markdown": outline.markdown,
+        "chapters": [{"id": chapter["id"], "title": chapter["title"]}
+                     for chapter in outline.snapshot.get("chapters", [])]}
+    return sha256(json.dumps(content, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+
 class CourseVocabulary:
     def __init__(self, retrieval):
         self.r = retrieval
@@ -112,6 +121,9 @@ class CourseVocabulary:
             .order_by(Document.id))]
         return sha256(json.dumps([UNIT_POLICY, self.r.store_name, sources],
                                  ensure_ascii=False).encode()).hexdigest()
+
+    def source_key(self, db, course_id):
+        return self._source_key(db, course_id)
 
     @staticmethod
     def _merge(target, entries):
@@ -179,6 +191,19 @@ class CourseVocabulary:
             course = db.get(Course, outline.course_id)
             if course is not None and course.version == outline.version:
                 self._prepare(db, outline)
+
+    def snapshot(self, outline_id):
+        with self.lock, self.r.sessions() as db:
+            outline = db.get(Outline, outline_id)
+            if outline is None or outline.status != "completed":
+                return None
+            course = db.get(Course, outline.course_id)
+            if course is None or course.version != outline.version:
+                return None
+            cached = self._prepare(db, outline)
+            if cached is None:
+                return None
+            return {**cached, "notes_key": note_content_key(outline)}
 
     def read(self, course_id, chapter_ids=None):
         concepts, facets, incomplete = OrderedDict(), OrderedDict(), 0

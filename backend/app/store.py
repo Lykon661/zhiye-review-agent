@@ -19,6 +19,7 @@ from .practice_progress import answer_policy_current
 from .retrieval import EMBEDDING_RUNTIME, RetrievalService
 from .retrieval_ranking import KnowledgeReranker
 from .knowledge_retrieval import KnowledgeRetrieval
+from .knowledge_points import KnowledgePointService
 from .visual_recognition import VisualRecognizer
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,7 @@ class Services:
         self.llm = llm if llm is not None else ModelClient(settings, self.model_config)
         self.retrieval.reranker = KnowledgeReranker(self.llm, self.model_config)
         self.knowledge = KnowledgeRetrieval(self)
+        self.knowledge_points = KnowledgePointService(self)
         self.visual = VisualRecognizer(settings)
         self.chat_locks = {}
         self.review_space_locks = {}

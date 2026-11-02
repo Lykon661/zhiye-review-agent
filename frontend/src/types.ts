@@ -204,3 +204,29 @@ export interface ReviewSpace extends ReviewSpaceSummary {
   attempts: ReviewSpaceAttempt[]; trace: { action: string; reason: string; topic: string; created_at: string; result: string }[]
   summary: string
 }
+
+export interface KnowledgePointSource {
+  source_id: string
+  document_id: string
+  filename: string
+  kind: DocumentKind
+  locator: Locator
+  title: string
+}
+export type KnowledgeSourceReason = 'no_english' | 'not_matched' | null
+export interface KnowledgePointNode {
+  id: string; title: string; name_zh: string; name_en: string | null; aliases: string[]
+  level: 3 | 4; position: number; parent_id: string | null; note_line: number | null
+  sources: KnowledgePointSource[]; source_reason: KnowledgeSourceReason; children: KnowledgePointNode[]
+}
+export interface KnowledgePointChapter {
+  chapter_id: string; title: string; position: number; points: KnowledgePointNode[]
+}
+export interface KnowledgePointsResponse {
+  course_id: string; outline_id: string | null
+  status: 'ready' | 'no_notes' | 'stale'; warnings: string[]; chapters: KnowledgePointChapter[]
+}
+export interface KnowledgeNoteJumpTarget {
+  outlineId: string; chapterTitle: string; title: string
+  nameZh: string; nameEn: string | null; level: 3 | 4; noteLine: number | null
+}

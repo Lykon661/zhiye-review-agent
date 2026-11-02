@@ -136,6 +136,16 @@ export function useCourseMaterials(options: Options) {
     } catch (error) { if (generation === sourceGeneration) sourceError.value = errorText(error) }
     finally { if (generation === sourceGeneration) sourceLoading.value = false }
   }
+  async function openSource(sourceId: string) {
+    if (!sourceId) return
+    showDrawer.value = true; sourceLoading.value = true; source.value = null; sourceError.value = ''; const generation = ++sourceGeneration
+    try {
+      const result = await api<Source>(`/sources/${encodeURIComponent(sourceId)}`)
+      if (generation !== sourceGeneration) return
+      source.value = result
+    } catch (error) { if (generation === sourceGeneration) sourceError.value = errorText(error) }
+    finally { if (generation === sourceGeneration) sourceLoading.value = false }
+  }
   function closePreview() {
     ++sourceGeneration
     showDrawer.value = false; sourceLoading.value = false
@@ -143,5 +153,5 @@ export function useCourseMaterials(options: Options) {
 
   return { documents, groups, uploadKind, uploadYear, fileInput, uploadBusy, uploadLabel, documentBusy, dragOver,
     showDrawer, source, sourceLoading, sourceError, reset, loadGroups, refreshDocuments, upload, drop,
-    practiceDocumentRenamed, deleteDocument, retryDocument, reparseDocument, preview, closePreview }
+    practiceDocumentRenamed, deleteDocument, retryDocument, reparseDocument, preview, openSource, closePreview }
 }
