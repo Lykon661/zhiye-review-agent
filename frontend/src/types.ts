@@ -217,7 +217,15 @@ export type KnowledgeSourceReason = 'no_english' | 'not_matched' | null
 export interface KnowledgePointNode {
   id: string; title: string; name_zh: string; name_en: string | null; aliases: string[]
   level: 3 | 4; position: number; parent_id: string | null; note_line: number | null
-  sources: KnowledgePointSource[]; source_reason: KnowledgeSourceReason; children: KnowledgePointNode[]
+  sources: KnowledgePointSource[]; source_reason: KnowledgeSourceReason
+  exam_questions: ExamQuestionHit[]; children: KnowledgePointNode[]
+}
+export interface ExamQuestionHit {
+  question_id: string; document_id: string; paper: string; number: string; section: string
+  question_type: string; stem: string; options: { key: string; text: string }[]; term: string
+}
+export interface ExamPaperSummary {
+  document_id: string; title: string; year: number | null; question_count: number; matched_count: number
 }
 export interface KnowledgePointChapter {
   chapter_id: string; title: string; position: number; points: KnowledgePointNode[]
@@ -225,6 +233,7 @@ export interface KnowledgePointChapter {
 export interface KnowledgePointsResponse {
   course_id: string; outline_id: string | null
   status: 'ready' | 'no_notes' | 'stale'; warnings: string[]; chapters: KnowledgePointChapter[]
+  exam_papers?: ExamPaperSummary[]
 }
 export interface KnowledgeNoteJumpTarget {
   outlineId: string; chapterTitle: string; title: string

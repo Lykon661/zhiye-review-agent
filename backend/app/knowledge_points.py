@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import load_only
 
 from .course_vocabulary import BILINGUAL, VOCABULARY_CACHE_POLICY, chapter_notes, term_start
+from .exam_frequency import exam_hits
 from .lexical import normalize
 from .models import Block, Chapter, Course, Document, KnowledgePoint, KnowledgePointState, Outline, RetrievalUnit, new_id, now
 
@@ -411,6 +412,7 @@ class KnowledgePointService:
                 "document_id": document.id, "filename": document.filename, "kind": document.kind,
                 "locator": unit.locator, "title": unit.title})
         ranks = {identity: rank for rank, identity in enumerate(sources)}
+        papers, questions = exam_hits(db, course.id, points)
         entries = {}
         for point in points:
             direct = [sources[identity][1] for identity in sorted(set(point.unit_ids), key=lambda key: ranks.get(key, len(ranks)))
@@ -419,7 +421,7 @@ class KnowledgePointService:
                 "name_en": point.name_en, "aliases": point.aliases, "level": point.level,
                 "position": point.position, "parent_id": point.parent_id, "note_line": point.note_line,
                 "sources": direct, "source_reason": "no_english" if not point.name_en else (None if direct else "not_matched"),
-                "children": []}
+                "exam_questions": questions.get(point.id, []), "children": []}
         trees = {chapter.id: {"chapter_id": chapter.id, "title": chapter.title,
             "position": chapter.position, "points": []} for chapter in chapters}
         for point in points:
@@ -431,4 +433,5 @@ class KnowledgePointService:
             else:
                 trees[point.chapter_id]["points"].append(entries[point.id])
         return {"course_id": course.id, "outline_id": outline.id, "status": "ready",
-            "warnings": state.warnings, "chapters": list(trees.values())}
+            # Exam, answer and syllabus chapters have no note headings, so they stay out of the tree.
+            "warnings": state.warnings, "exam_papers": papers, "chapters": [tree for tree in trees.values() if tree["points"]]}
