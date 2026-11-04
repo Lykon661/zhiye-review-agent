@@ -2,6 +2,7 @@
 formula-worker/.venv/
 .runtime/
 .cache/
+.ccg/
 data/
 validation/
 .env
