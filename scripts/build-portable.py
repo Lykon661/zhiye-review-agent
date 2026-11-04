@@ -19,6 +19,9 @@ MODEL_FILES = (
     "1_Pooling/config.json", "onnx/model_quint8_avx2.onnx",
 )
 FORMULA_FILES = ("image_resizer.onnx", "encoder.onnx", "decoder.onnx", "tokenizer.json")
+# The models ship as their own ZIP so upgrades can skip them. Bump this whenever
+# REVISION or the formula models change; portable-start.ps1 must use the same value.
+MODELS_ID = "1"
 # Interpreter parts the server never imports: installers, Tk GUI and IDLE.
 BASE_LIB_EXCLUDED = {"site-packages", "ensurepip", "idlelib", "tkinter", "turtledemo", "test"}
 BASE_DLLS_EXCLUDED = {"_tkinter.pyd", "tcl86t.dll", "tk86t.dll"}
@@ -39,6 +42,9 @@ def copy_tree(source, target, *, python=False, node=False):
         if python:
             # OpenCV's FFmpeg plugin only serves video I/O; image OCR never loads it.
             skipped += [name for name in names if name.startswith("opencv_videoio_ffmpeg") and name.endswith(".dll")]
+            # Haar cascades for face detection; nothing in the app or OCR packages reads them.
+            if Path(directory).name == "cv2" and "data" in names:
+                skipped.append("data")
         if node:
             # Types, source maps, TypeScript sources and docs are never loaded by Node at run time.
             skipped += [name for name in names if not is_notice(name) and name.endswith(
@@ -132,16 +138,58 @@ def licenses(bundle):
             (notices / ("Tika-" + Path(name).name + ".txt")).write_bytes(archive.read(name))
 
 
+def write_zip(output, folder):
+    archive_path = output / f"{folder.name}.zip"
+    with zipfile.ZipFile(archive_path, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+        for path in sorted(folder.rglob("*")):
+            if path.is_file():
+                archive.write(path, path.relative_to(output).as_posix())
+    with archive_path.open("rb") as stream:
+        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    (output / f"{folder.name}.sha256").write_text(f"{digest}  {archive_path.name}\n", encoding="ascii")
+    print(f"Created {archive_path} ({archive_path.stat().st_size / 1024**2:.1f} MiB)", flush=True)
+
+
+def models_package(output, formula_dir):
+    # Built once per MODELS_ID and reused by later releases whose models are unchanged.
+    package = output / f"Zhiye-models-{MODELS_ID}"
+    if (output / f"{package.name}.zip").exists():
+        print(f"Reusing {package.name}.zip", flush=True)
+        return
+    package.mkdir()
+    snapshot = Path("hub/models--ibm-granite--granite-embedding-311m-multilingual-r2/snapshots") / REVISION
+    files = {}
+    for name in MODEL_FILES:
+        relative = Path("huggingface") / snapshot / name
+        copy_file(ROOT / ".cache" / "huggingface" / snapshot / name, package / relative)
+        files[relative.as_posix()] = (package / relative).stat().st_size
+    for name in FORMULA_FILES:
+        relative = Path("formula") / name
+        copy_file(formula_dir / name, package / relative)
+        files[relative.as_posix()] = (package / relative).stat().st_size
+    for name in ("Apache-2.0.txt", "Granite-MODEL-CARD.md", "RapidLaTeXOCR-LICENSE.txt"):
+        copy_file(ROOT / ".cache" / "packaging" / "notices" / name, package / "third-party" / name)
+    # The launcher checks these sizes to catch a partly extracted package.
+    manifest = {"models_id": MODELS_ID, "embedding_revision": REVISION, "files": files}
+    (package / "models.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    write_zip(output, package)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", required=True)
     parser.add_argument("--java-home", type=Path, required=True,
                         help="Redistributable Temurin JDK folder; only a jlink-reduced runtime is bundled")
+    parser.add_argument("--formula-dir", type=Path, default=ROOT / "data" / "ocr-models" / "formula",
+                        help="Folder holding the four public formula OCR model files")
     args = parser.parse_args()
     if not re.fullmatch(r"[0-9][0-9A-Za-z.-]*", args.version):
         raise ValueError("Use a version containing only letters, numbers, dots and hyphens")
     if not all((args.java_home / "bin" / tool).is_file() for tool in ("javac.exe", "jdeps.exe", "jlink.exe")):
         raise ValueError("A complete JDK (javac, jdeps and jlink) is required to build the Java runtime")
+    missing = [str(args.formula_dir / file) for file in FORMULA_FILES if not (args.formula_dir / file).is_file()]
+    if missing:
+        raise ValueError("Missing formula model files: " + ", ".join(missing))
     name = f"Zhiye-{args.version}-windows-x64"
     output = ROOT / "dist"
     bundle = output / name
@@ -169,32 +217,21 @@ def main():
     copy_tree(ROOT / "model-runtime" / "node_modules", bundle / "model-runtime" / "node_modules", node=True)
     node = Path(shutil.which("node"))
     copy_file(node, bundle / ".runtime" / "node" / "node.exe")
-    print("Bundling Java, Tika and public OCR / embedding models...", flush=True)
+    print("Bundling Java and Tika...", flush=True)
     copy_file(ROOT / ".runtime" / "tika" / TIKA_JAR, bundle / ".runtime" / "tika" / TIKA_JAR)
     java_runtime(args.java_home, bundle)
-    snapshot = Path("hub/models--ibm-granite--granite-embedding-311m-multilingual-r2/snapshots") / REVISION
-    for name in MODEL_FILES:
-        copy_file(ROOT / ".cache" / "huggingface" / snapshot / name, bundle / ".runtime" / "huggingface" / snapshot / name)
-    for name in FORMULA_FILES:
-        copy_file(ROOT / ".cache" / "packaging" / "formula" / name, bundle / ".runtime" / "formula-models" / name)
     licenses(bundle)
     (bundle / "启动知页.cmd").write_text(
         '@echo off\r\ncd /d "%~dp0"\r\npowershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\\portable-start.ps1"\r\nif errorlevel 1 pause\r\n', encoding="ascii")
     copy_file(ROOT / "docs" / "PORTABLE.md", bundle / "使用说明.md")
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     manifest = {"version": args.version, "source_commit": revision, "platform": "windows-x64",
-                "runtime_tested": False, "embedding_revision": REVISION, "user_data": "%LOCALAPPDATA%/Zhiye"}
+                "runtime_tested": False, "embedding_revision": REVISION, "models_id": MODELS_ID, "user_data": "%LOCALAPPDATA%/Zhiye"}
     (bundle / "release.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print("Writing the release ZIP...", flush=True)
-    archive_path = output / f"{bundle.name}.zip"
-    with zipfile.ZipFile(archive_path, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
-        for path in sorted(bundle.rglob("*")):
-            if path.is_file():
-                archive.write(path, path.relative_to(output).as_posix())
-    with archive_path.open("rb") as stream:
-        digest = hashlib.file_digest(stream, "sha256").hexdigest()
-    (output / f"{bundle.name}.sha256").write_text(f"{digest}  {archive_path.name}\n", encoding="ascii")
-    print(f"Created {archive_path} ({archive_path.stat().st_size / 1024**2:.1f} MiB)", flush=True)
+    write_zip(output, bundle)
+    print("Writing the models ZIP...", flush=True)
+    models_package(output, args.formula_dir)
 
 
 if __name__ == "__main__":
